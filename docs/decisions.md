@@ -14,6 +14,14 @@ queue inline on the calling goroutine (`ccsim_sync.go`). Every packet
 delivery, timer fire and application write therefore runs to completion on
 the single event-loop goroutine before virtual time advances again.
 
+A per-endpoint reentrancy guard (`ccsimInlineActive`) is required: when a
+passive handshake is completed by a data-bearing segment (the bare third
+ACK was lost), upstream re-enqueues the segment and pokes the dispatcher
+from inside `handleConnecting`, which still holds `ep.mu` via a
+non-reentrant `TryLock`. Without the guard the inline loop spins forever
+against its own lock and the simulation hangs
+(`TestLossyHandshakeNoLivelock`).
+
 ## 2. CC integration surface (registry, rate samples, pacing)
 
 netstack's `congestionControl` interface is cwnd-only: no delivery-rate
@@ -98,6 +106,20 @@ barrier. Byte parity native↔wasm is enforced by test.
 - Loss is observed via the endpoint's cumulative retransmit counter
   (retransmitted segments × MSS approximates lost bytes); netstack does not
   expose per-packet loss marks without much deeper surgery.
+- **Alignment pass (post-review, vs google/bbr tcp_bbr.c)**: rounds are
+  packet-timed and anchored at the sample segment's transmit time
+  (`SimRateSample.PriorDelivered`), matching `prior_delivered` semantics —
+  ack-time anchoring degenerated to one round per ACK whenever inflight
+  drained to zero. `inflight_hi` probing accumulates acked bytes against an
+  inflight_hi-bytes threshold (a unit bug previously grew it ~MSS× too
+  fast), and `bw_probe_up_acks` is reset on REFILL entry. Startup's ECN
+  exit requires two consecutive high-CE rounds (`bbr_full_ecn_cnt`).
+  ProbeRTT exit requires a packet-timed round at the reduced window in
+  addition to the 200 ms hold. `bw_lo`'s floor is `max(1, bw_lo)` — an
+  earlier 0.2·max_bw floor silently neutered the beta cuts on >5× rate
+  drops. BBR's probe-cycle jitter derives from the scenario seed via a
+  named PCG sub-stream (seed, `0xBB3<<32 | port`), not from the port
+  alone.
 
 ## 8. RACK disabled, checksum offload claimed
 

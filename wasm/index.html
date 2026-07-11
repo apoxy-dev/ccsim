@@ -180,9 +180,16 @@ requestAnimationFrame(frame);
 const worker = new Worker("worker.js");
 const $ = id => document.getElementById(id);
 let presetJSON = {};
+// Run generation: bumped on every load; the worker echoes it on messages so
+// samples/progress from a superseded run (still in flight when the load was
+// posted) are dropped instead of polluting the fresh charts.
+let runGen = 0;
+// Set when Restart needs to start streaming as soon as the reload acks.
+let pendingRun = false;
 
 worker.onmessage = (e) => {
   const m = e.data;
+  if (m.gen !== undefined && m.gen !== runGen) return; // stale run
   switch (m.type) {
     case "ready":
       worker.postMessage({ op: "presets" });
@@ -202,6 +209,10 @@ worker.onmessage = (e) => {
     }
     case "loaded":
       $("runBtn").disabled = false;
+      if (pendingRun) {
+        pendingRun = false;
+        startRun();
+      }
       break;
     case "samples":
       decodeChunk(m.buf);
@@ -220,6 +231,11 @@ worker.onmessage = (e) => {
       break;
     case "error":
       running = false;
+      pendingRun = false;
+      // A failed sim must not be resumable: the worker fails closed on a
+      // bad load, and "Pause" on a dead run would post a fresh stream op.
+      $("pauseBtn").disabled = true;
+      $("runBtn").disabled = true;
       $("summary").textContent = "ERROR: " + m.error;
       break;
   }
@@ -238,6 +254,7 @@ function resetState() {
 function loadPreset(name) {
   resetState();
   running = false;
+  runGen++;
   const cfg = JSON.parse(presetJSON[name]);
   dur = cfg.dur_s;
   initSliders(cfg);
@@ -246,15 +263,14 @@ function loadPreset(name) {
   $("runBtn").disabled = true;
   $("pauseBtn").disabled = true;
   $("pauseBtn").textContent = "Pause";
-  worker.postMessage({ op: "load", scenario: presetJSON[name] });
+  worker.postMessage({ op: "load", scenario: presetJSON[name], gen: runGen });
 }
 
 $("runBtn").onclick = () => {
-  if (finishedSummary || !running && $("runBtn").textContent === "Restart") {
+  if (finishedSummary) {
+    // Restart: reload the scenario, then run when the fresh load acks.
+    pendingRun = true;
     loadPreset($("preset").value);
-    // Run once the fresh load acks.
-    const prev = worker.onmessage;
-    worker.onmessage = (e) => { prev(e); if (e.data.type === "loaded") { worker.onmessage = prev; startRun(); } };
     return;
   }
   startRun();

@@ -74,7 +74,8 @@ across native/wasm builds (enforced by `TestScenarioDeterminism` and
   (synchronous dispatch patch, below). No goroutine ever races the clock.
 - All randomness derives from the scenario seed via named PCG sub-streams:
   link loss fwd/rev, RED decisions, rr arrivals per flow, per-stack netstack
-  RNG/ISN sources, per-flow BBR probe jitter (keyed by the flow's port).
+  RNG/ISN sources, per-flow BBR probe jitter (named sub-stream: scenario
+  seed + flow port).
 - Explicit `float64` conversions block FMA fusion at every float
   multiply-add on simulation paths, so arm64/amd64/wasm produce identical
   bits (see docs/decisions.md §6).
@@ -103,13 +104,16 @@ All changes are in `pkg/tcpip/transport/tcp`:
 - `snd.go` — sender struct field (`ccsim ccsimSenderState`); timer init
   call; `initCongestionControl` wraps CCs via the registry; pacing
   gate/charge + app-limited mark in `sendData`; segment stamping in
-  `sendSegment`; ECE flag in `sendEmptySegment`; `handleRcvdSegment`
+  `sendSegment`; ECE echo in `sendEmptySegment` and
+  `sendSegmentFromPacketBuffer` (data segments carry ACKs too);
+  `handleRcvdSegment`
   renamed `handleRcvdSegmentInner`; FMA-blocking conversions in the
   RFC 7323 RTT smoothing; `SetPipe` body delegates to `ccsimSetPipe`.
 - `cubic.go` — fractional cwnd accumulator (upstream truncation stalls the
   window at large cwnd); FMA-blocking conversions.
 - `segment.go` — one field: `ccsim ccsimSegState` (delivery-rate stamps).
-- `endpoint.go` — `ccsimEchoECE` field; TOS ECN-bit mask bypass under
+- `endpoint.go` — `ccsimEchoECE` and `ccsimInlineActive` fields; ccsim
+  timer cleanup in `cleanupLocked`; TOS ECN-bit mask bypass under
   `SimAllowECTTOS`.
 - `rcv.go` — one line: CE detection hook (`ccsimNoteCE`).
 - `connect.go` — delayed-ACK policy in `handleSegmentsLocked` (sync mode

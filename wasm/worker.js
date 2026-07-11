@@ -2,7 +2,11 @@
 // Sample buffers flow out as Transferables; a `summary` message is posted on
 // run completion.
 //
-// Messages in:  {op:"load", scenario:<json string|object>}
+// A load may carry a `gen` (run generation id); it is echoed on every
+// subsequent outbound message so the page can drop stale messages that were
+// in flight when a new load was posted.
+//
+// Messages in:  {op:"load", scenario:<json string|object>, gen:<number>}
 //               {op:"run"}                    batch: flat out to the end
 //               {op:"stream", batch_ms:250}   flat out, yielding between
 //                                             batches so samples flush
@@ -21,6 +25,7 @@ importScripts("wasm_exec.js");
 
 const go = new Go();
 let paceTimer = null;
+let gen = 0; // current run generation, echoed on outbound messages
 
 self.__ccsimReady = () => {
   postMessage({ type: "ready" });
@@ -32,11 +37,11 @@ WebAssembly.instantiateStreaming(fetch("main.wasm"), go.importObject).then(
 
 function onSamples(u8) {
   // u8 is a fresh Uint8Array owned by us; transfer its buffer.
-  postMessage({ type: "samples", buf: u8.buffer }, [u8.buffer]);
+  postMessage({ type: "samples", buf: u8.buffer, gen }, [u8.buffer]);
 }
 
 function fail(r) {
-  postMessage({ type: "error", error: r.error });
+  postMessage({ type: "error", error: r.error, gen });
 }
 
 self.onmessage = (e) => {
@@ -44,16 +49,17 @@ self.onmessage = (e) => {
   switch (m.op) {
     case "load": {
       stopPacing();
+      if (m.gen !== undefined) gen = m.gen;
       const json =
         typeof m.scenario === "string" ? m.scenario : JSON.stringify(m.scenario);
       const r = ccsim.load(json, onSamples);
-      r.ok ? postMessage({ type: "loaded" }) : fail(r);
+      r.ok ? postMessage({ type: "loaded", gen }) : fail(r);
       break;
     }
     case "run": {
       stopPacing();
       const r = ccsim.run();
-      r.ok ? postMessage({ type: "summary", summary: JSON.parse(r.summary) }) : fail(r);
+      r.ok ? postMessage({ type: "summary", summary: JSON.parse(r.summary), gen }) : fail(r);
       break;
     }
     case "stream": {
@@ -68,10 +74,10 @@ self.onmessage = (e) => {
         const r = ccsim.step(batchMs);
         if (!r.ok) { fail(r); return; }
         ccsim.flush();
-        postMessage({ type: "progress", t_s: r.t_s, done: r.done });
+        postMessage({ type: "progress", t_s: r.t_s, done: r.done, gen });
         if (r.done) {
           const f = ccsim.finish();
-          f.ok ? postMessage({ type: "summary", summary: JSON.parse(f.summary) }) : fail(f);
+          f.ok ? postMessage({ type: "summary", summary: JSON.parse(f.summary), gen }) : fail(f);
           return;
         }
         paceTimer = setTimeout(loop, 0);
@@ -88,11 +94,11 @@ self.onmessage = (e) => {
       paceTimer = setInterval(() => {
         const r = ccsim.step(sliceMs);
         if (!r.ok) { stopPacing(); fail(r); return; }
-        postMessage({ type: "progress", t_s: r.t_s });
+        postMessage({ type: "progress", t_s: r.t_s, gen });
         if (r.done) {
           stopPacing();
           const f = ccsim.finish();
-          f.ok ? postMessage({ type: "summary", summary: JSON.parse(f.summary) }) : fail(f);
+          f.ok ? postMessage({ type: "summary", summary: JSON.parse(f.summary), gen }) : fail(f);
         }
       }, sliceMs / ratio);
       break;
@@ -102,7 +108,7 @@ self.onmessage = (e) => {
       break;
     case "step": {
       const r = ccsim.step(m.dt_ms || 10);
-      r.ok ? postMessage({ type: "progress", t_s: r.t_s, done: r.done }) : fail(r);
+      r.ok ? postMessage({ type: "progress", t_s: r.t_s, done: r.done, gen }) : fail(r);
       break;
     }
     case "set": {

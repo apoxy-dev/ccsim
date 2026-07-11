@@ -69,6 +69,10 @@ func load(this js.Value, args []js.Value) any {
 	s.w = stream.NewTakeWriter(s.flushTake, 64<<10)
 	s.sim, err = sim.New(cfg, s.w)
 	if err != nil {
+		// Fail closed: the previous session must not stay silently live, or
+		// subsequent set/step ops would act on a sim the caller believes was
+		// replaced.
+		cur = nil
 		return errResult(err)
 	}
 	cur = s
