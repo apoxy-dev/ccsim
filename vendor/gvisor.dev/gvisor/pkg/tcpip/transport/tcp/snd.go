@@ -112,6 +112,9 @@ type sender struct {
 	// lr is the loss recovery algorithm used by the sender.
 	lr lossRecovery
 
+	// ccsim is the ccsim patch state (pacing, delivery-rate estimation).
+	ccsim ccsimSenderState `state:"nosave"`
+
 	// firstRetransmittedSegXmitTime is the original transmit time of
 	// the first segment that was retransmitted due to RTO expiration.
 	firstRetransmittedSegXmitTime tcpip.MonotonicTime
@@ -296,6 +299,7 @@ func initSender(ep *Endpoint, iss, irs seqnum.Value, sndWnd seqnum.Size, mss uin
 	ep.snd.reorderTimer.init(ep.snd.ep.stack.Clock(), timerHandler(ep.snd.ep, ep.snd.rc.reorderTimerExpired))
 	ep.snd.probeTimer.init(ep.snd.ep.stack.Clock(), timerHandler(ep.snd.ep, ep.snd.probeTimerExpired))
 	ep.snd.corkTimer.init(ep.snd.ep.stack.Clock(), timerHandler(ep.snd.ep, ep.snd.corkTimerExpired))
+	ep.snd.ccsimInitTimers(ep.snd.ep) // ccsim patch
 
 	ep.snd.updateMaxPayloadSize(int(ep.snd.ep.route.MTU()), 0)
 	// Initialize SACK Scoreboard after updating max payload size as we use
@@ -332,14 +336,18 @@ func (s *sender) initCongestionControl(congestionControlName tcpip.CongestionCon
 	s.SndCwnd = InitialCwnd
 	s.Ssthresh = InitialSsthresh
 
+	// ccsim patch: wrap the stock CC (or a registered sim CC) so rate
+	// samples, pacing and ECN hooks can be delivered.
+	var stock congestionControl
 	switch congestionControlName {
 	case ccCubic:
-		return newCubicCC(s)
+		stock = newCubicCC(s)
 	case ccReno:
-		fallthrough
+		stock = newRenoCC(s)
 	default:
-		return newRenoCC(s)
+		stock = newRenoCC(s)
 	}
+	return s.ccsimInitCC(congestionControlName, stock)
 }
 
 // initLossRecovery initiates the loss recovery algorithm for the sender.
@@ -1099,13 +1107,18 @@ func (s *sender) sendData() {
 			s.updateWriteNext(seg.Next())
 			continue
 		}
+		if !s.ccsimPacingAllows() { // ccsim patch
+			break
+		}
 		if sent := s.maybeSendSegment(seg, limit, end); !sent {
 			break
 		}
 		dataSent = true
+		s.ccsimPacingCharge(seg.payloadSize()) // ccsim patch
 		s.Outstanding += s.pCount(seg, s.MaxPayloadSize)
 		s.updateWriteNext(seg.Next())
 	}
+	s.ccsimMarkAppLimited() // ccsim patch
 
 	s.postXmit(dataSent, true /* shouldScheduleProbe */)
 }
@@ -1510,7 +1523,7 @@ func (s *sender) inRecovery() bool {
 // handleRcvdSegment is called when a segment is received; it is responsible for
 // updating the send-related state.
 // +checklocks:s.ep.mu
-func (s *sender) handleRcvdSegment(rcvdSeg *segment) {
+func (s *sender) handleRcvdSegmentInner(rcvdSeg *segment) { // ccsim patch: renamed, see ccsim_cc.go wrapper
 	bestRTT := unknownRTT
 
 	// Check if we can extract an RTT measurement from this ack.
@@ -1788,6 +1801,7 @@ func (s *sender) sendSegment(seg *segment) tcpip.Error {
 		}
 	}
 	seg.xmitTime = s.ep.stack.Clock().NowMonotonic()
+	s.ccsimStampSegment(seg) // ccsim patch
 	seg.xmitCount++
 	seg.lost = false
 
@@ -1835,6 +1849,7 @@ func (s *sender) sendSegmentFromPacketBuffer(pkt *stack.PacketBuffer, flags head
 // sendEmptySegment sends a new empty segment, flags and sequence number.
 // +checklocks:s.ep.mu
 func (s *sender) sendEmptySegment(flags header.TCPFlags, seq seqnum.Value) tcpip.Error {
+	flags = s.ep.ccsimMaybeECE(flags) // ccsim patch
 	s.LastSendTime = s.ep.stack.Clock().NowMonotonic()
 	if seq == s.RTTMeasureSeqNum {
 		s.RTTMeasureTime = s.LastSendTime

@@ -23,6 +23,7 @@ type FlowMetrics struct {
 	BytesAcked    uint64
 	Retransmits   uint64
 	RTOs          uint64
+	LossEvents    uint64
 	CCState       int
 }
 
@@ -61,6 +62,7 @@ type flowState struct {
 	prevCwnd   float64
 	prevRetr   uint64
 	prevRTOs   uint64
+	prevLoss   uint64
 	prevState  int
 	cwndCuts   int
 	retrans    uint64
@@ -120,8 +122,8 @@ func (r *Recorder) OnFlowSample(t time.Duration, id int, m FlowMetrics) {
 		f.srtts = append(f.srtts, float64(m.SRTT)/float64(time.Millisecond))
 	}
 	// Edge detection.
-	if f.started && m.CwndPkts < f.prevCwnd*0.8 && f.prevRetr < m.Retransmits {
-		f.cwndCuts++
+	if f.started && m.LossEvents > f.prevLoss {
+		f.cwndCuts += int(m.LossEvents - f.prevLoss)
 		r.write(t, fid, stream.KindLossRecovery, m.CwndPkts)
 	}
 	if f.started && m.RTOs > f.prevRTOs {
@@ -134,6 +136,7 @@ func (r *Recorder) OnFlowSample(t time.Duration, id int, m FlowMetrics) {
 	f.prevCwnd = m.CwndPkts
 	f.prevRetr = m.Retransmits
 	f.prevRTOs = m.RTOs
+	f.prevLoss = m.LossEvents
 	f.prevState = m.CCState
 	f.retrans = m.Retransmits
 	f.rtos = m.RTOs

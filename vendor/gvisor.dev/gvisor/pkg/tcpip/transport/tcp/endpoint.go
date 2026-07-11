@@ -550,6 +550,10 @@ type Endpoint struct {
 	// amss is the advertised MSS to the peer by this endpoint.
 	amss uint16
 
+	// ccsimEchoECE is set when a CE-marked data segment arrives and
+	// cleared when the next ACK-bearing segment echoes it (ccsim patch).
+	ccsimEchoECE bool `state:"nosave"`
+
 	// sendTOS represents IPv4 TOS or IPv6 TrafficClass,
 	// applied while sending packets. Defaults to 0 as on Linux.
 	sendTOS uint8
@@ -1882,6 +1886,9 @@ func (e *Endpoint) SetSockOptInt(opt tcpip.SockOptInt, v int) tcpip.Error {
 		// TODO(gvisor.dev/issue/995): ECN is not currently supported,
 		// ignore the bits for now.
 		e.sendTOS = uint8(v) & ^uint8(inetECNMask)
+		if SimAllowECTTOS { // ccsim patch
+			e.sendTOS = uint8(v)
+		}
 		e.UnlockUser()
 
 	case tcpip.IPv6TrafficClassOption:
@@ -1889,6 +1896,9 @@ func (e *Endpoint) SetSockOptInt(opt tcpip.SockOptInt, v int) tcpip.Error {
 		// TODO(gvisor.dev/issue/995): ECN is not currently supported,
 		// ignore the bits for now.
 		e.sendTOS = uint8(v) & ^uint8(inetECNMask)
+		if SimAllowECTTOS { // ccsim patch
+			e.sendTOS = uint8(v)
+		}
 		e.UnlockUser()
 
 	case tcpip.MaxSegOption:

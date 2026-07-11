@@ -63,6 +63,12 @@ type cubicState struct {
 	// RTO.
 	numCongestionEvents int
 
+	// ccsimFrac accumulates the sub-packet remainder of the congestion
+	// window across Update calls (ccsim patch: without it, per-ack
+	// increments below one packet are lost to integer truncation and the
+	// window stalls for seconds at large cwnd).
+	ccsimFrac float64
+
 	s *sender
 }
 
@@ -247,12 +253,17 @@ func (c *cubicState) getCwnd(packetsAcked, sndCwnd int, srtt time.Duration) int 
 	wtRtt := c.cubicCwnd(tEst - c.K)
 	// As per 4.3 for each received ACK cwnd must be incremented
 	// by (w_cubic(t+RTT) - cwnd/cwnd.
-	cwnd := float64(sndCwnd)
+	cwnd := float64(sndCwnd) + c.ccsimFrac // ccsim patch: carry fraction
 	for i := 0; i < packetsAcked; i++ {
 		// Concave/Convex regions of cubic have the same formulas.
 		// See: https://tools.ietf.org/html/rfc8312#section-4.3
 		cwnd += (wtRtt - cwnd) / cwnd
 	}
+	// ccsim patch: return the integer part, carry the remainder.
+	if cwnd < 1 {
+		cwnd = 1
+	}
+	c.ccsimFrac = cwnd - float64(int(cwnd))
 	return int(cwnd)
 }
 

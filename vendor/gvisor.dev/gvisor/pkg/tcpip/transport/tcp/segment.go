@@ -75,6 +75,9 @@ type segment struct {
 	options        []byte `state:".([]byte)"`
 	hasNewSACKInfo bool
 	rcvdTime       tcpip.MonotonicTime
+	// ccsim is delivery-rate estimation state (ccsim patch).
+	ccsim ccsimSegState `state:"nosave"`
+
 	// xmitTime is the last transmit time of this segment.
 	xmitTime  tcpip.MonotonicTime
 	xmitCount uint32
