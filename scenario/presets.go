@@ -47,7 +47,11 @@ func Presets() map[string]*ScenarioConfig {
 			Flows: []FlowConfig{bulk("bbr", 0)},
 		},
 		"bufferbloat": {
-			Seed: 4, Dur: 30,
+			// 60 s: HyStart exits slow start almost immediately in a deep
+			// queue, so cubic's 0.4*t^3 climb first fills the 50xBDP buffer
+			// only at t~27 s; the second epoch (cut near ~44 s) is what
+			// shows the steady-state sawtooth.
+			Seed: 4, Dur: 60,
 			Link: LinkConfig{RateMbps: 50, OwdMs: 15,
 				Queue: QueueConfig{Kind: "taildrop", LimitPkts: 6250}}, // 50 x BDP
 			Flows: []FlowConfig{bulk("cubic", 0)},

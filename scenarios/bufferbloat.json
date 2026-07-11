@@ -1,6 +1,6 @@
 {
   "seed": 4,
-  "dur_s": 30,
+  "dur_s": 60,
   "link": {
     "rate_mbps": 50,
     "owd_ms": 15,

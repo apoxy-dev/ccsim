@@ -67,20 +67,31 @@ func TestScenarioCubicSingle(t *testing.T) {
 		goodput, sum.Flows[0].CwndCuts, sum.Flows[0].Retransmits, sum.Flows[0].SRTTMeanMs)
 }
 
-// Scenario 4: bufferbloat — cubic fills a 50xBDP buffer (bbr half added
-// once bbr lands).
+// Scenario 4: bufferbloat — cubic fills a 50xBDP buffer. HyStart exits
+// slow start almost immediately (delay rises as soon as the queue forms),
+// so the first overflow is the tail of a 0.4*t^3 climb at ~27 s and the
+// second epoch peaks near ~44 s; assertions target the post-overflow
+// steady state.
 func TestScenarioBufferbloatCubic(t *testing.T) {
-	recs, _ := runScenario(t, "bufferbloat", nil)
+	recs, sum := runScenario(t, "bufferbloat", nil)
 	const baseRTTms = 30
-	srtt := probe.MeanOf(recs, 0, stream.KindSRTTSec, 10, 30) * 1000
-	if srtt < 3*baseRTTms {
-		t.Errorf("cubic mean srtt over [10,30]s = %.1f ms, want >= %d (bloat missing)", srtt, 3*baseRTTms)
+	srtt := probe.MeanOf(recs, 0, stream.KindSRTTSec, 30, 60) * 1000
+	if srtt < 10*baseRTTms {
+		t.Errorf("cubic steady-state mean srtt over [30,60]s = %.1f ms, want >= %d (bloat missing)", srtt, 10*baseRTTms)
 	}
-	goodput := probe.GoodputMbps(recs, 0, 5, 30)
-	if goodput < 0.85*50 {
-		t.Errorf("goodput %.1f Mbps, want >= 42.5", goodput)
+	// The buffer must actually overflow, once per cubic epoch — guards
+	// against the flow silently going window-limited instead of
+	// congestion-limited.
+	if sum.Flows[0].CwndCuts < 2 {
+		t.Errorf("cwnd cuts = %d, want >= 2 (flow not congestion-limited?)", sum.Flows[0].CwndCuts)
 	}
-	t.Logf("srtt=%.1fms goodput=%.1f", srtt, goodput)
+	// 0.80 (not 0.85): each overflow episode loses ~1100 segments and
+	// recovers them at a ~1.5 s bloated RTT, which costs real goodput.
+	goodput := probe.GoodputMbps(recs, 0, 5, 60)
+	if goodput < 0.80*50 {
+		t.Errorf("goodput %.1f Mbps, want >= 40", goodput)
+	}
+	t.Logf("srtt=%.1fms goodput=%.1f cuts=%d", srtt, goodput, sum.Flows[0].CwndCuts)
 }
 
 // Scenario 3: bbr-single — high utilization with low standing queue,
@@ -142,11 +153,11 @@ func TestScenarioBufferbloatBBR(t *testing.T) {
 		c.Flows[0].CC = "bbr"
 	})
 	const baseRTTms = 30.0
-	srtt := probe.MeanOf(recs, 0, stream.KindSRTTSec, 10, 30) * 1000
+	srtt := probe.MeanOf(recs, 0, stream.KindSRTTSec, 10, 60) * 1000
 	if srtt > 1.5*baseRTTms {
-		t.Errorf("bbr mean srtt over [10,30]s = %.1f ms, want <= %.1f", srtt, 1.5*baseRTTms)
+		t.Errorf("bbr mean srtt over [10,60]s = %.1f ms, want <= %.1f", srtt, 1.5*baseRTTms)
 	}
-	goodput := probe.GoodputMbps(recs, 0, 5, 30)
+	goodput := probe.GoodputMbps(recs, 0, 5, 60)
 	if goodput < 0.85*50 {
 		t.Errorf("goodput %.1f Mbps, want >= 42.5", goodput)
 	}

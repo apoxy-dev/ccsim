@@ -149,7 +149,7 @@ is ≈59%/41% of a ≥90%-utilized 100 Mbps link. Representative results:
 |---|---|
 | cubic-single | 96.5 Mbps, 3 cwnd cuts, 0 RTO |
 | bbr-single | 91+ Mbps, mean srtt 40.7 ms (base 40), ProbeRTT every ≤5 s |
-| bufferbloat | cubic srtt 541 ms vs bbr 31 ms (base 30), both ≥85% goodput |
+| bufferbloat | cubic steady-state srtt 825 ms vs bbr 31 ms (base 30); 2 overflow cuts in 60 s (HyStart makes the first fill a ~27 s t³ climb) |
 | random-loss 1% | bbr 86-90 Mbps vs cubic 2.8 Mbps |
 | rate-step | drained to ≈1×new BDP within 3 s of the down-step |
 | ecn-codel | 60+ CE marks, zero retransmits, srtt ≤ 2×base |
