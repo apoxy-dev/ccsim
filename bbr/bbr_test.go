@@ -29,6 +29,7 @@ func (f *fakeSender) Now() time.Duration       { return f.now }
 func (f *fakeSender) InRecovery() bool         { return false }
 func (f *fakeSender) LocalPort() uint16        { return 40001 }
 func (f *fakeSender) SetSsthresh(v int)        { f.ssthresh = v }
+func (f *fakeSender) Seed() uint64             { return 42 }
 
 const mss = 1448
 
@@ -40,10 +41,18 @@ func trace(b *BBR, f *fakeSender, rateBps int64, rtt time.Duration, dur time.Dur
 	for elapsed := time.Duration(0); elapsed < dur; elapsed += step {
 		f.now += step
 		f.inflight = rateBps / 8 * int64(rtt) / int64(time.Second)
+		delivered := b.lastSample.Delivered + bytesPerStep
+		// In steady state the acked segment was sent one RTT ago, when the
+		// cumulative delivered count was one inflight's worth lower.
+		prior := delivered - f.inflight
+		if prior < 0 {
+			prior = 0
+		}
 		b.OnAck(tcp.SimRateSample{
 			Now:             f.now,
 			AckedBytes:      bytesPerStep,
-			Delivered:       b.lastSample.Delivered + bytesPerStep,
+			Delivered:       delivered,
+			PriorDelivered:  prior,
 			DeliveryRateBps: rateBps,
 			RTT:             rtt,
 			Interval:        step,
@@ -141,8 +150,10 @@ func TestProbeRTTScheduling(t *testing.T) {
 	for i := 0; i < 50 && b.state == StateProbeRTT; i++ {
 		f.now += 10 * time.Millisecond
 		f.inflight = 2 * mss
+		delivered := b.lastSample.Delivered + mss
 		b.OnAck(tcp.SimRateSample{
-			Now: f.now, AckedBytes: mss, Delivered: b.lastSample.Delivered + mss,
+			Now: f.now, AckedBytes: mss, Delivered: delivered,
+			PriorDelivered:  delivered - f.inflight,
 			DeliveryRateBps: 50e6, RTT: rtt, Interval: 10 * time.Millisecond,
 			InflightBytes: f.inflight,
 		})

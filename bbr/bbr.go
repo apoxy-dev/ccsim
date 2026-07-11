@@ -120,6 +120,10 @@ const (
 	ecnAlphaGain = 1.0 / 16
 	ecnFactor    = 1.0 / 3
 	ecnThresh    = 0.5
+	// startupFullECNCount is the number of consecutive high-CE rounds
+	// required to declare the pipe full in startup (reference:
+	// bbr_full_ecn_cnt).
+	startupFullECNCount = 2
 
 	minRTTFilterLen  = 10 * time.Second
 	probeRTTInterval = 5 * time.Second
@@ -147,6 +151,7 @@ type Sender interface {
 	InRecovery() bool
 	LocalPort() uint16
 	SetSsthresh(int)
+	Seed() uint64
 }
 
 // BBR is one connection's BBRv3 state.
@@ -164,18 +169,22 @@ type BBR struct {
 	bwLo        int64 // short-term bound (math.MaxInt64 = unset)
 	fullBw      int64
 	fullBwCount int
-	filledPipe  bool
+	// startupEcnRounds counts consecutive startup rounds whose CE fraction
+	// exceeded ecnThresh; reset by any low round.
+	startupEcnRounds int
+	filledPipe       bool
 
 	// Model: RTT. minRTT is a windowed minimum: rttBuckets holds per-2.5s
 	// sub-window minima so stale low samples expire after ~10s (a pinned
 	// historical minimum under a competitor's standing queue starves the
 	// cwnd model).
-	minRTT        time.Duration
-	minRTTStamp   time.Duration // when minRTT last decreased or was refreshed
-	rttBuckets    [4]time.Duration
-	rttBucketT    time.Duration // start time of current bucket
-	probeRTTDone  time.Duration // when ProbeRTT hold completes (0 = not holding)
-	probeRTTValid bool
+	minRTT            time.Duration
+	minRTTStamp       time.Duration // when minRTT last decreased or was refreshed
+	rttBuckets        [4]time.Duration
+	rttBucketT        time.Duration // start time of current bucket
+	probeRTTDone      time.Duration // when ProbeRTT hold completes (0 = not holding)
+	probeRTTRoundDone bool          // a full round elapsed at the reduced window
+	probeRTTValid     bool
 
 	// Model: inflight bounds (bytes; MaxInt64 = unset).
 	inflightHi     int64
@@ -221,8 +230,11 @@ var _ tcp.SimCCWithProbe = (*BBR)(nil)
 // New creates a BBRv3 instance for one connection.
 func New(s Sender) *BBR {
 	b := &BBR{
-		s:          s,
-		rng:        rand.New(rand.NewPCG(uint64(s.LocalPort()), 0xBB3)),
+		s: s,
+		// Named PCG sub-stream: the scenario seed selects the stream family
+		// and the flow's port distinguishes flows within it, so different
+		// scenario seeds produce different probe schedules.
+		rng:        rand.New(rand.NewPCG(s.Seed(), 0xBB3<<32|uint64(s.LocalPort()))),
 		state:      StateStartup,
 		bwLo:       math.MaxInt64,
 		inflightHi: math.MaxInt64,
@@ -265,10 +277,11 @@ func (b *BBR) PostRecovery() {
 	b.setCwnd()
 }
 
-// OnAck processes one delivery rate sample (the heart of BBRv3).
+// dbgSamples bounds the number of per-sample debug lines printed when
+// CCSIM_BBR_DEBUG is set.
 var dbgSamples int
 
-// OnAckDebug counter limits sample logging.
+// OnAck processes one delivery rate sample (the heart of BBRv3).
 func (b *BBR) OnAck(rs tcp.SimRateSample) {
 	if debugBBR && dbgSamples < 80 {
 		dbgSamples++
@@ -310,8 +323,13 @@ func (b *BBR) SimProbe() tcp.SimCCProbe {
 
 func (b *BBR) updateRound(rs tcp.SimRateSample) {
 	b.roundStart = false
-	if rs.Delivered >= b.nextRoundDelivered {
-		b.nextRoundDelivered = rs.Delivered + rs.InflightBytes
+	// Packet-timed rounds, anchored like the reference implementation: a
+	// round ends when a segment SENT at-or-after the round marker is acked
+	// (PriorDelivered is the delivered count at the sample's transmit
+	// time). Anchoring on ack-time delivered+inflight degenerates when
+	// inflight hits zero (every ACK becomes a round).
+	if rs.PriorDelivered >= 0 && rs.PriorDelivered >= b.nextRoundDelivered {
+		b.nextRoundDelivered = rs.Delivered
 		b.roundStart = true
 		b.roundCount++
 		b.roundsInPhase++
@@ -467,6 +485,7 @@ func (b *BBR) updateStateMachine(rs tcp.SimRateSample) {
 		now-b.minRTTStamp > probeRTTInterval && !b.idleRestart {
 		b.enter(StateProbeRTT, now)
 		b.probeRTTDone = 0
+		b.probeRTTRoundDone = false
 	}
 
 	// Time-bounded filter aging: in steady ProbeBW cruising, expire a
@@ -488,10 +507,7 @@ func (b *BBR) updateStateMachine(rs tcp.SimRateSample) {
 			// A competing flow's standing queue can make the drain target
 			// unreachable; go probe anyway when the wait expires (as in
 			// the reference implementation).
-			b.enter(StateProbeBWRefill, now)
-			b.bwLo = math.MaxInt64
-			b.inflightLo = math.MaxInt64
-			b.roundsInPhase = 0
+			b.enterRefill(now)
 		}
 	case StateProbeBWCruise:
 		// Excess-queue drain: if the bandwidth model dropped (e.g. after a
@@ -503,11 +519,7 @@ func (b *BBR) updateStateMachine(rs tcp.SimRateSample) {
 			break
 		}
 		if b.timeToProbeBW(now) {
-			b.enter(StateProbeBWRefill, now)
-			// Release short-term bounds so the probe can fill the pipe.
-			b.bwLo = math.MaxInt64
-			b.inflightLo = math.MaxInt64
-			b.roundsInPhase = 0
+			b.enterRefill(now)
 		}
 	case StateProbeBWRefill:
 		if b.roundStart && b.roundsInPhase >= 1 {
@@ -534,11 +546,18 @@ func (b *BBR) updateStateMachine(rs tcp.SimRateSample) {
 	case StateProbeRTT:
 		cap := b.probeRTTCwndBytes()
 		if b.probeRTTDone == 0 && rs.InflightBytes <= cap {
-			// Inflight reached the ProbeRTT cap: hold for the duration.
+			// Inflight reached the ProbeRTT cap: hold for the duration and
+			// for at least one packet-timed round at the reduced window
+			// (reference: probe_rtt_round_done), so an RTT sample taken with
+			// our queue actually drained lands in the filter before exit.
 			b.probeRTTDone = now + probeRTTDuration
-			b.nextRoundDelivered = rs.Delivered + rs.InflightBytes
+			b.probeRTTRoundDone = false
+			b.nextRoundDelivered = rs.Delivered
 		}
-		if b.probeRTTDone != 0 && now >= b.probeRTTDone {
+		if b.probeRTTDone != 0 && b.roundStart {
+			b.probeRTTRoundDone = true
+		}
+		if b.probeRTTDone != 0 && b.probeRTTRoundDone && now >= b.probeRTTDone {
 			// The hold sampled RTT with our own queue drained; the windowed
 			// filter has absorbed those samples. Reschedule the next probe.
 			b.minRTTStamp = now
@@ -574,11 +593,23 @@ func (b *BBR) enter(state int, now time.Duration) {
 	b.roundsInPhase = 0
 }
 
+// enterRefill starts a bandwidth probe: release the short-term model
+// bounds so the probe can fill the pipe, and reset per-probe accounting
+// (the reference zeroes bw_probe_up_acks in bbr_start_bw_probe_refill;
+// stale residue would grow inflight_hi on the first ACK of the probe).
+func (b *BBR) enterRefill(now time.Duration) {
+	b.enter(StateProbeBWRefill, now)
+	b.bwLo = math.MaxInt64
+	b.inflightLo = math.MaxInt64
+	b.probeUpAcks = 0
+}
+
 func (b *BBR) startProbeBWDown(now time.Duration) {
 	b.advanceMaxBwFilter()
 	b.enter(StateProbeBWDown, now)
 	b.cycleStamp = now
-	// Wall-clock probe interval: 2-3 s (deterministic per-flow stream).
+	// Elapsed virtual-time probe interval: 2-3 s, jittered from the
+	// deterministic per-flow sub-stream (time-based, not round-based).
 	b.probeWait = 2*time.Second + time.Duration(b.rng.Int64N(int64(time.Second)))
 	b.ackPhaseIsUp = false
 }
@@ -605,10 +636,18 @@ func (b *BBR) checkFullPipe(rs tcp.SimRateSample) {
 		b.filledPipe = true
 		return
 	}
+	// ECN exit needs sustained evidence: two consecutive high-CE rounds
+	// (reference: bbr_full_ecn_cnt = 2), so a single transient marking
+	// burst does not end startup early.
 	if b.ackedBytesRound > 0 &&
 		float64(b.ceBytesRound)/float64(b.ackedBytesRound) > ecnThresh {
-		b.filledPipe = true
-		return
+		b.startupEcnRounds++
+		if b.startupEcnRounds >= startupFullECNCount {
+			b.filledPipe = true
+			return
+		}
+	} else {
+		b.startupEcnRounds = 0
 	}
 	if b.maxBw() >= int64(float64(b.fullBw)*fullBwThresh) {
 		b.fullBw = b.maxBw()
@@ -664,12 +703,17 @@ func (b *BBR) probeInflightHiUpward(rs tcp.SimRateSample) {
 	if b.inflightHi == math.MaxInt64 {
 		return
 	}
+	if b.inflightHi <= 0 {
+		return
+	}
 	b.probeUpAcks += rs.AckedBytes
 	// Grow inflight_hi by one MSS per inflight_hi bytes acked (draft's
-	// slow-then-fast growth simplified to linear per-round growth).
-	if b.probeUpAcks >= b.inflightHi/int64(b.s.MSS()) {
-		b.probeUpAcks = 0
-		b.inflightHi += int64(b.s.MSS())
+	// slow-then-fast growth simplified to linear per-round growth), keeping
+	// the remainder like the reference's bw_probe_up_acks accounting.
+	if b.probeUpAcks >= b.inflightHi {
+		delta := b.probeUpAcks / b.inflightHi
+		b.probeUpAcks -= delta * b.inflightHi
+		b.inflightHi += delta * int64(b.s.MSS())
 	}
 }
 
@@ -726,9 +770,11 @@ func (b *BBR) adaptLowerBounds() {
 }
 
 func (b *BBR) boundLower() {
-	if b.bwLo != math.MaxInt64 && b.bwLo < int64(float64(b.maxBw())*0.2) {
-		// Never let the short-term bound collapse entirely.
-		b.bwLo = int64(float64(b.maxBw()) * 0.2)
+	// Reference floor is max(1, bw_lo): the short-term bound may collapse
+	// arbitrarily far, it just must stay positive. (An earlier 0.2*maxBw
+	// floor here silently neutered the beta cuts on >5x rate drops.)
+	if b.bwLo != math.MaxInt64 && b.bwLo < 1 {
+		b.bwLo = 1
 	}
 }
 
