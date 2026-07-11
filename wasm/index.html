@@ -1,42 +1,322 @@
 <!DOCTYPE html>
-<!-- Minimal wasm smoke page: loads the module in a worker, runs a preset in
-     batch mode and dumps the summary to the console. No charting. -->
+<!-- Progressive ccsim visualization: the wasm sim runs in a worker in
+     streaming mode (see worker.js {op:"stream"}), sample chunks render into
+     the charts as they arrive, and the link sliders mutate the live sim.
+     Self-contained: no external dependencies. Serve the repo root and open
+     /wasm/index.html. -->
 <html>
-<head><meta charset="utf-8"><title>ccsim wasm smoke test</title></head>
+<head>
+<meta charset="utf-8">
+<title>ccsim</title>
+<style>
+  :root { color-scheme: light dark; }
+  body { font: 13px/1.4 system-ui, sans-serif; margin: 0 auto; max-width: 980px; padding: 12px; }
+  h1 { font-size: 16px; margin: 4px 0 10px; }
+  h1 small { font-weight: normal; opacity: .6; }
+  .row { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; margin: 6px 0; }
+  .row label { display: flex; gap: 6px; align-items: center; }
+  .row .val { font-variant-numeric: tabular-nums; min-width: 72px; opacity: .8; }
+  button, select { font: inherit; padding: 3px 10px; }
+  #bar { flex: 1; height: 6px; min-width: 120px; background: rgba(128,128,128,.25); border-radius: 3px; overflow: hidden; }
+  #fill { height: 100%; width: 0%; background: #4a90d9; }
+  .chart { position: relative; margin: 10px 0; }
+  .chart canvas { width: 100%; height: 110px; display: block; }
+  .chart .title { position: absolute; top: 2px; left: 6px; font-size: 11px; opacity: .7; }
+  #legend { font-size: 11px; opacity: .8; }
+  #legend b { font-weight: 600; }
+  #summary { font-size: 11px; white-space: pre; overflow-x: auto; }
+  input[type=range] { width: 130px; }
+</style>
+</head>
 <body>
-<pre id="log">loading…</pre>
-<script>
-  const log = (s) => (document.getElementById("log").textContent += "\n" + s);
-  const worker = new Worker("worker.js");
-  let sampleBytes = 0;
-  const preset = new URLSearchParams(location.search).get("preset") || "cubic-single";
+<h1>ccsim <small>— deterministic TCP congestion control, live in wasm</small></h1>
 
-  worker.onmessage = (e) => {
-    const m = e.data;
-    switch (m.type) {
-      case "ready":
-        log(`wasm ready; loading preset ${preset}`);
-        fetch(`../scenarios/${preset}.json`)
-          .then((r) => r.text())
-          .then((scenario) => worker.postMessage({ op: "load", scenario }));
-        break;
-      case "loaded":
-        log("scenario loaded; running (batch)…");
-        worker.postMessage({ op: "run" });
-        break;
-      case "samples":
-        sampleBytes += m.buf.byteLength;
-        break;
-      case "summary":
-        log(`sample stream: ${sampleBytes} bytes`);
-        log("summary: " + JSON.stringify(m.summary, null, 2));
-        console.log("ccsim summary", m.summary);
-        break;
-      case "error":
-        log("ERROR: " + m.error);
-        break;
+<div class="row">
+  <select id="preset" disabled></select>
+  <button id="runBtn" disabled>Run</button>
+  <button id="pauseBtn" disabled>Pause</button>
+  <div id="bar"><div id="fill"></div></div>
+  <span class="val" id="clock">–</span>
+</div>
+
+<div class="row" id="sliders">
+  <label>rate <input type="range" id="s_rate" min="1" max="200" step="1"><span class="val" id="v_rate"></span></label>
+  <label>owd <input type="range" id="s_owd" min="1" max="150" step="1"><span class="val" id="v_owd"></span></label>
+  <label>loss <input type="range" id="s_loss" min="0" max="5" step="0.1"><span class="val" id="v_loss"></span></label>
+  <label>queue <input type="range" id="s_queue" min="1" max="100" step="1"><span class="val" id="v_queue"></span></label>
+</div>
+
+<div id="legend"></div>
+<div id="charts"></div>
+<pre id="summary"></pre>
+
+<script>
+"use strict";
+
+// ---- sample stream constants (mirrors stream/stream.go) -------------------
+const K = { cwnd: 0, srtt: 3, delivery: 5, qdepth: 9, util: 15 };
+const LINK_FWD = 0xFFFF, LINK_REV = 0xFFFE;
+const REC = 20;
+
+const FLOW_COLORS = ["#4a90d9", "#e2712e", "#3aa76d", "#b05fd0", "#c9b32a"];
+const LINK_COLOR = "#888888";
+const colorOf = (flow) => flow >= LINK_REV ? LINK_COLOR : FLOW_COLORS[flow % FLOW_COLORS.length];
+
+// ---- series store ----------------------------------------------------------
+// key "flow:kind" -> {flow, kind, t:[], v:[]}; full resolution is kept so
+// redraws re-bin from raw data.
+let series = new Map();
+let dur = 30, dirty = false, running = false, finishedSummary = null;
+
+function addSample(t, flow, kind, v) {
+  const key = flow + ":" + kind;
+  let s = series.get(key);
+  if (!s) { s = { flow, kind, t: [], v: [] }; series.set(key, s); }
+  s.t.push(t); s.v.push(v);
+}
+
+// Incremental decoder: records are fixed 20-byte LE
+// [f64 t][u16 flow][u8 kind][u8 pad][f64 value]; chunks may split a record,
+// so carry the remainder.
+let carry = new Uint8Array(0);
+function decodeChunk(buf) {
+  let bytes = new Uint8Array(buf);
+  if (carry.length) {
+    const joined = new Uint8Array(carry.length + bytes.length);
+    joined.set(carry); joined.set(bytes, carry.length);
+    bytes = joined;
+  }
+  const n = Math.floor(bytes.length / REC);
+  const dv = new DataView(bytes.buffer, bytes.byteOffset);
+  for (let i = 0; i < n; i++) {
+    const off = i * REC;
+    addSample(dv.getFloat64(off, true), dv.getUint16(off + 8, true),
+              bytes[off + 10], dv.getFloat64(off + 12, true));
+  }
+  carry = bytes.slice(n * REC);
+  dirty = true;
+}
+
+// ---- charts ----------------------------------------------------------------
+// Each chart selects series by kind (and optionally flow) and scales values.
+const CHARTS = [
+  { title: "srtt (ms)",        pick: s => s.kind === K.srtt,  scale: 1000 },
+  { title: "throughput (Mbps)",pick: s => s.kind === K.delivery || (s.kind === K.util && s.flow === LINK_FWD), scale: 1e-6 },
+  { title: "cwnd (pkts)",      pick: s => s.kind === K.cwnd,  scale: 1 },
+  { title: "queue (pkts)",     pick: s => s.kind === K.qdepth && s.flow === LINK_FWD, scale: 1 },
+];
+
+const chartsDiv = document.getElementById("charts");
+for (const c of CHARTS) {
+  const wrap = document.createElement("div");
+  wrap.className = "chart";
+  wrap.innerHTML = `<span class="title">${c.title}</span>`;
+  c.canvas = document.createElement("canvas");
+  wrap.appendChild(c.canvas);
+  chartsDiv.appendChild(wrap);
+}
+
+// Per-pixel min/max binning: subsampling would erase loss spikes and
+// sawtooth teeth; a vertical min..max segment per column cannot.
+function drawChart(c) {
+  const cv = c.canvas, dpr = devicePixelRatio || 1;
+  const W = cv.clientWidth, H = cv.clientHeight || 110;
+  if (cv.width !== W * dpr) { cv.width = W * dpr; cv.height = H * dpr; }
+  const ctx = cv.getContext("2d");
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.clearRect(0, 0, W, H);
+  ctx.fillStyle = "rgba(128,128,128,.08)";
+  ctx.fillRect(0, 0, W, H);
+
+  const sel = [...series.values()].filter(c.pick);
+  let vMax = 0;
+  for (const s of sel) for (let i = 0; i < s.v.length; i++) {
+    const v = s.v[i] * c.scale;
+    if (v > vMax) vMax = v;
+  }
+  if (vMax <= 0) return;
+  vMax *= 1.05;
+  const pad = 2, ih = H - 2 * pad;
+  const yOf = v => H - pad - (v * c.scale / vMax) * ih;
+  const xOf = t => (t / dur) * W;
+
+  for (const s of sel) {
+    ctx.strokeStyle = colorOf(s.flow);
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    // Bin into pixel columns; series arrive time-ordered.
+    let px = -1, mn = 0, mx = 0, last = NaN;
+    for (let i = 0; i < s.t.length; i++) {
+      const x = Math.round(xOf(s.t[i])), v = s.v[i];
+      if (x !== px) {
+        if (px >= 0) { ctx.moveTo(px + .5, yOf(mn)); ctx.lineTo(px + .5, yOf(mx) - .5); }
+        px = x; mn = mx = v;
+      } else {
+        if (v < mn) mn = v;
+        if (v > mx) mx = v;
+      }
+      last = v;
     }
-  };
+    if (px >= 0) { ctx.moveTo(px + .5, yOf(mn)); ctx.lineTo(px + .5, yOf(mx) - .5); }
+    ctx.stroke();
+  }
+  // Scale label.
+  ctx.fillStyle = "rgba(128,128,128,.9)";
+  ctx.font = "10px system-ui";
+  ctx.textAlign = "right";
+  ctx.fillText((vMax >= 100 ? vMax.toFixed(0) : vMax.toPrecision(3)), W - 4, 10);
+}
+
+function frame() {
+  if (dirty) {
+    dirty = false;
+    for (const c of CHARTS) drawChart(c);
+  }
+  requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+
+// ---- worker ----------------------------------------------------------------
+const worker = new Worker("worker.js");
+const $ = id => document.getElementById(id);
+let presetJSON = {};
+
+worker.onmessage = (e) => {
+  const m = e.data;
+  switch (m.type) {
+    case "ready":
+      worker.postMessage({ op: "presets" });
+      break;
+    case "presets": {
+      presetJSON = m.scenarios;
+      const sel = $("preset");
+      for (const name of Object.keys(presetJSON).sort()) {
+        sel.add(new Option(name, name));
+      }
+      sel.disabled = false;
+      const q = new URLSearchParams(location.search).get("preset");
+      if (q && presetJSON[q]) sel.value = q;
+      sel.onchange = () => loadPreset(sel.value);
+      loadPreset(sel.value);
+      break;
+    }
+    case "loaded":
+      $("runBtn").disabled = false;
+      break;
+    case "samples":
+      decodeChunk(m.buf);
+      break;
+    case "progress":
+      $("fill").style.width = (100 * m.t_s / dur).toFixed(1) + "%";
+      $("clock").textContent = m.t_s.toFixed(1) + " / " + dur + " s";
+      break;
+    case "summary":
+      running = false;
+      finishedSummary = m.summary;
+      $("runBtn").textContent = "Restart";
+      $("runBtn").disabled = false;
+      $("pauseBtn").disabled = true;
+      renderSummary(m.summary);
+      break;
+    case "error":
+      running = false;
+      $("summary").textContent = "ERROR: " + m.error;
+      break;
+  }
+};
+
+function resetState() {
+  series = new Map();
+  carry = new Uint8Array(0);
+  finishedSummary = null;
+  dirty = true;
+  $("summary").textContent = "";
+  $("fill").style.width = "0%";
+  $("clock").textContent = "–";
+}
+
+function loadPreset(name) {
+  resetState();
+  running = false;
+  const cfg = JSON.parse(presetJSON[name]);
+  dur = cfg.dur_s;
+  initSliders(cfg);
+  renderLegend(cfg);
+  $("runBtn").textContent = "Run";
+  $("runBtn").disabled = true;
+  $("pauseBtn").disabled = true;
+  $("pauseBtn").textContent = "Pause";
+  worker.postMessage({ op: "load", scenario: presetJSON[name] });
+}
+
+$("runBtn").onclick = () => {
+  if (finishedSummary || !running && $("runBtn").textContent === "Restart") {
+    loadPreset($("preset").value);
+    // Run once the fresh load acks.
+    const prev = worker.onmessage;
+    worker.onmessage = (e) => { prev(e); if (e.data.type === "loaded") { worker.onmessage = prev; startRun(); } };
+    return;
+  }
+  startRun();
+};
+
+function startRun() {
+  running = true;
+  $("runBtn").disabled = true;
+  $("pauseBtn").disabled = false;
+  $("pauseBtn").textContent = "Pause";
+  worker.postMessage({ op: "stream", batch_ms: 250 });
+}
+
+$("pauseBtn").onclick = () => {
+  if (running) {
+    worker.postMessage({ op: "pause" });
+    running = false;
+    $("pauseBtn").textContent = "Resume";
+  } else {
+    running = true;
+    $("pauseBtn").textContent = "Pause";
+    worker.postMessage({ op: "stream", batch_ms: 250 });
+  }
+};
+
+// ---- live sliders ----------------------------------------------------------
+// The five live-settable paths (sim.Set); queue slider is expressed in BDP
+// multiples of the *loaded* scenario so one control fits every preset.
+let basePkts = 100;
+function initSliders(cfg) {
+  const q = cfg.link.queue || {};
+  basePkts = Math.max(1, Math.round((cfg.link.rate_mbps * 1e6 / 8) * (2 * cfg.link.owd_ms / 1000) / 1500));
+  bind("s_rate", "v_rate", cfg.link.rate_mbps, v => v + " Mbps", v => set("link.rate_mbps", v));
+  bind("s_owd", "v_owd", cfg.link.owd_ms, v => v + " ms", v => set("link.owd_ms", v));
+  bind("s_loss", "v_loss", (cfg.link.loss || 0) * 100, v => v.toFixed(1) + " %", v => set("link.loss", v / 100));
+  const xbdp = Math.max(1, Math.round((q.limit_pkts || 2 * basePkts) / basePkts));
+  bind("s_queue", "v_queue", xbdp, v => v + "×BDP (" + v * basePkts + "p)", v => set("link.queue.limit_pkts", v * basePkts));
+}
+function bind(sid, vid, init, fmt, apply) {
+  const s = $(sid), val = $(vid);
+  s.value = init;
+  val.textContent = fmt(Number(s.value));
+  s.oninput = () => { const v = Number(s.value); val.textContent = fmt(v); apply(v); };
+}
+function set(path, value) { worker.postMessage({ op: "set", path, value }); }
+
+// ---- legend & summary ------------------------------------------------------
+function renderLegend(cfg) {
+  const parts = cfg.flows.map((f, i) =>
+    `<b style="color:${colorOf(i)}">flow ${i}: ${f.cc}</b>`);
+  parts.push(`<b style="color:${LINK_COLOR}">link</b>`);
+  $("legend").innerHTML = parts.join(" &nbsp; ") +
+    ` &nbsp; <span style="opacity:.6">${cfg.link.queue.kind} queue, seed ${cfg.seed}</span>`;
+}
+
+function renderSummary(sum) {
+  const rows = (sum.flows || []).map(f =>
+    `flow ${f.id} ${f.cc}: goodput ${f.goodput_mbps.toFixed(1)} Mbps | ` +
+    `srtt mean ${f.srtt_mean_ms.toFixed(1)} ms | retrans ${f.retransmits} | ` +
+    `rtos ${f.rtos} | cwnd cuts ${f.cwnd_cuts}`);
+  $("summary").textContent = rows.join("\n");
+}
 </script>
 </body>
 </html>

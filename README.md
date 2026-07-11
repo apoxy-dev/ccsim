@@ -35,10 +35,15 @@ node wasm/parity.mjs wasm/main.wasm wasm/wasm_exec.js scenarios/cubic-single.jso
 node stream/decoder_test.mjs                    # JS decoder unit test
 ```
 
-Browser smoke test (no charting): build `wasm/main.wasm` as above, serve the
-repo root (`python3 -m http.server`), open `/wasm/index.html?preset=bbr-single`
-— the worker loads the module, runs the preset in batch mode and dumps the
-summary to the page and console.
+Browser demo: build `wasm/main.wasm` as above, serve the repo root
+(`python3 -m http.server`), open `/wasm/index.html?preset=bufferbloat`.
+The sim runs in a worker in **streaming mode** (flat out, yielding between
+250 ms-sim batches) and the charts — srtt, throughput, cwnd, queue depth —
+render progressively as sample chunks arrive, so there is no wait for the
+run to finish. The rate / owd / loss / queue sliders mutate the live sim
+mid-run via `set()`. Rendering uses per-pixel min/max binning over the
+full-resolution stream, so loss spikes and sawtooth teeth survive
+decimation. Self-contained page, no chart library.
 
 The sim runs in **batch** mode (flat out) or **paced** mode (the worker glue
 drives `step()` on a wall-clock timer at a configurable sim/real ratio; same

@@ -119,6 +119,17 @@ func finish(this js.Value, args []js.Value) any {
 	return okResult(map[string]any{"summary": string(data)})
 }
 
+// flush() -> {ok} — hand any buffered samples to the onSamples callback now.
+// Used by the worker's streaming mode to bound chart latency; without it,
+// samples only surface at 64KB buffer boundaries.
+func flush(this js.Value, args []js.Value) any {
+	if cur == nil {
+		return errResult(fmt.Errorf("flush: no scenario loaded"))
+	}
+	cur.w.Flush()
+	return okResult(nil)
+}
+
 // set(path string, value float64) -> {ok} | {error} — live parameter change.
 func set(this js.Value, args []js.Value) any {
 	if cur == nil {
@@ -149,6 +160,7 @@ func main() {
 		"step":    js.FuncOf(step),
 		"run":     js.FuncOf(run),
 		"finish":  js.FuncOf(finish),
+		"flush":   js.FuncOf(flush),
 		"set":     js.FuncOf(set),
 		"presets": js.FuncOf(presets),
 	}
