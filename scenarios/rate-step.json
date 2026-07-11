@@ -1,0 +1,35 @@
+{
+  "seed": 7,
+  "dur_s": 45,
+  "link": {
+    "rate_mbps": 100,
+    "owd_ms": 10,
+    "loss": 0,
+    "queue": {
+      "kind": "taildrop",
+      "limit_pkts": 334
+    }
+  },
+  "flows": [
+    {
+      "cc": "bbr",
+      "start_at_s": 0,
+      "app": {
+        "kind": "bulk"
+      }
+    }
+  ],
+  "events": [
+    {
+      "at_s": 15,
+      "path": "link.rate_mbps",
+      "value": 25
+    },
+    {
+      "at_s": 30,
+      "path": "link.rate_mbps",
+      "value": 100
+    }
+  ],
+  "sample": {}
+}

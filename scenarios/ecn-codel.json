@@ -1,0 +1,30 @@
+{
+  "seed": 8,
+  "dur_s": 30,
+  "link": {
+    "rate_mbps": 50,
+    "owd_ms": 10,
+    "loss": 0,
+    "queue": {
+      "kind": "fqcodel",
+      "ecn": true
+    }
+  },
+  "flows": [
+    {
+      "cc": "bbr",
+      "start_at_s": 0,
+      "app": {
+        "kind": "bulk"
+      }
+    },
+    {
+      "cc": "cubic",
+      "start_at_s": 0,
+      "app": {
+        "kind": "bulk"
+      }
+    }
+  ],
+  "sample": {}
+}

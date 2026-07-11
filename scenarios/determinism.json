@@ -1,0 +1,30 @@
+{
+  "seed": 1,
+  "dur_s": 10,
+  "link": {
+    "rate_mbps": 100,
+    "owd_ms": 10,
+    "loss": 0,
+    "queue": {
+      "kind": "taildrop",
+      "limit_pkts": 167
+    }
+  },
+  "flows": [
+    {
+      "cc": "cubic",
+      "start_at_s": 0,
+      "app": {
+        "kind": "bulk"
+      }
+    },
+    {
+      "cc": "bbr",
+      "start_at_s": 0,
+      "app": {
+        "kind": "bulk"
+      }
+    }
+  ],
+  "sample": {}
+}
