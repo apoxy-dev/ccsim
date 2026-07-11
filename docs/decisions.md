@@ -107,3 +107,20 @@ behaviorally adequate for these scenarios. The link endpoints claim TX/RX
 checksum offload: packets never cross a real wire, so TCP checksum
 computation/validation would only burn simulation CPU. (IPv4 header
 checksums are still maintained, including after CE re-marking.)
+
+## 9. SetPipe rewritten as a single-pass cursor walk
+
+Profiling the bufferbloat preset showed 87% of the run's CPU inside
+upstream `sender.SetPipe` (RFC 6675 pipe), nearly all of it in one ~2 s
+recovery episode: a ~7000-packet window with ~1100 scoreboard holes means
+two btree range queries per SMSS chunk per ACK, and `IsRangeLost`
+additionally counts up to 100 ranges per chunk — O(cwnd²)-class work per
+recovery. Since the chunk walk ascends in sequence space and scoreboard
+ranges are disjoint and sorted, `ccsimSetPipe` (ccsim_cc.go) snapshots the
+scoreboard once per call and answers both queries with a monotonically
+advancing cursor plus precomputed suffix block/byte tallies —
+O(cwnd + ranges) per ACK. The computation is semantically identical to
+upstream (verified: byte-identical sample streams before/after); it is a
+performance patch only. Bufferbloat wall time: 19.7 s → 2.1 s. The same
+cost exists in real gVisor during SACK recovery on large-window paths;
+an incremental-pipe variant would be the proper upstream fix.

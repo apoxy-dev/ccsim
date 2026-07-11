@@ -89,7 +89,9 @@ All changes are in `pkg/tcpip/transport/tcp`:
   RFC 3168 fallback for stock CCs), delivery-rate estimation
   (`ccsimPreAck`/`ccsimPostAck` around the renamed upstream ACK handler),
   pacing gate + timer, delayed-ACK policy, per-ACK ECE echo helpers,
-  `SimSenderInfo` probe snapshot.
+  `SimSenderInfo` probe snapshot, and `ccsimSetPipe` — a single-pass
+  RFC 6675 pipe calculation replacing the upstream per-chunk btree
+  queries (identical result, O(cwnd + sacked-ranges) per ACK).
 
 **Modified files (all edits marked `// ccsim patch`)**
 - `dispatcher.go` — 4 lines: `queueEndpoint` branches to inline processing.
@@ -98,7 +100,7 @@ All changes are in `pkg/tcpip/transport/tcp`:
   gate/charge + app-limited mark in `sendData`; segment stamping in
   `sendSegment`; ECE flag in `sendEmptySegment`; `handleRcvdSegment`
   renamed `handleRcvdSegmentInner`; FMA-blocking conversions in the
-  RFC 7323 RTT smoothing.
+  RFC 7323 RTT smoothing; `SetPipe` body delegates to `ccsimSetPipe`.
 - `cubic.go` — fractional cwnd accumulator (upstream truncation stalls the
   window at large cwnd); FMA-blocking conversions.
 - `segment.go` — one field: `ccsim ccsimSegState` (delivery-rate stamps).

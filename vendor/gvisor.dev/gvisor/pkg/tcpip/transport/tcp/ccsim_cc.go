@@ -200,6 +200,11 @@ type ccsimSenderState struct {
 	appLimitedSeq seqnum.Value // app-limited until this sequence is acked
 	appLimited    bool
 
+	// Reusable scratch for ccsimSetPipe: scoreboard snapshot and suffix
+	// byte sums (index i holds the total SACKed bytes in ranges[i:]).
+	pipeRanges   []header.SACKBlock `state:"nosave"`
+	pipeSufBytes []seqnum.Size      `state:"nosave"`
+
 	// Scratch captured by ccsimPreAck for ccsimPostAck.
 	scratchAcked     int64
 	scratchHasSample bool
@@ -544,16 +549,16 @@ func (e *Endpoint) ccsimNoteCE(s *segment) {
 
 // SimInfo is the probe snapshot for one endpoint.
 type SimInfo struct {
-	CwndPkts       int
-	InflightBytes  int64
-	MSS            int
-	PacingBps      int64
-	DeliveryBps    int64
-	RetransSegs    uint64
-	RTOs           uint64
-	LossEvents     uint64
-	HasCCProbe     bool
-	CCProbe        SimCCProbe
+	CwndPkts      int
+	InflightBytes int64
+	MSS           int
+	PacingBps     int64
+	DeliveryBps   int64
+	RetransSegs   uint64
+	RTOs          uint64
+	LossEvents    uint64
+	HasCCProbe    bool
+	CCProbe       SimCCProbe
 }
 
 // SimSenderInfo snapshots sender internals for instrumentation. Returns
@@ -589,4 +594,110 @@ func SimSenderInfo(tep tcpip.Endpoint) (SimInfo, bool) {
 		}
 	}
 	return info, true
+}
+
+// ccsimSetPipe computes the RFC 6675 pipe value exactly as the upstream
+// SetPipe loop did (packets, not bytes), but in a single ascending pass.
+//
+// The upstream loop issued two btree range queries (IsSACKED, IsRangeLost)
+// per SMSS-sized chunk of outstanding data — O(cwnd * log ranges) per ACK,
+// with IsRangeLost additionally counting up to maxSACKBlocks ranges per
+// chunk. During SACK recovery with a large window this dominated runtime
+// (87% of a bufferbloat run's CPU). Because the chunk walk ascends in
+// sequence space and the scoreboard ranges are disjoint and sorted, one
+// snapshot plus a monotonically advancing cursor answers both queries:
+//
+//   - a chunk is SACKed iff the first range ending past its start contains
+//     it (at most one range can overlap any given point);
+//   - IsRangeLost's dup-SACK block/byte tallies "above the chunk" are
+//     suffix aggregates over the snapshot, precomputed once.
+//
+// The result is bit-identical to the upstream computation (the scenario
+// determinism suite would catch any divergence as a stream mismatch).
+//
+// +checklocks:s.ep.mu
+func (s *sender) ccsimSetPipe() int {
+	board := s.ep.scoreboard
+	ranges := s.ccsim.pipeRanges[:0]
+	board.ranges.Ascend(func(r header.SACKBlock) bool {
+		ranges = append(ranges, r)
+		return true
+	})
+	s.ccsim.pipeRanges = ranges
+	n := len(ranges)
+	suf := s.ccsim.pipeSufBytes
+	if cap(suf) < n+1 {
+		suf = make([]seqnum.Size, n+1)
+	}
+	suf = suf[:n+1]
+	suf[n] = 0
+	for j := n - 1; j >= 0; j-- {
+		suf[j] = suf[j+1] + ranges[j].Start.Size(ranges[j].End)
+	}
+	s.ccsim.pipeSufBytes = suf
+
+	smss := seqnum.Size(board.SMSS())
+	// Same expression (and integer types) as upstream IsRangeLost.
+	lostBytes := seqnum.Size((nDupAckThreshold - 1) * board.SMSS())
+	pipe := 0
+	i := 0 // cursor: first range with End > current chunk start
+	for s1 := s.writeList.Front(); s1 != nil && s1.payloadSize() != 0 && s.isAssignedSequenceNumber(s1); s1 = s1.Next() {
+		// With GSO each segment can be much larger than SMSS. So check the
+		// segment in SMSS sized ranges.
+		segEnd := s1.sequenceNumber.Add(seqnum.Size(s1.payloadSize()))
+		for startSeq := s1.sequenceNumber; startSeq.LessThan(segEnd); startSeq = startSeq.Add(smss) {
+			endSeq := startSeq.Add(smss)
+			if segEnd.LessThan(endSeq) {
+				endSeq = segEnd
+			}
+			if !s1.sequenceNumber.LessThan(s.SndNxt) {
+				break
+			}
+			for i < n && !startSeq.LessThan(ranges[i].End) {
+				i++
+			}
+			r := header.SACKBlock{Start: startSeq, End: endSeq}
+			// IsSACKED: only ranges[i] can overlap startSeq.
+			if i < n && ranges[i].Contains(r) {
+				continue
+			}
+			// SetPipe(): (a) if IsLost(S1) returns false, Pipe++.
+			if !ccsimRangeLost(ranges, suf, i, r, lostBytes) {
+				pipe++
+			}
+			// SetPipe(): (b) if S1 <= HighRxt, Pipe++.
+			if s1.sequenceNumber.LessThanEq(s.FastRecovery.HighRxt) {
+				pipe++
+			}
+		}
+	}
+	return pipe
+}
+
+// ccsimRangeLost mirrors SACKScoreboard.IsRangeLost for a chunk r that is
+// known not to be fully SACKed, given the sorted snapshot, its suffix byte
+// sums and the cursor i (first index with ranges[i].End > r.Start).
+//
+// Upstream first inspects the last range starting at or below r.Start: if
+// it partially overlaps r it bumps r.Start to that range's end, so the
+// counting pass starts strictly above it. Ranges below the cursor end at
+// or below r.Start and never participate. The early-exit thresholds in the
+// upstream counting loop are equivalent to comparing the full suffix
+// totals, since both tallies only grow.
+func ccsimRangeLost(ranges []header.SACKBlock, suf []seqnum.Size, i int, r header.SACKBlock, lostBytes seqnum.Size) bool {
+	n := len(ranges)
+	if n == 0 {
+		return false
+	}
+	k := i
+	if i < n && !r.Start.LessThan(ranges[i].Start) {
+		// ranges[i] starts at or below r.Start and (not being a
+		// container) ends inside r: the partial-overlap bump means
+		// counting starts at the next range.
+		k = i + 1
+	}
+	if k >= n {
+		return false
+	}
+	return n-k >= nDupAckThreshold || suf[k] >= lostBytes
 }

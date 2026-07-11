@@ -1201,48 +1201,11 @@ func (s *sender) SetPipe() {
 	if !s.ep.SACKPermitted || !s.FastRecovery.Active {
 		return
 	}
-	pipe := 0
-	smss := seqnum.Size(s.ep.scoreboard.SMSS())
-	for s1 := s.writeList.Front(); s1 != nil && s1.payloadSize() != 0 && s.isAssignedSequenceNumber(s1); s1 = s1.Next() {
-		// With GSO each segment can be much larger than SMSS. So check the segment
-		// in SMSS sized ranges.
-		segEnd := s1.sequenceNumber.Add(seqnum.Size(s1.payloadSize()))
-		for startSeq := s1.sequenceNumber; startSeq.LessThan(segEnd); startSeq = startSeq.Add(smss) {
-			endSeq := startSeq.Add(smss)
-			if segEnd.LessThan(endSeq) {
-				endSeq = segEnd
-			}
-			sb := header.SACKBlock{Start: startSeq, End: endSeq}
-			// SetPipe():
-			//
-			// After initializing pipe to zero, the following steps are
-			// taken for each octet 'S1' in the sequence space between
-			// HighACK and HighData that has not been SACKed:
-			if !s1.sequenceNumber.LessThan(s.SndNxt) {
-				break
-			}
-			if s.ep.scoreboard.IsSACKED(sb) {
-				continue
-			}
-
-			// SetPipe():
-			//
-			//    (a) If IsLost(S1) returns false, Pipe is incremened by 1.
-			//
-			// NOTE: here we mark the whole segment as lost. We do not try
-			// and test every byte in our write buffer as we maintain our
-			// pipe in terms of outstanding packets and not bytes.
-			if !s.ep.scoreboard.IsRangeLost(sb) {
-				pipe++
-			}
-			// SetPipe():
-			//    (b) If S1 <= HighRxt, Pipe is incremented by 1.
-			if s1.sequenceNumber.LessThanEq(s.FastRecovery.HighRxt) {
-				pipe++
-			}
-		}
-	}
-	s.Outstanding = pipe
+	// ccsim patch: single-pass cursor walk over a scoreboard snapshot
+	// replaces the per-chunk IsSACKED/IsRangeLost btree queries (same
+	// result, O(cwnd + ranges) instead of O(cwnd * ranges) per call). See
+	// ccsimSetPipe in ccsim_cc.go for the original per-chunk logic.
+	s.Outstanding = s.ccsimSetPipe()
 }
 
 // shouldEnterRecovery returns true if the sender should enter fast recovery
