@@ -26,8 +26,11 @@ func rawNum(v float64) json.RawMessage {
 func Presets() map[string]*ScenarioConfig {
 	return map[string]*ScenarioConfig{
 		"determinism": {
+			// A small wire loss makes the seed observable in the stream
+			// (otherwise the dynamics are seed-independent and different
+			// seeds legitimately produce identical output).
 			Seed: 1, Dur: 10,
-			Link: LinkConfig{RateMbps: 100, OwdMs: 10,
+			Link: LinkConfig{RateMbps: 100, OwdMs: 10, Loss: 0.002,
 				Queue: QueueConfig{Kind: "taildrop", LimitPkts: 167}},
 			Flows: []FlowConfig{bulk("cubic", 0), bulk("bbr", 0)},
 		},
