@@ -307,8 +307,12 @@ func (e *Endpoint) LinkAddress() tcpip.LinkAddress { return "" }
 // SetLinkAddress implements stack.NetworkLinkEndpoint.
 func (e *Endpoint) SetLinkAddress(tcpip.LinkAddress) {}
 
-// Capabilities implements stack.NetworkLinkEndpoint.
-func (e *Endpoint) Capabilities() stack.LinkEndpointCapabilities { return 0 }
+// Capabilities implements stack.NetworkLinkEndpoint. Checksum offload is
+// claimed in both directions: packets never cross a real wire, so computing
+// and validating TCP checksums would only burn simulation CPU.
+func (e *Endpoint) Capabilities() stack.LinkEndpointCapabilities {
+	return stack.CapabilityTXChecksumOffload | stack.CapabilityRXChecksumOffload
+}
 
 // Attach implements stack.NetworkLinkEndpoint.
 func (e *Endpoint) Attach(dispatcher stack.NetworkDispatcher) { e.dispatcher = dispatcher }

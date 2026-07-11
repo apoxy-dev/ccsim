@@ -85,8 +85,12 @@ func newStack(clk *vclock.Clock, seed int64, ep stack.LinkEndpoint, addr tcpip.A
 	if err := s.SetTransportProtocolOption(tcp.ProtocolNumber, &rcvBuf); err != nil {
 		return nil, fmt.Errorf("sim: receive buffer option: %s", err)
 	}
-	// Recovery: keep RACK (default) — it is deterministic under the
-	// virtual clock.
+	// Disable RACK: its per-ACK segment scan dominates CPU at large cwnd
+	// and classic SACK recovery is sufficient (and deterministic) here.
+	recovery := tcpip.TCPRecovery(0)
+	if err := s.SetTransportProtocolOption(tcp.ProtocolNumber, &recovery); err != nil {
+		return nil, fmt.Errorf("sim: recovery option: %s", err)
+	}
 	return s, nil
 }
 

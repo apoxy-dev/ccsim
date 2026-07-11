@@ -450,6 +450,7 @@ func (r *receiver) handleRcvdSegmentClosing(s *segment, state EndpointState, clo
 // r as they arrive. It is called by the protocol main loop.
 // +checklocks:r.ep.mu
 func (r *receiver) handleRcvdSegment(s *segment) (drop bool, err tcpip.Error) {
+	r.ep.ccsimNoteCE(s) // ccsim patch: record CE marks for the ECN echo
 	state := r.ep.EndpointState()
 	closed := r.ep.closed
 
