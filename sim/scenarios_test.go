@@ -67,6 +67,29 @@ func TestScenarioCubicSingle(t *testing.T) {
 		goodput, sum.Flows[0].CwndCuts, sum.Flows[0].Retransmits, sum.Flows[0].SRTTMeanMs)
 }
 
+// Regression: synchronous dispatch must not livelock when a passive
+// handshake is completed by a data-bearing segment (third ACK dropped by
+// the lossy link). Before the reentrancy guard in processEndpointInline
+// this configuration hung the event loop on most seeds.
+func TestLossyHandshakeNoLivelock(t *testing.T) {
+	for _, seed := range []int64{11, 12, 14, 15} {
+		rawRun(t, "determinism", func(cfg *scenario.ScenarioConfig) {
+			cfg.Seed = seed
+			cfg.Dur = 3
+			cfg.Link.Loss = 0.35
+			cfg.Flows = []scenario.FlowConfig{
+				bulkFlow("cubic", 0), bulkFlow("cubic", 0.1), bulkFlow("cubic", 0.2),
+				bulkFlow("bbr", 0.3), bulkFlow("cubic", 0.4), bulkFlow("cubic", 0.5),
+			}
+		})
+	}
+}
+
+func bulkFlow(cc string, startAt float64) scenario.FlowConfig {
+	return scenario.FlowConfig{CC: cc, StartAt: startAt,
+		App: scenario.AppConfig{Kind: "bulk"}}
+}
+
 // Scenario 4: bufferbloat — cubic fills a 50xBDP buffer. HyStart exits
 // slow start almost immediately (delay rises as soon as the queue forms),
 // so the first overflow is the tail of a 0.4*t^3 climb at ~27 s and the

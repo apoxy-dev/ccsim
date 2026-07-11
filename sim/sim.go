@@ -17,6 +17,7 @@ import (
 
 	"gvisor.dev/gvisor/pkg/tcpip"
 	"gvisor.dev/gvisor/pkg/tcpip/stack"
+	"gvisor.dev/gvisor/pkg/tcpip/transport/tcp"
 )
 
 // Sim is one simulation instance.
@@ -72,6 +73,11 @@ func New(cfg *scenario.ScenarioConfig, w *stream.Writer) (*Sim, error) {
 		MakeQdisc: makeQdisc,
 	}, cfg.Seed, s.rec.LinkHooks())
 	s.lnk.Classify = s.classify
+
+	// Registered CCs derive their per-flow randomness from the scenario
+	// seed via SimSender.Seed() (per-process sim configuration, like
+	// SimSynchronousDispatch; one sim runs at a time).
+	tcp.SimSeed = uint64(cfg.Seed)
 
 	var err error
 	s.sndStack, err = newStack(s.clk, cfg.Seed^0x5E4D1, s.lnk.Endpoint(link.Fwd), senderAddr)

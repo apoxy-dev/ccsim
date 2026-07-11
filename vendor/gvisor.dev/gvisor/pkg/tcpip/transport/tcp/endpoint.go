@@ -554,6 +554,12 @@ type Endpoint struct {
 	// cleared when the next ACK-bearing segment echoes it (ccsim patch).
 	ccsimEchoECE bool `state:"nosave"`
 
+	// ccsimInlineActive marks this goroutine as already inside
+	// processEndpointInline for this endpoint; reentrant queueEndpoint
+	// calls return instead of spinning on a lock the outer frame holds
+	// (ccsim patch).
+	ccsimInlineActive bool `state:"nosave"`
+
 	// sendTOS represents IPv4 TOS or IPv6 TrafficClass,
 	// applied while sending packets. Defaults to 0 as on Linux.
 	sendTOS uint8
@@ -1199,6 +1205,10 @@ func (e *Endpoint) cleanupLocked() {
 		e.snd.probeTimer.cleanup()
 		e.snd.reorderTimer.cleanup()
 		e.snd.corkTimer.cleanup()
+		// ccsim patch: the pacing and delayed-ACK timers must not fire on
+		// a cleaned-up endpoint (the route is released below).
+		e.snd.ccsim.pacingTimer.cleanup()
+		e.snd.ccsim.delAckTimer.cleanup()
 	}
 
 	if e.finWait2Timer != nil {

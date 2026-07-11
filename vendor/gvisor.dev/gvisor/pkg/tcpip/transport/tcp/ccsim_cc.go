@@ -46,6 +46,11 @@ type SimRateSample struct {
 	AckedBytes int64
 	// Delivered is the cumulative delivered byte count.
 	Delivered int64
+	// PriorDelivered is the cumulative delivered count at the transmit
+	// time of the segment this rate sample was taken from, or -1 when the
+	// ACK produced no sample (pure dup-ACK, ECE-only). CCs use it for
+	// packet-timed round detection anchored at send time.
+	PriorDelivered int64
 	// DeliveryRateBps is the sampled delivery rate, 0 if not measurable.
 	DeliveryRateBps int64
 	// RTT is the sample RTT (ack time - send time of the sample segment).
@@ -126,6 +131,14 @@ func (h SimSender) SetSsthresh(v int) {
 	}
 	h.s.Ssthresh = v
 }
+
+// SimSeed is the scenario seed, set by the harness before stacks are
+// created (like SimSynchronousDispatch, it is per-process sim configuration;
+// one simulation runs at a time). CC randomness must derive from it.
+var SimSeed uint64
+
+// Seed returns the scenario seed for deriving named per-flow sub-streams.
+func (h SimSender) Seed() uint64 { return SimSeed }
 
 // SimCC is the extended congestion control interface for registered CCs.
 // It embeds the four upstream congestionControl methods plus the ccsim
@@ -419,12 +432,14 @@ func (s *sender) ccsimPostAck(rcvdSeg *segment) {
 		Now:            now,
 		AckedBytes:     st.scratchAcked,
 		Delivered:      st.delivered,
+		PriorDelivered: -1,
 		InflightBytes:  int64(s.SndUna.Size(s.SndNxt)),
 		ECE:            ece,
 		RetransSegsCum: s.ep.stats.SendErrors.Retransmits.Value(),
 	}
 	if st.scratchHasSample {
 		sc := &st.scratchSeg
+		sample.PriorDelivered = sc.delivered
 		ackElapsed := nowMT.Sub(sc.deliveredTime)
 		sendElapsed := sc.xmitTime.Sub(sc.firstSent)
 		interval := ackElapsed

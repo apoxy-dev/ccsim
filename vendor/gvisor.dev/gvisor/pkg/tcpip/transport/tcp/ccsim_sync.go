@@ -23,7 +23,21 @@ var SimSynchronousDispatch = false
 // processEndpointInline is the synchronous equivalent of one processor loop
 // iteration (dispatcher.go processor.start), repeated until the endpoint's
 // segment queue is drained or ownership prevents processing.
+//
+// The reentrancy guard prevents a livelock: handshake completion inside
+// handleConnecting re-enqueues the completing segment and calls
+// queueEndpoint again while ep.mu is still held by this goroutine (via
+// TryLock, which does not set ownedByUser). Without the guard the inner
+// call would spin forever — handleConnected's TryLock can never succeed
+// against a lock the same goroutine holds. With it, the inner call
+// returns immediately and the OUTER loop drains the queue as soon as
+// handleConnecting releases the lock.
 func processEndpointInline(ep *Endpoint) {
+	if ep.ccsimInlineActive {
+		return
+	}
+	ep.ccsimInlineActive = true
+	defer func() { ep.ccsimInlineActive = false }()
 	for !ep.segmentQueue.empty() && !ep.isOwnedByUser() {
 		switch state := ep.EndpointState(); {
 		case state.connecting():
