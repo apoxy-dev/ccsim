@@ -167,9 +167,12 @@ func (r *Recorder) OnLinkSample(t time.Duration, qPkts, qBytes int, window time.
 	}
 }
 
-// LinkHooks returns link.Hooks wired into this recorder.
+// LinkHooks returns link.Hooks wired into this recorder. The per-packet
+// enqueue/dequeue taps are only installed when the scenario asks for the
+// packet event stream — a nil hook lets the link skip building the event
+// record entirely on the per-packet fast path.
 func (r *Recorder) LinkHooks() link.Hooks {
-	return link.Hooks{
+	h := link.Hooks{
 		OnDrop: func(e link.Event) {
 			// Wire loss is not a queue drop but still counts as a drop record.
 			r.drops++
@@ -182,17 +185,16 @@ func (r *Recorder) LinkHooks() link.Hooks {
 		OnDeliver: func(e link.Event) {
 			r.deliveredBytes[e.Dir] += uint64(e.Size)
 		},
-		OnEnqueue: func(e link.Event) {
-			if r.PacketEvents {
-				r.write(e.T, flowOrLink(e), stream.KindPktEnqueue, float64(e.Size))
-			}
-		},
-		OnDequeue: func(e link.Event) {
-			if r.PacketEvents {
-				r.write(e.T, flowOrLink(e), stream.KindPktDequeue, float64(e.Size))
-			}
-		},
 	}
+	if r.PacketEvents {
+		h.OnEnqueue = func(e link.Event) {
+			r.write(e.T, flowOrLink(e), stream.KindPktEnqueue, float64(e.Size))
+		}
+		h.OnDequeue = func(e link.Event) {
+			r.write(e.T, flowOrLink(e), stream.KindPktDequeue, float64(e.Size))
+		}
+	}
+	return h
 }
 
 func flowOrLink(e link.Event) uint16 {

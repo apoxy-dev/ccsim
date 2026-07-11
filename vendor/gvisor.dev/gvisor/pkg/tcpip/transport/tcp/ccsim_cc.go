@@ -190,6 +190,7 @@ type ccsimSenderState struct {
 	wrap *ccsimWrapper
 
 	pacingTimer timer `state:"nosave"`
+	delAckTimer timer `state:"nosave"`
 	nextSend    tcpip.MonotonicTime
 
 	// Delivery rate estimation state.
@@ -263,6 +264,26 @@ func (s *sender) ccsimInitCC(name tcpip.CongestionControlOption, stock congestio
 	return w
 }
 
+// ccsimDelAckTimeout is the delayed-ACK flush deadline.
+const ccsimDelAckTimeout = 5 * time.Millisecond
+
+// ccsimMaybeDelayAck implements the delayed-ACK policy used under
+// synchronous dispatch: ACK immediately once two or more full segments are
+// unacknowledged, otherwise arm the delack timer.
+//
+// +checklocks:e.mu
+func (e *Endpoint) ccsimMaybeDelayAck() {
+	unacked := e.snd.MaxSentAck.Size(e.rcv.RcvNxt)
+	if int(unacked) >= 2*e.snd.MaxPayloadSize {
+		e.snd.ccsim.delAckTimer.disable()
+		e.snd.sendAck()
+		return
+	}
+	if !e.snd.ccsim.delAckTimer.enabled() {
+		e.snd.ccsim.delAckTimer.enable(ccsimDelAckTimeout)
+	}
+}
+
 // ccsimInitTimers initializes the pacing timer (called from newSender).
 func (s *sender) ccsimInitTimers(ep *Endpoint) {
 	s.ccsim.pacingTimer.init(ep.stack.Clock(), timerHandler(ep, func() tcpip.Error {
@@ -270,6 +291,15 @@ func (s *sender) ccsimInitTimers(ep *Endpoint) {
 			return nil
 		}
 		s.sendData()
+		return nil
+	}))
+	s.ccsim.delAckTimer.init(ep.stack.Clock(), timerHandler(ep, func() tcpip.Error {
+		if !s.ccsim.delAckTimer.checkExpiration() {
+			return nil
+		}
+		if ep.rcv != nil && ep.rcv.RcvNxt != s.MaxSentAck {
+			s.sendAck()
+		}
 		return nil
 	}))
 }

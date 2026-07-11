@@ -1,0 +1,42 @@
+<!DOCTYPE html>
+<!-- Minimal wasm smoke page: loads the module in a worker, runs a preset in
+     batch mode and dumps the summary to the console. No charting. -->
+<html>
+<head><meta charset="utf-8"><title>ccsim wasm smoke test</title></head>
+<body>
+<pre id="log">loading…</pre>
+<script>
+  const log = (s) => (document.getElementById("log").textContent += "\n" + s);
+  const worker = new Worker("worker.js");
+  let sampleBytes = 0;
+  const preset = new URLSearchParams(location.search).get("preset") || "cubic-single";
+
+  worker.onmessage = (e) => {
+    const m = e.data;
+    switch (m.type) {
+      case "ready":
+        log(`wasm ready; loading preset ${preset}`);
+        fetch(`../scenarios/${preset}.json`)
+          .then((r) => r.text())
+          .then((scenario) => worker.postMessage({ op: "load", scenario }));
+        break;
+      case "loaded":
+        log("scenario loaded; running (batch)…");
+        worker.postMessage({ op: "run" });
+        break;
+      case "samples":
+        sampleBytes += m.buf.byteLength;
+        break;
+      case "summary":
+        log(`sample stream: ${sampleBytes} bytes`);
+        log("summary: " + JSON.stringify(m.summary, null, 2));
+        console.log("ccsim summary", m.summary);
+        break;
+      case "error":
+        log("ERROR: " + m.error);
+        break;
+    }
+  };
+</script>
+</body>
+</html>

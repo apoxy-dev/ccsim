@@ -166,6 +166,22 @@ type pipe struct {
 	extraDelay map[int]time.Duration
 	busy       bool // serializer transmitting
 	seq        uint64
+
+	// Serializer timer state (single reusable timer, no per-packet
+	// closures: this path runs a quarter million times per simulated
+	// 30 s at 100 Mbps).
+	txTimer tcpip.Timer
+	txPkt   *Packet
+
+	// Propagation-delay stage: time-ordered pending deliveries drained by
+	// one reusable timer.
+	delivQ     []delivEntry
+	delivTimer tcpip.Timer
+}
+
+type delivEntry struct {
+	at time.Duration
+	pk *Packet
 }
 
 // now returns the current virtual time as a duration since epoch.
@@ -224,11 +240,19 @@ func (p *pipe) startNext() {
 	}
 	p.busy = true
 	tx := time.Duration(int64(pk.Size()) * 8 * int64(time.Second) / p.rateBps)
-	p.link.clk.AfterFunc(tx, func() { p.txDone(pk) })
+	p.txPkt = pk
+	if p.txTimer == nil {
+		p.txTimer = p.link.clk.AfterFunc(tx, p.onTxTimer)
+	} else {
+		p.txTimer.Reset(tx)
+	}
 }
 
-// txDone runs when the last bit of pk has been serialized onto the wire.
-func (p *pipe) txDone(pk *Packet) {
+// onTxTimer runs when the last bit of the current packet has been
+// serialized onto the wire.
+func (p *pipe) onTxTimer() {
+	pk := p.txPkt
+	p.txPkt = nil
 	// Wire loss applies after serialization.
 	if p.lossP > 0 && p.rng.Float64() < p.lossP {
 		p.qdiscDropped(pk, DropWire)
@@ -237,20 +261,59 @@ func (p *pipe) txDone(pk *Packet) {
 		if extra, ok := p.extraDelay[pk.Flow]; ok {
 			d += extra
 		}
-		p.link.clk.AfterFunc(d, func() { p.deliver(pk) })
+		p.scheduleDelivery(p.now()+d, pk)
 	}
 	p.startNext()
 }
 
-// deliver hands the packet to the peer stack.
-func (p *pipe) deliver(pk *Packet) {
-	if h := p.link.hooks.OnDeliver; h != nil {
-		h(p.event(pk, 0))
+// scheduleDelivery inserts pk into the time-ordered pending list and arms
+// the delivery timer for the head entry.
+func (p *pipe) scheduleDelivery(at time.Duration, pk *Packet) {
+	e := delivEntry{at: at, pk: pk}
+	// Almost always append (per-flow extra delay can reorder tails).
+	i := len(p.delivQ)
+	for i > 0 && p.delivQ[i-1].at > at {
+		i--
 	}
-	// The endpoint that receives traffic from direction d is the opposite
-	// side's endpoint: Fwd traffic arrives at the Rev-sending endpoint.
-	dst := p.link.eps[1-p.dir]
-	dst.inject(pk)
+	p.delivQ = append(p.delivQ, delivEntry{})
+	copy(p.delivQ[i+1:], p.delivQ[i:])
+	p.delivQ[i] = e
+	if i == 0 {
+		p.armDelivTimer()
+	}
+}
+
+func (p *pipe) armDelivTimer() {
+	d := p.delivQ[0].at - p.now()
+	if d < 0 {
+		d = 0
+	}
+	if p.delivTimer == nil {
+		p.delivTimer = p.link.clk.AfterFunc(d, p.onDelivTimer)
+	} else {
+		p.delivTimer.Reset(d)
+	}
+}
+
+// onDelivTimer delivers all due packets to the peer stack.
+func (p *pipe) onDelivTimer() {
+	now := p.now()
+	for len(p.delivQ) > 0 && p.delivQ[0].at <= now {
+		pk := p.delivQ[0].pk
+		p.delivQ[0].pk = nil
+		p.delivQ = p.delivQ[1:]
+		if h := p.link.hooks.OnDeliver; h != nil {
+			h(p.event(pk, 0))
+		}
+		// The endpoint that receives traffic from direction d is the
+		// opposite side's endpoint.
+		p.link.eps[1-p.dir].inject(pk)
+	}
+	if len(p.delivQ) > 0 {
+		p.armDelivTimer()
+	} else if cap(p.delivQ) > 1024 {
+		p.delivQ = nil // shed the grown backing array
+	}
 }
 
 // Endpoint implements stack.LinkEndpoint. Packets written by its stack are
@@ -269,11 +332,13 @@ var _ stack.LinkEndpoint = (*Endpoint)(nil)
 func (e *Endpoint) WritePackets(pkts stack.PacketBufferList) (int, tcpip.Error) {
 	n := 0
 	for _, pb := range pkts.AsSlice() {
-		v := pb.ToView()
-		data := v.AsSlice()
-		buf := make([]byte, len(data))
-		copy(buf, data)
-		v.Release()
+		// Single copy: flatten the packet buffer directly into a fresh
+		// slice owned by the link model.
+		buf := make([]byte, pb.Size())
+		off := 0
+		for _, sl := range pb.AsSlices() {
+			off += copy(buf[off:], sl)
+		}
 		e.link.pipes[e.sendDir].send(buf)
 		n++
 	}

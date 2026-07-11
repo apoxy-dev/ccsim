@@ -300,7 +300,8 @@ func (b *BBR) updateLossECN(rs tcp.SimRateSample) {
 	if b.roundStart && b.ackedBytesRound > 0 {
 		// Per-round ECN alpha update (draft: once per round trip).
 		ceFrac := float64(b.ceBytesRound) / float64(b.ackedBytesRound)
-		b.ecnAlpha = (1-ecnAlphaGain)*b.ecnAlpha + ecnAlphaGain*ceFrac
+		// Explicit conversions block FMA fusion (native/wasm parity).
+		b.ecnAlpha = float64((1-ecnAlphaGain)*b.ecnAlpha) + float64(ecnAlphaGain*ceFrac)
 	}
 }
 
@@ -674,7 +675,7 @@ func (b *BBR) adaptLowerBounds() {
 	if ecnCut {
 		// Draft ECN response: scale the short-term bounds by
 		// (1 - alpha * ecnFactor).
-		scale := 1 - b.ecnAlpha*ecnFactor
+		scale := 1 - float64(b.ecnAlpha*ecnFactor)
 		if scale < 1.0/3 {
 			scale = 1.0 / 3
 		}

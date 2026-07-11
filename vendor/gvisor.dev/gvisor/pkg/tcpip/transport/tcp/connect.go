@@ -1278,8 +1278,16 @@ func (e *Endpoint) handleSegmentsLocked() tcpip.Error {
 	}
 
 	// Send an ACK for all processed packets if needed.
+	// ccsim patch: with synchronous dispatch every inbound segment is its
+	// own batch, which would produce one ACK per data segment; apply a
+	// classic delayed-ACK policy instead (ack every second full segment,
+	// else within the delack timeout).
 	if e.rcv.RcvNxt != e.snd.MaxSentAck {
-		e.snd.sendAck()
+		if !SimSynchronousDispatch {
+			e.snd.sendAck()
+		} else {
+			e.ccsimMaybeDelayAck()
+		}
 	}
 
 	e.resetKeepaliveTimer(true /* receivedData */)

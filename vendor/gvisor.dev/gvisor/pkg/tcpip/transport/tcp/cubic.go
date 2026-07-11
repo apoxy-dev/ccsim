@@ -223,7 +223,8 @@ func (c *cubicState) Update(packetsAcked int, rtt time.Duration) {
 // cubicCwnd computes the CUBIC congestion window after t seconds from last
 // congestion event.
 func (c *cubicState) cubicCwnd(t float64) float64 {
-	return c.C*math.Pow(t, 3.0) + c.WMax
+	// ccsim patch: float64 conversion blocks FMA fusion (native/wasm parity).
+	return float64(c.C*math.Pow(t, 3.0)) + c.WMax
 }
 
 // getCwnd returns the current congestion window as computed by CUBIC.
@@ -237,7 +238,7 @@ func (c *cubicState) getCwnd(packetsAcked, sndCwnd int, srtt time.Duration) int 
 	c.WC = c.cubicCwnd(elapsedSeconds - c.K)
 
 	// Compute the TCP friendly estimate of the congestion window.
-	c.WEst = c.WMax*c.Beta + (3.0*((1.0-c.Beta)/(1.0+c.Beta)))*(elapsedSeconds/srtt.Seconds())
+	c.WEst = float64(c.WMax*c.Beta) + float64((3.0*((1.0-c.Beta)/(1.0+c.Beta)))*(elapsedSeconds/srtt.Seconds())) // ccsim patch: no FMA
 
 	// Make sure in the TCP friendly region CUBIC performs at least
 	// as well as Reno.

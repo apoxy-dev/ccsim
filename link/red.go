@@ -60,7 +60,8 @@ func (q *RED) Enqueue(pk *Packet, now time.Duration) bool {
 		q.avg *= math.Pow(1-q.p.Wq, idleMs)
 		q.idle = false
 	}
-	q.avg = (1-q.p.Wq)*q.avg + q.p.Wq*float64(q.len())
+	// Explicit conversions block FMA fusion (native/wasm parity).
+	q.avg = float64((1-q.p.Wq)*q.avg) + float64(q.p.Wq*float64(q.len()))
 
 	if q.limitPkts > 0 && q.len()+1 > q.limitPkts {
 		q.sink.qdiscDropped(pk, DropTail)
@@ -74,14 +75,14 @@ func (q *RED) Enqueue(pk *Packet, now time.Duration) bool {
 		case q.avg >= 2*q.p.MaxTh:
 			pb = 1
 		case q.avg >= q.p.MaxTh: // gentle RED
-			pb = q.p.MaxP + (q.avg-q.p.MaxTh)/q.p.MaxTh*(1-q.p.MaxP)
+			pb = q.p.MaxP + float64((q.avg-q.p.MaxTh)/q.p.MaxTh*(1-q.p.MaxP))
 		default:
 			pb = q.p.MaxP * (q.avg - q.p.MinTh) / (q.p.MaxTh - q.p.MinTh)
 		}
 		q.count++
 		pa := pb
 		if q.count > 0 && float64(q.count)*pb < 1 {
-			pa = pb / (1 - float64(q.count)*pb)
+			pa = pb / (1 - float64(float64(q.count)*pb))
 		}
 		if q.rng() < pa {
 			q.count = 0

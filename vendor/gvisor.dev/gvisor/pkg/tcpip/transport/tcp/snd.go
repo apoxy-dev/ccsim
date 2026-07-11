@@ -475,8 +475,11 @@ func (s *sender) updateRTO(rtt time.Duration) {
 
 			alphaPrime := alpha / expectedSamples
 			betaPrime := beta / expectedSamples
-			rttVar := (1-betaPrime)*s.rtt.TCPRTTState.RTTVar.Seconds() + betaPrime*diff.Seconds()
-			srtt := (1-alphaPrime)*s.rtt.TCPRTTState.SRTT.Seconds() + alphaPrime*rtt.Seconds()
+			// ccsim patch: explicit float64 conversions force intermediate
+			// rounding so the compiler cannot fuse multiply-adds (FMA);
+			// fusion would make native (arm64) and wasm runs diverge.
+			rttVar := float64((1-betaPrime)*s.rtt.TCPRTTState.RTTVar.Seconds()) + float64(betaPrime*diff.Seconds())
+			srtt := float64((1-alphaPrime)*s.rtt.TCPRTTState.SRTT.Seconds()) + float64(alphaPrime*rtt.Seconds())
 			s.rtt.TCPRTTState.RTTVar = time.Duration(rttVar * float64(time.Second))
 			s.rtt.TCPRTTState.SRTT = time.Duration(srtt * float64(time.Second))
 		}
