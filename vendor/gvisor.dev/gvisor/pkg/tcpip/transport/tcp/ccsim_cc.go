@@ -115,6 +115,18 @@ func (h SimSender) Now() time.Duration {
 // InRecovery reports whether the sender is in loss recovery.
 func (h SimSender) InRecovery() bool { return h.s.inRecovery() }
 
+// LocalPort returns the connection's local port (stable per-flow identity,
+// used to derive deterministic per-flow randomness).
+func (h SimSender) LocalPort() uint16 { return h.s.ep.ID.LocalPort }
+
+// SetSsthresh sets the sender's slow-start threshold (packets).
+func (h SimSender) SetSsthresh(v int) {
+	if v < 2 {
+		v = 2
+	}
+	h.s.Ssthresh = v
+}
+
 // SimCC is the extended congestion control interface for registered CCs.
 // It embeds the four upstream congestionControl methods plus the ccsim
 // extensions.
@@ -254,6 +266,9 @@ func (s *sender) ccsimInitCC(name tcpip.CongestionControlOption, stock congestio
 // ccsimInitTimers initializes the pacing timer (called from newSender).
 func (s *sender) ccsimInitTimers(ep *Endpoint) {
 	s.ccsim.pacingTimer.init(ep.stack.Clock(), timerHandler(ep, func() tcpip.Error {
+		if !s.ccsim.pacingTimer.checkExpiration() {
+			return nil
+		}
 		s.sendData()
 		return nil
 	}))

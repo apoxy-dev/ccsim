@@ -82,3 +82,171 @@ func TestScenarioBufferbloatCubic(t *testing.T) {
 	}
 	t.Logf("srtt=%.1fms goodput=%.1f", srtt, goodput)
 }
+
+// Scenario 3: bbr-single — high utilization with low standing queue,
+// ProbeRTT visible, ProbeBW reached quickly.
+func TestScenarioBBRSingle(t *testing.T) {
+	recs, sum := runScenario(t, "bbr-single", nil)
+	const baseRTT = 0.040
+	goodput := probe.GoodputMbps(recs, 0, 5, 30)
+	if goodput < 90 {
+		t.Errorf("goodput over [5,30]s = %.1f Mbps, want >= 90", goodput)
+	}
+	srtt := probe.MeanOf(recs, 0, stream.KindSRTTSec, 5, 30)
+	if srtt > 1.35*baseRTT {
+		t.Errorf("mean srtt %.1f ms, want <= %.1f ms", srtt*1000, 1.35*baseRTT*1000)
+	}
+	// State machine reaches ProbeBW by t=3s.
+	_, states := probe.Series(recs, 0, stream.KindCCState, 0, 3)
+	reached := false
+	for _, s := range states {
+		if int(s) >= 2 && int(s) <= 5 { // any ProbeBW phase
+			reached = true
+			break
+		}
+	}
+	if !reached {
+		t.Error("state machine did not reach ProbeBW by t=3s")
+	}
+	// At least one ProbeRTT entry within any 12s window.
+	ts, states2 := probe.Series(recs, 0, stream.KindCCState, 0, 30)
+	var probeRTTs []float64
+	for i, s := range states2 {
+		if int(s) == 6 { // ProbeRTT
+			probeRTTs = append(probeRTTs, ts[i])
+		}
+	}
+	if len(probeRTTs) == 0 {
+		t.Error("no ProbeRTT entries observed")
+	}
+	for w := 0.0; w+12 <= 30; w += 1 {
+		found := false
+		for _, pt := range probeRTTs {
+			if pt >= w && pt < w+12 {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Errorf("no ProbeRTT in window [%.0f,%.0f]s", w, w+12)
+			break
+		}
+	}
+	t.Logf("goodput=%.1f srtt=%.1fms probertt_samples=%d rtos=%d retrans=%d",
+		goodput, srtt*1000, len(probeRTTs), sum.Flows[0].RTOs, sum.Flows[0].Retransmits)
+}
+
+// Scenario 4b: bufferbloat with bbr — low delay at high utilization.
+func TestScenarioBufferbloatBBR(t *testing.T) {
+	recs, _ := runScenario(t, "bufferbloat", func(c *scenario.ScenarioConfig) {
+		c.Flows[0].CC = "bbr"
+	})
+	const baseRTTms = 30.0
+	srtt := probe.MeanOf(recs, 0, stream.KindSRTTSec, 10, 30) * 1000
+	if srtt > 1.5*baseRTTms {
+		t.Errorf("bbr mean srtt over [10,30]s = %.1f ms, want <= %.1f", srtt, 1.5*baseRTTms)
+	}
+	goodput := probe.GoodputMbps(recs, 0, 5, 30)
+	if goodput < 0.85*50 {
+		t.Errorf("goodput %.1f Mbps, want >= 42.5", goodput)
+	}
+	t.Logf("srtt=%.1fms goodput=%.1f", srtt, goodput)
+}
+
+// Scenario 5: random-loss — bbr shrugs off 1% loss, cubic collapses.
+func TestScenarioRandomLoss(t *testing.T) {
+	recsC, _ := runScenario(t, "random-loss", nil) // preset is cubic
+	recsB, _ := runScenario(t, "random-loss", func(c *scenario.ScenarioConfig) {
+		c.Flows[0].CC = "bbr"
+	})
+	gpC := probe.GoodputMbps(recsC, 0, 5, 30)
+	gpB := probe.GoodputMbps(recsB, 0, 5, 30)
+	if gpB < 3*gpC {
+		t.Errorf("bbr %.1f Mbps < 3x cubic %.1f Mbps", gpB, gpC)
+	}
+	if gpB < 50 {
+		t.Errorf("bbr goodput %.1f Mbps, want >= 50%% of link (50)", gpB)
+	}
+	t.Logf("cubic=%.1f bbr=%.1f Mbps", gpC, gpB)
+}
+
+// Scenario 6: fairness — cubic and bbr share a 2xBDP tail-drop bottleneck.
+// Documents BBRv3's coexistence claim.
+func TestScenarioFairness(t *testing.T) {
+	recs, _ := runScenario(t, "fairness", nil)
+	gp0 := probe.GoodputMbps(recs, 0, 20, 60) // cubic
+	gp1 := probe.GoodputMbps(recs, 1, 20, 60) // bbr
+	agg := gp0 + gp1
+	if agg < 90 {
+		t.Errorf("aggregate %.1f Mbps, want >= 90", agg)
+	}
+	for i, gp := range []float64{gp0, gp1} {
+		share := gp / agg
+		if share < 0.25 || share > 0.75 {
+			t.Errorf("flow %d share %.0f%% outside [25%%,75%%] (cubic=%.1f bbr=%.1f)",
+				i, share*100, gp0, gp1)
+		}
+	}
+	t.Logf("cubic=%.1f bbr=%.1f aggregate=%.1f", gp0, gp1, agg)
+}
+
+// Scenario 7: rate-step — bbr adapts down within 3s and back up within 5s.
+func TestScenarioRateStep(t *testing.T) {
+	recs, _ := runScenario(t, "rate-step", nil)
+	// Within 3s after the downstep at t=15: delivery rate <= 30 Mbps and
+	// inflight drained below 1.5x the new BDP (25 Mbps x 20 ms = 62.5 kB).
+	dlv := probe.MeanOf(recs, 0, stream.KindDeliveryBps, 17, 18) / 1e6
+	if dlv > 30 {
+		t.Errorf("delivery rate %.1f Mbps at t=18s, want <= 30", dlv)
+	}
+	infl := probe.MeanOf(recs, 0, stream.KindInflightBytes, 17.8, 18)
+	newBDP := 25e6 / 8 * 0.020
+	if infl > 1.5*newBDP {
+		t.Errorf("inflight %.0f B at t=18s, want <= %.0f (1.5x new BDP)", infl, 1.5*newBDP)
+	}
+	// Within 5s after the upstep at t=30: goodput >= 80 Mbps.
+	gp := probe.GoodputMbps(recs, 0, 35, 45)
+	if gp < 80 {
+		t.Errorf("goodput %.1f Mbps after upstep, want >= 80", gp)
+	}
+	t.Logf("post-down dlv=%.1f infl=%.0f post-up gp=%.1f", dlv, infl, gp)
+}
+
+// Scenario 8: ecn-codel — CE marks appear, bbr reacts without loss, both
+// flows keep srtt low.
+func TestScenarioECNCoDel(t *testing.T) {
+	recs, sum := runScenario(t, "ecn-codel", nil)
+	if sum.CEMarks == 0 {
+		t.Fatal("no CE marks observed")
+	}
+	// bbr (flow 0) reacted to CE: an inflight_lo/bw_lo cut is visible as a
+	// cwnd trajectory that stays bounded without packet loss for flow 0.
+	if sum.Flows[0].Retransmits > 50 {
+		t.Errorf("bbr flow had %d retransmits; ECN response should mostly avoid loss",
+			sum.Flows[0].Retransmits)
+	}
+	const baseRTTms = 20.0
+	for i := 0; i < 2; i++ {
+		srtt := probe.MeanOf(recs, uint16(i), stream.KindSRTTSec, 5, 30) * 1000
+		if srtt > 2*baseRTTms {
+			t.Errorf("flow %d mean srtt %.1f ms, want <= %.1f", i, srtt, 2*baseRTTms)
+		}
+	}
+	t.Logf("ce_marks=%d bbr_retrans=%d cubic_retrans=%d",
+		sum.CEMarks, sum.Flows[0].Retransmits, sum.Flows[1].Retransmits)
+}
+
+// Scenario 9: rr-fct — request/response FCTs recorded and sane.
+func TestScenarioRRFCT(t *testing.T) {
+	_, sum := runScenario(t, "rr-fct", nil)
+	rr := sum.Flows[1]
+	if rr.FCTCount == 0 {
+		t.Fatal("no FCTs recorded")
+	}
+	const baseRTTms = 40.0
+	if rr.FCTP95Ms < rr.FCTP50Ms || rr.FCTP50Ms < baseRTTms {
+		t.Errorf("FCT sanity failed: p50=%.1f p95=%.1f (base rtt %.0f)",
+			rr.FCTP50Ms, rr.FCTP95Ms, baseRTTms)
+	}
+	t.Logf("fct n=%d p50=%.0f p95=%.0f p99=%.0f ms", rr.FCTCount, rr.FCTP50Ms, rr.FCTP95Ms, rr.FCTP99Ms)
+}

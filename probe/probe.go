@@ -55,22 +55,22 @@ type RunSummary struct {
 }
 
 type flowState struct {
-	cc         string
-	srtts      []float64 // ms
-	fcts       []float64 // ms
-	appBytes   uint64
-	prevCwnd   float64
-	prevRetr   uint64
-	prevRTOs   uint64
-	prevLoss   uint64
-	prevState  int
-	cwndCuts   int
-	retrans    uint64
-	rtos       uint64
-	started    bool
-	lastAcked  uint64
-	firstTick  time.Duration
-	lastTick   time.Duration
+	cc        string
+	srtts     []float64 // ms
+	fcts      []float64 // ms
+	appBytes  uint64
+	prevCwnd  float64
+	prevRetr  uint64
+	prevRTOs  uint64
+	prevLoss  uint64
+	prevState int
+	cwndCuts  int
+	retrans   uint64
+	rtos      uint64
+	started   bool
+	lastAcked uint64
+	firstTick time.Duration
+	lastTick  time.Duration
 }
 
 // Recorder writes the sample stream and maintains run summary accumulators.

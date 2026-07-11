@@ -59,10 +59,10 @@ type Hooks struct {
 
 // Config is the runtime-independent link configuration.
 type Config struct {
-	RateBps  int64         // serialization rate, bits/s (both directions)
-	Delay    time.Duration // one-way propagation delay per direction
-	LossP    float64       // Bernoulli per-packet wire loss probability
-	MTU      uint32        // link MTU (default 1500)
+	RateBps   int64         // serialization rate, bits/s (both directions)
+	Delay     time.Duration // one-way propagation delay per direction
+	LossP     float64       // Bernoulli per-packet wire loss probability
+	MTU       uint32        // link MTU (default 1500)
 	MakeQdisc func(dir Dir, sink QdiscSink) Qdisc
 }
 

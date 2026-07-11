@@ -57,6 +57,19 @@ type flow struct {
 	srvRespOwed int             // server: response bytes not yet written
 }
 
+// maybeEnableECT stamps ECT(0) on the endpoint's traffic when the scenario
+// queue does ECN marking (the ccsim netstack patch lets the ECN bits
+// through; stock netstack masks them).
+func (f *flow) maybeEnableECT(ep tcpip.Endpoint) {
+	if !f.sim.cfg.Link.Queue.ECN {
+		return
+	}
+	tcp.SimAllowECTTOS = true
+	if err := ep.SetSockOptInt(tcpip.IPv4TOSOption, 0x02); err != nil {
+		panic(fmt.Sprintf("sim: flow %d set ECT: %s", f.id, err))
+	}
+}
+
 func (f *flow) sndPort() uint16 { return uint16(sndPortBase + f.id) }
 func (f *flow) rcvPort() uint16 { return uint16(rcvPortBase + f.id) }
 
@@ -68,6 +81,7 @@ func (f *flow) setupListener() error {
 		return fmt.Errorf("sim: flow %d listener: %s", f.id, err)
 	}
 	f.lep, f.lwq = ep, &wq
+	f.maybeEnableECT(ep)
 	if err := ep.Bind(tcpip.FullAddress{NIC: nicID, Addr: receiverAddr, Port: f.rcvPort()}); err != nil {
 		return fmt.Errorf("sim: flow %d bind: %s", f.id, err)
 	}
@@ -90,6 +104,7 @@ func (f *flow) start() error {
 		return fmt.Errorf("sim: flow %d endpoint: %s", f.id, err)
 	}
 	f.ep, f.wq = ep, &wq
+	f.maybeEnableECT(ep)
 	cc := tcpip.CongestionControlOption(f.cfg.CC)
 	if err := ep.SetSockOpt(&cc); err != nil {
 		return fmt.Errorf("sim: flow %d set cc %q: %s", f.id, f.cfg.CC, err)

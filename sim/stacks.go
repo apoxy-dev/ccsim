@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"math/rand"
 
+	"ccsim/bbr"
 	vclock "ccsim/clock"
 
 	"gvisor.dev/gvisor/pkg/tcpip"
@@ -42,6 +43,8 @@ func (r *detReader) Read(p []byte) (int, error) {
 }
 
 func init() {
+	// Register the BBRv3 implementation with the patched netstack.
+	bbr.Register()
 	// Determinism requirement: all TCP segment processing must happen on
 	// the event-loop goroutine (see the ccsim patch in
 	// vendor/.../transport/tcp/ccsim_sync.go).
