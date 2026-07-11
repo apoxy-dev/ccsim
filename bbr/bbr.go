@@ -34,6 +34,41 @@ import (
 	"gvisor.dev/gvisor/pkg/tcpip/transport/tcp"
 )
 
+// The BBRv3 state machine (draft-ietf-ccwg-bbr-03):
+//
+//	+---------+                              +-------+
+//	| Startup | -- full pipe: bw plateau, -> | Drain |
+//	+---------+    excess loss, or ECN       +-------+
+//	                                             |
+//	                            inflight <= BDP  |
+//	                                             v
+//	+----------------------------------------------------------+
+//	| ProbeBW                       (entry: DOWN)              |
+//	|                                                          |
+//	|     +------+                              +--------+     |
+//	|     | DOWN | - inflight <= BDP and -----> | CRUISE |     |
+//	|     +------+   <= 0.85*inflight_hi        +--------+     |
+//	|      ^   |                                    |          |
+//	|      |   | probe timer expired                | time to  |
+//	|      |   | (drain unreachable)                | probe    |
+//	|      |   |                                    v          |
+//	|      |   |                                +--------+     |
+//	|      |   +------------------------------> | REFILL |     |
+//	|      |                                    +--------+     |
+//	|      | loss/ECN gate (> 2%)                   |          |
+//	|      | or probe done                          | 1 round  |
+//	|      |                                        |          |
+//	|     +----+                                    |          |
+//	|     | UP | <----------------------------------+          |
+//	|     +----+                                               |
+//	+----------------------------------------------------------+
+//
+// ProbeRTT is entered from any state when min_rtt has not been refreshed
+// for probeRTTInterval (5 s); it caps cwnd at 0.5*BDP, holds for 200 ms
+// once inflight is under the cap, then exits to ProbeBW:CRUISE (pipe
+// full) or back to Startup (pipe not yet full). Entering DOWN advances
+// the max-bw filter; entering REFILL releases bw_lo/inflight_lo.
+//
 // State codes exported through the probe layer.
 const (
 	StateStartup = iota
