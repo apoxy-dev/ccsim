@@ -22,8 +22,9 @@ type ScenarioConfig struct {
 // LinkConfig describes the bottleneck link.
 type LinkConfig struct {
 	RateMbps float64     `json:"rate_mbps"`
-	OwdMs    float64     `json:"owd_ms"` // one-way delay, each direction
-	Loss     float64     `json:"loss"`   // bernoulli, per packet
+	OwdMs    float64     `json:"owd_ms"`               // one-way delay, each direction
+	RevOwdMs float64     `json:"rev_owd_ms,omitempty"` // reverse-direction delay override (0 = symmetric)
+	Loss     float64     `json:"loss"`                 // bernoulli, per packet
 	Queue    QueueConfig `json:"queue"`
 }
 
@@ -45,6 +46,7 @@ type FlowConfig struct {
 	CC         string    `json:"cc"` // "cubic" | "bbr" | "reno"
 	StartAt    float64   `json:"start_at_s"`
 	ExtraOwdMs float64   `json:"extra_owd_ms,omitempty"`
+	Reverse    bool      `json:"reverse,omitempty"` // data flows receiver->sender (two-way traffic scenarios)
 	App        AppConfig `json:"app"`
 }
 
@@ -116,6 +118,9 @@ func (c *ScenarioConfig) Validate() error {
 	if c.Link.OwdMs < 0 {
 		return fmt.Errorf("scenario: link.owd_ms must be >= 0, got %v", c.Link.OwdMs)
 	}
+	if c.Link.RevOwdMs < 0 {
+		return fmt.Errorf("scenario: link.rev_owd_ms must be >= 0, got %v", c.Link.RevOwdMs)
+	}
 	if c.Link.Loss < 0 || c.Link.Loss >= 1 {
 		return fmt.Errorf("scenario: link.loss must be in [0,1), got %v", c.Link.Loss)
 	}
@@ -161,10 +166,11 @@ func (c *ScenarioConfig) Validate() error {
 			return fmt.Errorf("scenario: events[%d].at_s %v outside [0,%v]", i, e.At, c.Dur)
 		}
 		switch e.Path {
-		case "link.rate_mbps", "link.loss", "link.owd_ms", "link.queue.limit_pkts", "link.queue.limit_bytes":
+		case "link.rate_mbps", "link.loss", "link.owd_ms", "link.queue.limit_pkts",
+			"link.queue.limit_bytes", "link.drop_next":
 		default:
 			return fmt.Errorf("scenario: events[%d].path %q is not live-settable "+
-				"(want link.rate_mbps|link.loss|link.owd_ms|link.queue.limit_pkts|link.queue.limit_bytes)", i, e.Path)
+				"(want link.rate_mbps|link.loss|link.owd_ms|link.queue.limit_pkts|link.queue.limit_bytes|link.drop_next)", i, e.Path)
 		}
 		var v float64
 		if err := json.Unmarshal(e.Value, &v); err != nil {

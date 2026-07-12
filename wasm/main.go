@@ -60,6 +60,12 @@ func load(this js.Value, args []js.Value) any {
 	if err != nil {
 		return errResult(err)
 	}
+	// Tear down the previous session's netstacks: their goroutines would
+	// otherwise pin the whole old sim (~30 MB per run) for the life of the
+	// page — a leak the memtest harness catches within a few reloads.
+	if cur != nil && cur.sim != nil {
+		cur.sim.Close()
+	}
 	s := &session{}
 	if len(args) > 1 {
 		s.onSamples = args[1]

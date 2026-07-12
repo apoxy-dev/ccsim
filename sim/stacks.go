@@ -19,8 +19,12 @@ const (
 	rcvAddr4 = "\x0a\x00\x00\x02" // 10.0.0.2
 
 	// Buffer sizes chosen so window never limits the CC in any preset
-	// (bufferbloat needs ~10 MB of inflight).
-	bufSize = 32 << 20
+	// (bufferbloat needs ~10 MB of inflight). Scenarios whose BDP + queue
+	// exceeds this floor get proportionally larger buffers (see bufSizeFor);
+	// without that, high-BDP runs silently become window-limited and every
+	// result is a receive-window artifact.
+	bufSizeFloor = 32 << 20
+	bufSizeCap   = 1 << 30
 )
 
 var (
@@ -52,7 +56,7 @@ func init() {
 }
 
 // newStack builds one netstack instance bound to a link endpoint.
-func newStack(clk *vclock.Clock, seed int64, ep stack.LinkEndpoint, addr tcpip.Address) (*stack.Stack, error) {
+func newStack(clk *vclock.Clock, seed int64, ep stack.LinkEndpoint, addr tcpip.Address, bufSize int) (*stack.Stack, error) {
 	s := stack.New(stack.Options{
 		NetworkProtocols:   []stack.NetworkProtocolFactory{ipv4.NewProtocol},
 		TransportProtocols: []stack.TransportProtocolFactory{tcp.NewProtocol},

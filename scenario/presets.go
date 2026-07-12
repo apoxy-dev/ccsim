@@ -84,6 +84,28 @@ func Presets() map[string]*ScenarioConfig {
 				Queue: QueueConfig{Kind: "fqcodel", ECN: true}},
 			Flows: []FlowConfig{bulk("bbr", 0), bulk("cubic", 0)},
 		},
+		// The next three mirror validation-suite experiments (BBR operating
+		// point, cubic/bbr coexistence at 1xBDP, cubic through CoDel) so
+		// their streams are covered by the golden regression test and
+		// reproducible from the CLI.
+		"bbr-op-point": {
+			Seed: 33, Dur: 60,
+			Link: LinkConfig{RateMbps: 100, OwdMs: 20,
+				Queue: QueueConfig{Kind: "taildrop", LimitPkts: 1332}}, // 4 x BDP
+			Flows: []FlowConfig{bulk("bbr", 0)},
+		},
+		"coexist-1bdp": {
+			Seed: 400, Dur: 60,
+			Link: LinkConfig{RateMbps: 100, OwdMs: 15,
+				Queue: QueueConfig{Kind: "taildrop", LimitPkts: 250}}, // 1 x BDP
+			Flows: []FlowConfig{bulk("cubic", 0), bulk("bbr", 0)},
+		},
+		"codel-cubic": {
+			Seed: 21, Dur: 30,
+			Link: LinkConfig{RateMbps: 50, OwdMs: 10,
+				Queue: QueueConfig{Kind: "codel"}},
+			Flows: []FlowConfig{bulk("cubic", 0)},
+		},
 		"rr-fct": {
 			Seed: 9, Dur: 30,
 			Link: LinkConfig{RateMbps: 20, OwdMs: 20,

@@ -12,6 +12,7 @@ import (
 
 	"gvisor.dev/gvisor/pkg/tcpip"
 	"gvisor.dev/gvisor/pkg/tcpip/network/ipv4"
+	"gvisor.dev/gvisor/pkg/tcpip/stack"
 	"gvisor.dev/gvisor/pkg/tcpip/transport/tcp"
 	"gvisor.dev/gvisor/pkg/waiter"
 )
@@ -73,16 +74,27 @@ func (f *flow) maybeEnableECT(ep tcpip.Endpoint) {
 func (f *flow) sndPort() uint16 { return uint16(sndPortBase + f.id) }
 func (f *flow) rcvPort() uint16 { return uint16(rcvPortBase + f.id) }
 
+// endpoints returns the connecting (data-sender) and listening stacks with
+// their addresses. A reverse flow swaps the roles: its data crosses the
+// link's reverse direction (two-way traffic scenarios).
+func (f *flow) endpoints() (connStack *stack.Stack, connAddr tcpip.Address, lisStack *stack.Stack, lisAddr tcpip.Address) {
+	if f.cfg.Reverse {
+		return f.sim.rcvStack, receiverAddr, f.sim.sndStack, senderAddr
+	}
+	return f.sim.sndStack, senderAddr, f.sim.rcvStack, receiverAddr
+}
+
 // setupListener creates the receiver-side listening socket at load time.
 func (f *flow) setupListener() error {
+	_, _, lisStack, lisAddr := f.endpoints()
 	var wq waiter.Queue
-	ep, err := f.sim.rcvStack.NewEndpoint(tcp.ProtocolNumber, ipv4.ProtocolNumber, &wq)
+	ep, err := lisStack.NewEndpoint(tcp.ProtocolNumber, ipv4.ProtocolNumber, &wq)
 	if err != nil {
 		return fmt.Errorf("sim: flow %d listener: %s", f.id, err)
 	}
 	f.lep, f.lwq = ep, &wq
 	f.maybeEnableECT(ep)
-	if err := ep.Bind(tcpip.FullAddress{NIC: nicID, Addr: receiverAddr, Port: f.rcvPort()}); err != nil {
+	if err := ep.Bind(tcpip.FullAddress{NIC: nicID, Addr: lisAddr, Port: f.rcvPort()}); err != nil {
 		return fmt.Errorf("sim: flow %d bind: %s", f.id, err)
 	}
 	if err := ep.Listen(2); err != nil {
@@ -98,8 +110,9 @@ func (f *flow) setupListener() error {
 // start creates the sender endpoint and initiates the connect. Called at the
 // flow's start_at time.
 func (f *flow) start() error {
+	connStack, connAddr, _, lisAddr := f.endpoints()
 	var wq waiter.Queue
-	ep, err := f.sim.sndStack.NewEndpoint(tcp.ProtocolNumber, ipv4.ProtocolNumber, &wq)
+	ep, err := connStack.NewEndpoint(tcp.ProtocolNumber, ipv4.ProtocolNumber, &wq)
 	if err != nil {
 		return fmt.Errorf("sim: flow %d endpoint: %s", f.id, err)
 	}
@@ -109,7 +122,7 @@ func (f *flow) start() error {
 	if err := ep.SetSockOpt(&cc); err != nil {
 		return fmt.Errorf("sim: flow %d set cc %q: %s", f.id, f.cfg.CC, err)
 	}
-	if err := ep.Bind(tcpip.FullAddress{NIC: nicID, Addr: senderAddr, Port: f.sndPort()}); err != nil {
+	if err := ep.Bind(tcpip.FullAddress{NIC: nicID, Addr: connAddr, Port: f.sndPort()}); err != nil {
 		return fmt.Errorf("sim: flow %d bind: %s", f.id, err)
 	}
 	entry := waiter.NewFunctionEntry(waiter.WritableEvents, func(waiter.EventMask) {
@@ -121,7 +134,7 @@ func (f *flow) start() error {
 	})
 	f.wq.EventRegister(&rentry)
 
-	err2 := ep.Connect(tcpip.FullAddress{NIC: nicID, Addr: receiverAddr, Port: f.rcvPort()})
+	err2 := ep.Connect(tcpip.FullAddress{NIC: nicID, Addr: lisAddr, Port: f.rcvPort()})
 	if _, ok := err2.(*tcpip.ErrConnectStarted); !ok && err2 != nil {
 		return fmt.Errorf("sim: flow %d connect: %s", f.id, err2)
 	}

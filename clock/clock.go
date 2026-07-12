@@ -101,6 +101,20 @@ func (c *Clock) Next() (time.Time, bool) {
 	return time.Time{}, false
 }
 
+// Pending returns the number of scheduled (not stopped) timers. Tests use
+// it to bound timer leakage at teardown.
+func (c *Clock) Pending() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	n := 0
+	for _, t := range c.timers {
+		if t.state == timerScheduled {
+			n++
+		}
+	}
+	return n
+}
+
 // Advance moves virtual time forward by d, firing all timers due in
 // (now, now+d] in timestamp order (ties by schedule order). Callbacks run
 // synchronously on the calling goroutine and may schedule further timers,

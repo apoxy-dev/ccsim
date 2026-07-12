@@ -58,10 +58,17 @@ func New(cfg *scenario.ScenarioConfig, w *stream.Writer) (*Sim, error) {
 	s.rec.PacketEvents = cfg.Sample.PacketEvents
 
 	qcfg := cfg.Link.Queue
+	hasReverse := false
+	for _, f := range cfg.Flows {
+		if f.Reverse {
+			hasReverse = true
+		}
+	}
 	makeQdisc := func(dir link.Dir, sink link.QdiscSink) link.Qdisc {
-		// The reverse direction always gets a plain deep FIFO: the
-		// scenario's discipline shapes the data direction.
-		if dir == link.Rev {
+		// The reverse direction gets a plain deep FIFO (it carries only
+		// ACKs) — unless the scenario runs reverse data flows, in which
+		// case both directions are shaped by the configured discipline.
+		if dir == link.Rev && !hasReverse {
 			return link.NewTailDrop(1<<16, 0, sink)
 		}
 		return buildQdisc(qcfg, cfg.Seed, sink)
@@ -73,18 +80,22 @@ func New(cfg *scenario.ScenarioConfig, w *stream.Writer) (*Sim, error) {
 		MakeQdisc: makeQdisc,
 	}, cfg.Seed, s.rec.LinkHooks())
 	s.lnk.Classify = s.classify
+	if cfg.Link.RevOwdMs > 0 {
+		s.lnk.SetDirDelay(link.Rev, time.Duration(cfg.Link.RevOwdMs*float64(time.Millisecond)))
+	}
 
 	// Registered CCs derive their per-flow randomness from the scenario
 	// seed via SimSender.Seed() (per-process sim configuration, like
 	// SimSynchronousDispatch; one sim runs at a time).
 	tcp.SimSeed = uint64(cfg.Seed)
 
+	bufSize := bufSizeFor(cfg)
 	var err error
-	s.sndStack, err = newStack(s.clk, cfg.Seed^0x5E4D1, s.lnk.Endpoint(link.Fwd), senderAddr)
+	s.sndStack, err = newStack(s.clk, cfg.Seed^0x5E4D1, s.lnk.Endpoint(link.Fwd), senderAddr, bufSize)
 	if err != nil {
 		return nil, err
 	}
-	s.rcvStack, err = newStack(s.clk, cfg.Seed^0x2ECF2, s.lnk.Endpoint(link.Rev), receiverAddr)
+	s.rcvStack, err = newStack(s.clk, cfg.Seed^0x2ECF2, s.lnk.Endpoint(link.Rev), receiverAddr, bufSize)
 	if err != nil {
 		return nil, err
 	}
@@ -130,6 +141,40 @@ func New(cfg *scenario.ScenarioConfig, w *stream.Writer) (*Sim, error) {
 	s.clk.AfterFunc(s.sampleIntv, tick)
 
 	return s, nil
+}
+
+// bufSizeFor sizes the fixed socket buffers so the window never limits the
+// congestion controller: twice the worst-case inflight (BDP plus the full
+// bottleneck queue), floored at 32 MB. All original presets stay below the
+// floor, so their behavior is unchanged; high-BDP scenarios (1 Gbps x
+// 300 ms) grow the buffers instead of silently going window-limited.
+func bufSizeFor(cfg *scenario.ScenarioConfig) int {
+	rttS := (cfg.Link.OwdMs + cfg.Link.OwdMs) / 1000
+	if cfg.Link.RevOwdMs > 0 {
+		rttS = (cfg.Link.OwdMs + cfg.Link.RevOwdMs) / 1000
+	}
+	for _, f := range cfg.Flows {
+		if extra := 2 * f.ExtraOwdMs / 1000; extra > 0 {
+			rttS += extra
+		}
+	}
+	bdp := cfg.Link.RateMbps * 1e6 / 8 * rttS
+	var queueBytes float64
+	switch cfg.Link.Queue.Kind {
+	case "taildrop", "red":
+		queueBytes = float64(cfg.Link.Queue.LimitBytes)
+		if b := float64(cfg.Link.Queue.LimitPkts) * 1500; b > queueBytes {
+			queueBytes = b
+		}
+	}
+	need := int(2 * (bdp + queueBytes))
+	if need < bufSizeFloor {
+		return bufSizeFloor
+	}
+	if need > bufSizeCap {
+		return bufSizeCap
+	}
+	return need
 }
 
 // buildQdisc constructs the configured forward-direction discipline.
@@ -223,7 +268,8 @@ func (s *Sim) flowMetrics(f *flow) probe.FlowMetrics {
 	}
 	// Stack-global counters; exact per-flow values come from the sender
 	// tap once the CC integration patch fills them in.
-	tstats := s.sndStack.Stats().TCP
+	connStack, _, _, _ := f.endpoints()
+	tstats := connStack.Stats().TCP
 	if len(s.flows) == 1 {
 		m.Retransmits = tstats.Retransmits.Value()
 		m.RTOs = tstats.Timeouts.Value()
@@ -245,11 +291,30 @@ func (s *Sim) Set(path string, v float64) error {
 		s.lnk.SetQueueLimit(int(v), 0)
 	case "link.queue.limit_bytes":
 		s.lnk.SetQueueLimit(0, int(v))
+	case "link.drop_next":
+		// Scripted loss: force-drop the next int(v) packets entering the
+		// data direction (analytical single-loss experiments).
+		s.lnk.DropNext(link.Fwd, int(v))
 	default:
 		return fmt.Errorf("sim: path %q is not live-settable", path)
 	}
 	return nil
 }
+
+// InjectAt schedules a live-settable parameter change at virtual time at
+// (absolute, from sim start), exactly as a pre-declared scenario event would
+// be. Callable while the sim is running, from between-slice callbacks.
+func (s *Sim) InjectAt(at time.Duration, path string, v float64) {
+	s.clk.AfterFunc(at-s.clk.Elapsed(), func() {
+		if err := s.Set(path, v); err != nil {
+			panic(err)
+		}
+	})
+}
+
+// PendingTimers exposes the clock's scheduled-timer count for invariant
+// checks (timer leak detection in the fuzz suite).
+func (s *Sim) PendingTimers() int { return s.clk.Pending() }
 
 // Step advances virtual time by dt (bounded by the configured duration).
 func (s *Sim) Step(dt time.Duration) {
@@ -288,4 +353,18 @@ func (s *Sim) Finish() probe.RunSummary {
 		s.rec.W.Flush()
 	}
 	return s.rec.Summary(s.endT)
+}
+
+// Close tears down both netstack instances so the sim becomes collectible.
+// Each stack pins ~10 goroutines (and through them the whole object graph,
+// ~29 MB per cubic-single run); without Close, hosts that create sims in a
+// loop — the browser page reloading presets, the fuzz suite — leak the
+// full sim per iteration. Safe to call once, after the sim is done.
+func (s *Sim) Close() {
+	for _, st := range []*stack.Stack{s.sndStack, s.rcvStack} {
+		if st != nil {
+			st.Destroy()
+		}
+	}
+	s.sndStack, s.rcvStack = nil, nil
 }
