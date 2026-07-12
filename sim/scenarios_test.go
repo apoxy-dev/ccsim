@@ -31,6 +31,7 @@ func rawRun(t *testing.T, name string, mut func(*scenario.ScenarioConfig)) []byt
 		t.Fatal(err)
 	}
 	s.Run(nil)
+	s.Close()
 	return buf.Bytes()
 }
 

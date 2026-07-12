@@ -35,6 +35,7 @@ func runScenarioE(name string, mut func(*scenario.ScenarioConfig)) ([]stream.Rec
 		return nil, probe.RunSummary{}, err
 	}
 	sum := s.Run(nil)
+	s.Close()
 	recs, err := stream.Decode(buf.Bytes())
 	if err != nil {
 		return nil, probe.RunSummary{}, err
