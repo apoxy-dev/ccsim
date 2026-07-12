@@ -132,6 +132,18 @@ func (l *Link) SetDelay(d time.Duration) {
 	}
 }
 
+// SetDirDelay updates the one-way propagation delay of one direction
+// (asymmetric-path scenarios).
+func (l *Link) SetDirDelay(d Dir, delay time.Duration) {
+	l.pipes[d].delay = delay
+}
+
+// DropNext forces the next n packets entering direction d to be dropped
+// before queueing (scripted single-loss events for analytical tests).
+func (l *Link) DropNext(d Dir, n int) {
+	l.pipes[d].forceDrop += n
+}
+
 // SetQueueLimit updates queue limits on the forward-direction qdisc.
 func (l *Link) SetQueueLimit(pkts, bytes int) {
 	l.pipes[Fwd].q.SetLimit(pkts, bytes)
@@ -166,6 +178,7 @@ type pipe struct {
 	extraDelay map[int]time.Duration
 	busy       bool // serializer transmitting
 	seq        uint64
+	forceDrop  int // pending scripted drops (DropNext)
 
 	// Serializer timer state (single reusable timer, no per-packet
 	// closures: this path runs a quarter million times per simulated
@@ -215,6 +228,11 @@ func (p *pipe) send(data []byte) {
 	pk.seq = p.seq
 	if c := p.link.Classify; c != nil {
 		pk.Flow = c(pk)
+	}
+	if p.forceDrop > 0 {
+		p.forceDrop--
+		p.qdiscDropped(pk, DropForced)
+		return
 	}
 	if dropped := p.q.Enqueue(pk, p.now()); dropped {
 		return

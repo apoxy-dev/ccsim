@@ -6,9 +6,10 @@ import "time"
 type DropReason int
 
 const (
-	DropTail DropReason = iota // queue limit exceeded
-	DropAQM                    // active queue management decision (RED/CoDel)
-	DropWire                   // random wire loss
+	DropTail   DropReason = iota // queue limit exceeded
+	DropAQM                      // active queue management decision (RED/CoDel)
+	DropWire                     // random wire loss
+	DropForced                   // scripted drop injected by the scenario
 )
 
 func (r DropReason) String() string {
@@ -19,6 +20,8 @@ func (r DropReason) String() string {
 		return "aqm"
 	case DropWire:
 		return "wire"
+	case DropForced:
+		return "forced"
 	}
 	return "?"
 }
@@ -46,29 +49,45 @@ type Qdisc interface {
 	SetLimit(pkts, bytes int)
 }
 
-// fifo is a simple slice-backed packet FIFO used as a building block.
+// fifo is a ring-buffer packet FIFO used as a building block. A ring
+// (rather than a slide-forward slice) keeps the enqueue/dequeue hot path
+// allocation-free: the previous append/reslice pattern allocated once per
+// packet whenever the queue oscillated around empty, which is the common
+// uncongested case.
 type fifo struct {
-	pkts  []*Packet
+	pkts  []*Packet // ring storage; nil until first push
+	head  int
+	count int
 	bytes int
 }
 
 func (q *fifo) push(p *Packet) {
-	q.pkts = append(q.pkts, p)
+	if q.count == len(q.pkts) {
+		grown := make([]*Packet, max(16, 2*len(q.pkts)))
+		for i := 0; i < q.count; i++ {
+			grown[i] = q.pkts[(q.head+i)%len(q.pkts)]
+		}
+		q.pkts = grown
+		q.head = 0
+	}
+	q.pkts[(q.head+q.count)%len(q.pkts)] = p
+	q.count++
 	q.bytes += p.Size()
 }
 
 func (q *fifo) pop() *Packet {
-	if len(q.pkts) == 0 {
+	if q.count == 0 {
 		return nil
 	}
-	p := q.pkts[0]
-	q.pkts[0] = nil
-	q.pkts = q.pkts[1:]
+	p := q.pkts[q.head]
+	q.pkts[q.head] = nil
+	q.head = (q.head + 1) % len(q.pkts)
+	q.count--
 	q.bytes -= p.Size()
 	return p
 }
 
-func (q *fifo) len() int { return len(q.pkts) }
+func (q *fifo) len() int { return q.count }
 
 // TailDrop is a FIFO with packet- and/or byte-count limits (0 = unlimited,
 // but at least one limit must be set by the caller for a finite queue).
