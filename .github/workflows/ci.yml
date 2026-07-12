@@ -1,0 +1,47 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    - cron: "17 3 * * *" # nightly: slow sweeps + fuzz + wasm memory
+  workflow_dispatch:
+
+jobs:
+  # PR gate: build, vet, fast suite (smoke + conformance + AQM + property
+  # smoke + golden streams), and the wasm build. Perf budgets are logged
+  # but not asserted on shared runners (CCSIM_PERF unset).
+  fast:
+    if: github.event_name == 'push' || github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - run: go build ./... && go vet ./...
+      - run: go test ./... -timeout 20m
+      - run: GOOS=js GOARCH=wasm GOWASM=satconv,signext go build -o wasm/main.wasm ./wasm
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: node stream/decoder_test.mjs
+
+  # Nightly: long-duration sweeps, the 200-iteration fuzz, wasm parity and
+  # the wasm memory-stability harness.
+  nightly:
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: go test -tags slow ./sim -run 'TestSlow|TestScenarioFuzz' -v -timeout 90m
+      - run: GOOS=js GOARCH=wasm GOWASM=satconv,signext go build -o wasm/main.wasm ./wasm
+      - run: node wasm/memtest.mjs wasm/main.wasm wasm/wasm_exec.js scenarios/bufferbloat.json 20

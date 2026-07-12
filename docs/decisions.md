@@ -130,6 +130,31 @@ checksum offload: packets never cross a real wire, so TCP checksum
 computation/validation would only burn simulation CPU. (IPv4 header
 checksums are still maintained, including after CE re-marking.)
 
+## 9a. Validation-suite harness additions (no vendor changes)
+
+Added for the validation suite (docs/validation.md), all in ccsim packages:
+
+- **`Sim.Close()`** destroys both netstacks. Each stack pins ~10 goroutines
+  which kept every replaced sim reachable (~29 MB/run); the wasm page
+  leaked a full sim per preset load until `load()` started closing the
+  previous session. Regression-tested natively
+  (`TestSimCloseReleasesResources`) and in node (`wasm/memtest.mjs`).
+- **Ring-buffer fifo** in link/qdisc.go: the slide-forward slice allocated
+  once per packet whenever a queue oscillated around empty (the common
+  uncongested case — measured exactly 1.0 allocs/packet). Byte-identical
+  streams, now 0.0 allocs/packet.
+- **Socket-buffer auto-sizing** (`bufSizeFor`): 2x(BDP + bottleneck queue),
+  floored at the old fixed 32 MB. All original presets sit below the floor
+  (behavior unchanged); 1 Gbps x 300 ms scenarios no longer go silently
+  window-limited.
+- **Reverse flows** (`flows[].reverse`) for two-way traffic, and the
+  reverse direction gets the scenario's qdisc (instead of the deep ACK
+  FIFO) only when reverse data flows exist — with the deep FIFO, the
+  reverse bulk flow enjoyed an effectively unlimited buffer and starved
+  the forward flow (30/93 Mbps split; symmetric queues give 77/77).
+- **`link.drop_next` inject path** and **`rev_owd_ms`** for scripted
+  single-loss experiments (cubic curve fit) and asymmetric paths.
+
 ## 9. SetPipe rewritten as a single-pass cursor walk
 
 Profiling the bufferbloat preset showed 87% of the run's CPU inside

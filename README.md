@@ -21,12 +21,15 @@ cmd/ccsim/  CLI runner
 wasm/       thin wasm entry + worker glue + node parity runner + smoke page
 scenarios/  preset scenario JSON files
 docs/       decisions.md — design notes for every forced deviation
+            validation.md — validation methodology, findings, measured tables
 ```
 
 ## Running
 
 ```sh
-go test ./...                                   # everything incl. 10 smoke scenarios
+go test ./...                                   # fast suite: smoke + validation + goldens
+go test -tags slow ./sim -run TestSlow -v       # nightly sweeps (Mathis, fairness, coexistence)
+make validate                                   # fast + slow + perf budgets + wasm memory
 go build -o ccsim ./cmd/ccsim
 ./ccsim -preset bufferbloat -summary            # human table
 ./ccsim -scenario scenarios/rate-step.json -out run.bin -json
@@ -34,6 +37,15 @@ GOOS=js GOARCH=wasm go build -o wasm/main.wasm ./wasm
 node wasm/parity.mjs wasm/main.wasm wasm/wasm_exec.js scenarios/cubic-single.json out.bin
 node stream/decoder_test.mjs                    # JS decoder unit test
 ```
+
+The validation suite (docs/validation.md) checks the harness against
+published models — cubic's W(t)=C·(t−K)³+W_max fits with C=0.410 and
+R²=0.9999, the RFC 9438 loss-response function within 0.68–0.95× per
+point, RED's marking curve by χ² against the exact ramp pmf — plus BBRv3
+draft conformance, invariant fuzzing, golden-stream regressions
+(`sim/testdata/golden.json`, regenerate with `-update -reason "..."`) and
+performance budgets. Measured tables in docs/validation.md are written by
+the tests themselves under `-update`.
 
 Browser demo: build `wasm/main.wasm` as above, serve the repo root
 (`python3 -m http.server`), open `/wasm/index.html?preset=bufferbloat`.
