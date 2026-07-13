@@ -1,0 +1,193 @@
+// Accumulates decoded sample records from one run and resamples them into
+// the normalized point model the figures share: x = inflight/BDP,
+// y = delivery/BtlBw, r = srtt/base-RTT, q = bottleneck queue (packets).
+
+import { Kind, LINK_FWD, LINK_REV } from '../../../stream/decoder.mjs'
+import type { Rec } from './sim-client'
+import type { Derived } from './scenario'
+
+interface Track {
+  t: number[]
+  v: number[]
+}
+
+const newTrack = (): Track => ({ t: [], v: [] })
+
+// BBR state codes exported through the probe layer (bbr.StateName order),
+// mapped onto the design's phase keys.
+const BBR_PHASE = [
+  'startup',
+  'drain',
+  'bw:down',
+  'bw:cruise',
+  'bw:refill',
+  'bw:up',
+  'probertt',
+] as const
+
+export type Phase = (typeof BBR_PHASE)[number]
+
+export class RunData {
+  inflight = newTrack() // bytes
+  cwnd = newTrack() // packets
+  srtt = newTrack() // seconds
+  delivery = newTrack() // bits/s
+  ccState = newTrack()
+  qDepth = newTrack() // packets, forward link
+  lossEvents: number[] = [] // cwnd-cut times
+  dropEvents: number[] = [] // forward-link drop times
+  maxT = 0
+
+  push(recs: Rec[]) {
+    for (const r of recs) {
+      if (r.t > this.maxT) this.maxT = r.t
+      // Forward drops are attributed to the owning flow when known, with
+      // LINK_FWD as fallback; reverse-direction (ACK-path) drops arrive as
+      // LINK_REV and are excluded — they are not bottleneck-queue events.
+      if (r.kind === Kind.Drop) {
+        if (r.flow !== LINK_REV) this.dropEvents.push(r.t)
+        continue
+      }
+      if (r.flow === LINK_FWD) {
+        if (r.kind === Kind.QDepthPkts) {
+          this.qDepth.t.push(r.t)
+          this.qDepth.v.push(r.value)
+        }
+        continue
+      }
+      if (r.flow === LINK_REV) continue
+      switch (r.kind) {
+        case Kind.InflightBytes:
+          this.inflight.t.push(r.t)
+          this.inflight.v.push(r.value)
+          break
+        case Kind.CwndPkts:
+          this.cwnd.t.push(r.t)
+          this.cwnd.v.push(r.value)
+          break
+        case Kind.SRTTSec:
+          this.srtt.t.push(r.t)
+          this.srtt.v.push(r.value)
+          break
+        case Kind.DeliveryBps:
+          this.delivery.t.push(r.t)
+          this.delivery.v.push(r.value)
+          break
+        case Kind.CCState:
+          this.ccState.t.push(r.t)
+          this.ccState.v.push(r.value)
+          break
+        case Kind.LossRecovery:
+          this.lossEvents.push(r.t)
+          break
+      }
+    }
+  }
+}
+
+export interface Pt {
+  t: number
+  x: number // inflight, ×BDP
+  y: number // delivery, ×BtlBw
+  r: number // srtt, ×base RTT
+  q: number // bottleneck queue, packets
+  phase?: Phase
+}
+
+export interface LossMark {
+  t: number
+  x: number
+  y: number
+  r: number // srtt ratio at the loss — buffer-overflow losses sit at the cliff, random losses do not
+}
+
+// Walks a time-ordered track alongside the resample grid; O(n) overall.
+class Cursor {
+  private i = 0
+  private tr: Track
+  constructor(tr: Track) {
+    this.tr = tr
+  }
+  at(t: number): number {
+    while (this.i + 1 < this.tr.t.length && this.tr.t[this.i + 1] <= t) this.i++
+    if (this.tr.t.length === 0 || this.tr.t[this.i] > t) return NaN
+    return this.tr.v[this.i]
+  }
+}
+
+// bbrPhases: CCState codes only decode as BBR phases for a bbr flow; cubic
+// exports different (recovery) codes that must not be phase-labeled.
+export function toPts(run: RunData, d: Derived, rateMbps: number, bbrPhases: boolean, dt = 0.02): Pt[] {
+  const inf = new Cursor(run.inflight)
+  const cwn = new Cursor(run.cwnd)
+  const rtt = new Cursor(run.srtt)
+  const del = new Cursor(run.delivery)
+  const st = new Cursor(run.ccState)
+  const q = new Cursor(run.qDepth)
+  const btlBps = rateMbps * 1e6
+  const pts: Pt[] = []
+  const n = Math.floor(run.maxT / dt)
+  for (let i = 0; i <= n; i++) {
+    const t = i * dt
+    // InflightBytes is SND.NXT−SND.UNA (RFC 6675 outstanding): during loss
+    // recovery a pinned SND.UNA inflates it by the SACK-hole span, far past
+    // what is actually in the network. Capping at cwnd recovers the paper's
+    // "amount inflight" operating point; outside recovery inflight ≤ cwnd
+    // anyway, so the cap is inert.
+    let infB = inf.at(t)
+    const cwB = cwn.at(t) * 1500
+    if (!Number.isNaN(cwB)) infB = Math.min(infB, cwB)
+    const rttS = rtt.at(t)
+    const delB = del.at(t)
+    const code = st.at(t)
+    const qP = q.at(t)
+    const x = Number.isNaN(infB) ? 0.02 : Math.max(infB / d.bdpBytes, 0.02)
+    let y = Number.isNaN(delB) ? 0.02 : Math.max(delB / btlBps, 0.02)
+    let r = Number.isNaN(rttS) ? 1 : Math.max((rttS * 1000) / d.baseMs, 1)
+    // Project onto the feasible envelope. srtt and the delivery estimate
+    // measure packets ACKed an RTT ago, while x is instantaneous, so a
+    // fast inflight change briefly pairs a fresh x with stale estimators —
+    // placing points in the figure's infeasible regions (RTT below the
+    // queue-implied delay, delivery above the inflight-implied rate).
+    // Raising r to the envelope and capping y at it restores same-instant
+    // semantics; feasible excursions (srtt loops above the envelope,
+    // delivery dips below it) pass through untouched.
+    r = Math.max(r, Math.min(x, d.cliff))
+    y = Math.min(y, x)
+    pts.push({
+      t,
+      x,
+      y,
+      r,
+      q: Number.isNaN(qP) ? 0 : qP,
+      phase: bbrPhases && !Number.isNaN(code) ? BBR_PHASE[code] : undefined,
+    })
+  }
+  return pts
+}
+
+export function lossMarks(run: RunData, pts: Pt[], d: Derived, dt = 0.02): LossMark[] {
+  return run.lossEvents.map((t) => {
+    const p = ptAt(pts, t, dt)
+    return {
+      t,
+      x: Math.min(p?.x ?? d.cliff, d.cliff),
+      y: Math.min(p?.y ?? 1, 1),
+      r: p?.r ?? Math.min(d.cliff, 2.3),
+    }
+  })
+}
+
+// Coalesces burst losses into at most one visual event per window.
+export function coalesce(times: number[], windowS: number): number[] {
+  const out: number[] = []
+  for (const t of times) {
+    if (out.length === 0 || t - out[out.length - 1] >= windowS) out.push(t)
+  }
+  return out
+}
+
+export function ptAt(pts: Pt[], t: number, dt = 0.02): Pt | undefined {
+  if (pts.length === 0) return undefined
+  return pts[Math.min(pts.length - 1, Math.max(0, Math.round(t / dt)))]
+}

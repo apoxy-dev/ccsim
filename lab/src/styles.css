@@ -1,0 +1,209 @@
+/* CC Lab styles — a small cut of the Apoxy design-system tokens
+   (design project _ds/tokens.css) plus the design prototype's card chrome. */
+
+:root {
+  --apx-ink: #1e1d1c;
+  --apx-graphite: #4a4847;
+  --apx-slate: #6b6967;
+  --apx-stone: #ababab;
+  --apx-fog: #d9d7d3;
+  --apx-mist: #edece8;
+  --apx-paper: #f5f3ee;
+  --apx-bone: #faf8f4;
+  --apx-blue: #3d91dc;
+  --apx-coral: #ea6a4e;
+  --apx-amber: #c28a2a;
+  --font-body: 'Inter', ui-sans-serif, system-ui, sans-serif;
+  --font-mono: 'JetBrains Mono', 'SF Mono', Consolas, monospace;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  background: var(--apx-paper);
+  font-family: var(--font-body);
+  color: var(--apx-ink);
+  -webkit-font-smoothing: antialiased;
+}
+
+a {
+  color: var(--apx-ink);
+  text-decoration: underline;
+}
+a:hover {
+  color: var(--apx-blue);
+}
+
+.page {
+  max-width: 736px;
+  margin: 0 auto;
+  padding: 40px 16px 64px;
+  display: flex;
+  flex-direction: column;
+  gap: 28px;
+}
+
+.hdr-title {
+  font: 600 13px var(--font-mono);
+  letter-spacing: 0.12em;
+  background: var(--apx-ink);
+  color: var(--apx-bone);
+  display: inline-block;
+  padding: 4px 9px;
+}
+
+.hdr-sub {
+  margin-top: 10px;
+  font: 400 12.5px/1.6 var(--font-body);
+  color: var(--apx-graphite);
+  max-width: 64ch;
+}
+
+.fig-card {
+  background: #ffffff;
+  border: 1px solid var(--apx-fog);
+  padding: 20px 22px 16px;
+  overflow-x: auto;
+}
+
+.fig-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  gap: 16px;
+  flex-wrap: wrap;
+  margin-bottom: 8px;
+}
+
+.fig-title {
+  font: 500 11px var(--font-mono);
+  letter-spacing: 0.08em;
+  color: var(--apx-slate);
+}
+
+.fig-legend {
+  display: flex;
+  gap: 16px;
+  font: 500 11px var(--font-mono);
+}
+
+.fig-note {
+  margin-top: 8px;
+  font: 400 11px/1.5 var(--font-body);
+  color: var(--apx-slate);
+}
+
+.fig-readout {
+  display: flex;
+  gap: 24px;
+  font: 400 11px var(--font-mono);
+  color: var(--apx-slate);
+  flex-wrap: wrap;
+}
+
+.transport {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  margin-top: 12px;
+  padding-top: 12px;
+  border-top: 1px solid var(--apx-mist);
+}
+
+.transport-t {
+  font: 500 11px var(--font-mono);
+  color: var(--apx-graphite);
+  min-width: 72px;
+  text-align: right;
+}
+
+.btn-solid {
+  font: 600 10.5px var(--font-mono);
+  letter-spacing: 0.06em;
+  background: var(--apx-ink);
+  color: var(--apx-bone);
+  border: 0;
+  padding: 6px 12px;
+  cursor: pointer;
+  min-width: 64px;
+}
+
+.btn-toggle {
+  font: 600 10.5px var(--font-mono);
+  letter-spacing: 0.06em;
+  background: transparent;
+  color: var(--apx-ink);
+  border: 1px solid var(--apx-ink);
+  padding: 5px 12px;
+  cursor: pointer;
+}
+
+.btn-toggle.on {
+  background: var(--apx-ink);
+  color: var(--apx-bone);
+}
+
+input[type='range'] {
+  -webkit-appearance: none;
+  appearance: none;
+  height: 2px;
+  background: var(--apx-fog);
+  outline: none;
+  margin: 0;
+  flex: 1;
+}
+
+input[type='range']::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 12px;
+  height: 12px;
+  background: var(--apx-ink);
+  border: 0;
+  border-radius: 0;
+  cursor: pointer;
+}
+
+.ctl-card .fig-title {
+  margin-bottom: 12px;
+}
+
+.ctl-row {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+  gap: 16px 24px;
+}
+
+.ctl {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.ctl-label {
+  font: 400 10.5px var(--font-mono);
+  color: var(--apx-slate);
+}
+
+.ctl-label b {
+  color: var(--apx-ink);
+  font-weight: 600;
+}
+
+.ctl-derived {
+  margin-top: 14px;
+  font: 400 11px var(--font-mono);
+  color: var(--apx-graphite);
+}
+
+.err {
+  color: var(--apx-coral);
+}
+
+.ftr {
+  font: 400 11px/1.6 var(--font-body);
+  color: var(--apx-slate);
+}

@@ -1,6 +1,6 @@
 GO ?= go
 
-.PHONY: build test slow fuzz perf wasm wasm-mem validate docs-update
+.PHONY: build test slow fuzz perf wasm wasm-mem validate docs-update lab-assets lab-dev lab-build
 
 build:
 	$(GO) build ./... && $(GO) vet ./...
@@ -18,6 +18,19 @@ perf:
 
 wasm:
 	GOOS=js GOARCH=wasm GOWASM=satconv,signext $(GO) build -o wasm/main.wasm ./wasm
+
+# CC Lab SPA (lab/): the wasm binary and worker glue are served from
+# lab/public/sim/, refreshed from wasm/ on every lab target.
+lab-assets: wasm
+	mkdir -p lab/public/sim
+	rm -f lab/public/sim/main.wasm lab/public/sim/wasm_exec.js lab/public/sim/worker.js
+	cp wasm/main.wasm wasm/wasm_exec.js wasm/worker.js lab/public/sim/
+
+lab-dev: lab-assets
+	cd lab && npm install && npm run dev
+
+lab-build: lab-assets
+	cd lab && npm install && npm run build
 
 wasm-mem: wasm
 	node wasm/memtest.mjs wasm/main.wasm wasm/wasm_exec.js scenarios/bufferbloat.json 20

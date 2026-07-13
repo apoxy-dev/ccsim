@@ -19,6 +19,8 @@ sim/        harness: stacks, flow drivers, event loop, live-settable params
 stream/     20-byte binary sample records; Go encoder + JS reference decoder
 cmd/ccsim/  CLI runner
 wasm/       thin wasm entry + worker glue + node parity runner + smoke page
+lab/        CC Lab — React SPA rendering the wasm sample stream as live
+            figures (operating-point panels, bandwidth-change experiment)
 scenarios/  preset scenario JSON files
 docs/       decisions.md — design notes for every forced deviation
             validation.md — validation methodology, findings, measured tables
@@ -56,6 +58,14 @@ run to finish. The rate / owd / loss / queue sliders mutate the live sim
 mid-run via `set()`. Rendering uses per-pixel min/max binning over the
 full-resolution stream, so loss spikes and sawtooth teeth survive
 decimation. Self-contained page, no chart library.
+
+**CC Lab** (`lab/`) is a Vite + React SPA over the same worker glue:
+`make lab-dev` builds the wasm binary, copies it with the worker into
+`lab/public/sim/`, and starts the dev server. It runs cubic and bbrv3 as
+independent single-flow runs per parameter set and draws the BBR paper's
+Figure-1 operating-point panels (RTT + delivery vs. inflight, live trails)
+and the bandwidth-change experiment (paper figure 3) straight from the
+decoded sample stream. `make lab-build` produces `lab/dist/`.
 
 The sim runs in **batch** mode (flat out) or **paced** mode (the worker glue
 drives `step()` on a wall-clock timer at a configurable sim/real ratio; same
