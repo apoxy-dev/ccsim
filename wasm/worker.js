@@ -31,9 +31,13 @@ self.__ccsimReady = () => {
   postMessage({ type: "ready" });
 };
 
-WebAssembly.instantiateStreaming(fetch("main.wasm"), go.importObject).then(
-  (result) => go.run(result.instance),
-);
+WebAssembly.instantiateStreaming(fetch("main.wasm"), go.importObject)
+  .then((result) => go.run(result.instance))
+  .catch((err) => {
+    // Without this the page waits for a "ready" that never comes (e.g.
+    // main.wasm missing or served with the wrong MIME type).
+    postMessage({ type: "error", error: `wasm bootstrap failed: ${err}`, gen });
+  });
 
 function onSamples(u8) {
   // u8 is a fresh Uint8Array owned by us; transfer its buffer.
