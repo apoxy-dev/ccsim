@@ -223,6 +223,12 @@ input[type='range']::-webkit-slider-thumb {
   color: var(--apx-coral);
 }
 
+.ctl-warn {
+  margin-top: 10px;
+  font: 400 10.5px/1.5 var(--font-mono);
+  color: var(--apx-amber);
+}
+
 .ftr {
   font: 400 11px/1.6 var(--font-body);
   color: var(--apx-slate);

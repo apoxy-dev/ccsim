@@ -1,6 +1,6 @@
 GO ?= go
 
-.PHONY: build test slow fuzz perf wasm wasm-mem validate docs-update lab-assets lab-dev lab-build
+.PHONY: build test slow fuzz perf wasm wasm-mem validate docs-update lab-assets lab-precomp lab-dev lab-build
 
 build:
 	$(GO) build ./... && $(GO) vet ./...
@@ -26,10 +26,20 @@ lab-assets: wasm
 	rm -f lab/public/sim/main.wasm lab/public/sim/wasm_exec.js lab/public/sim/worker.js
 	cp wasm/main.wasm wasm/wasm_exec.js wasm/worker.js lab/public/sim/
 
-lab-dev: lab-assets
+# Precomputed default streams: the native binary renders the default
+# scenarios once; determinism makes the bytes identical to a live wasm
+# run, so the page loads instantly and only runs wasm off-defaults.
+lab-precomp:
+	$(GO) build -o ccsim ./cmd/ccsim
+	node lab/scripts/gen-scenarios.mjs lab/public/sim/pre
+	for s in fig1-cubic fig1-bbr fig1-cubic-lite fig1-bbr-lite fig2-cubic fig2-bbr; do \
+		./ccsim -scenario lab/public/sim/pre/$$s.json -out lab/public/sim/pre/$$s.bin -summary=false || exit 1; \
+	done
+
+lab-dev: lab-assets lab-precomp
 	cd lab && npm install && npm run dev
 
-lab-build: lab-assets
+lab-build: lab-assets lab-precomp
 	cd lab && npm install && npm run build
 
 wasm-mem: wasm

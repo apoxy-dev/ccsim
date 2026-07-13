@@ -9,8 +9,11 @@ import {
   RUN_DUR_S,
   BWSTEP_DUR_S,
   BWSTEP_CFG,
+  SMALL_MACHINE,
   bwStepScenario,
   derive,
+  fig1Precomp,
+  fig2Precomp,
   scenarioFor,
   type LabCfg,
 } from './lib/scenario'
@@ -39,6 +42,19 @@ function Slider({
       </span>
       <input type="range" min={min} max={max} step={step} value={value} onChange={(e) => onChange(+e.target.value)} />
     </label>
+  )
+}
+
+// Precomputed streams cover the defaults; leaving them means simulating
+// live, which few-core devices pay for in wall-clock minutes. Warn before
+// the first slider move, not after.
+function SlowWarning() {
+  if (!SMALL_MACHINE) return null
+  return (
+    <div className="ctl-warn">
+      ⚠ defaults are precomputed — moving a slider runs the simulator live on this device, which
+      can take a while
+    </div>
   )
 }
 
@@ -87,10 +103,20 @@ export function App() {
   // don't restart the sims.
   const cubicScn = useMemo(() => scenarioFor('cubic', cfg), [cfg])
   const bbrScn = useMemo(() => scenarioFor('bbr', cfg), [cfg])
-  const runs = useSimPair(cubicScn, bbrScn)
+  const pre1 = useMemo(() => {
+    const c = fig1Precomp('cubic', cfg)
+    const b = fig1Precomp('bbr', cfg)
+    return c && b ? { cubic: c, bbr: b } : null
+  }, [cfg])
+  const runs = useSimPair(cubicScn, bbrScn, pre1)
   const bwCubicScn = useMemo(() => bwStepScenario('cubic', bwLossPct), [bwLossPct])
   const bwBbrScn = useMemo(() => bwStepScenario('bbr', bwLossPct), [bwLossPct])
-  const bw = useSimPair(bwCubicScn, bwBbrScn)
+  const pre2 = useMemo(() => {
+    const c = fig2Precomp('cubic', bwLossPct)
+    const b = fig2Precomp('bbr', bwLossPct)
+    return c && b ? { cubic: c, bbr: b } : null
+  }, [bwLossPct])
+  const bw = useSimPair(bwCubicScn, bwBbrScn, pre2)
 
   // Re-derive figure points per sample batch; version is the cache key —
   // d/cfg are deliberately omitted because a cfg change replaces the
@@ -162,6 +188,7 @@ export function App() {
               durS={RUN_DUR_S}
               onReset={() => setCfg(DEFAULT_CFG)}
             />
+            <SlowWarning />
           </>
         }
       />
@@ -181,6 +208,7 @@ export function App() {
               durS={BWSTEP_DUR_S}
               onReset={() => setBwLossPct(0)}
             />
+            <SlowWarning />
           </>
         }
       />

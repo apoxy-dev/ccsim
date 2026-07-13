@@ -4,6 +4,7 @@
 // consumers re-derive their views progressively.
 
 import { useEffect, useRef, useState } from 'react'
+import { decode } from '../../../stream/decoder.mjs'
 import { RunData } from './series'
 import { isDisposed, SimClient } from './sim-client'
 import { SMALL_MACHINE } from './scenario'
@@ -37,9 +38,19 @@ export interface SimPair {
   error?: string
 }
 
+// Precomputed default streams (fig1Precomp/fig2Precomp in scenario.ts).
+export interface PrePair {
+  cubic: string
+  bbr: string
+}
+
 // Runs the two scenarios side by side, restarting both whenever either
-// scenario object changes identity — callers must memoize them.
-export function useSimPair(cubicScn: object, bbrScn: object): SimPair {
+// scenario object changes identity — callers must memoize them (pre too).
+// When pre names precomputed streams for this parameter set, they are
+// fetched instead of simulating: determinism guarantees identical bytes,
+// so defaults render instantly and wasm only runs off-defaults. A failed
+// fetch quietly falls back to the live sims.
+export function useSimPair(cubicScn: object, bbrScn: object, pre: PrePair | null): SimPair {
   const [state, setState] = useState<SimPair>(() => ({
     cubic: new RunData(),
     bbr: new RunData(),
@@ -80,8 +91,7 @@ export function useSimPair(cubicScn: object, bbrScn: object): SimPair {
         releaseSlot()
       }
     }
-    const timer = setTimeout(() => {
-      if (!live()) return
+    const startLive = () => {
       // Small machines run the pair back to back — one slot per figure —
       // so both figures make visible progress instead of the first one
       // hogging both slots while the second sits at zero for minutes.
@@ -104,12 +114,33 @@ export function useSimPair(cubicScn: object, bbrScn: object): SimPair {
             setState((s) => ({ ...s, running: false, error: String(e) }))
           }
         })
+    }
+    // Both streams are fetched fully before either is pushed so a partial
+    // failure cannot leave records behind for the live fallback to double.
+    const loadPre = async (p: PrePair) => {
+      const resps = await Promise.all([fetch(p.cubic), fetch(p.bbr)])
+      if (!resps.every((r) => r.ok)) throw new Error('precomputed stream missing')
+      const [cBuf, bBuf] = await Promise.all(resps.map((r) => r.arrayBuffer()))
+      const cRecs = decode(cBuf)
+      const bRecs = decode(bBuf)
+      cubic.push(cRecs)
+      bbr.push(bRecs)
+    }
+    const timer = setTimeout(() => {
+      if (!live()) return
+      if (pre) {
+        loadPre(pre)
+          .then(() => live() && setState((s) => ({ ...s, version: s.version + 1, running: false })))
+          .catch(() => live() && startLive())
+      } else {
+        startLive()
+      }
     }, 250)
     return () => {
       clearTimeout(timer)
       clients.forEach((c) => c.dispose())
     }
-  }, [cubicScn, bbrScn])
+  }, [cubicScn, bbrScn, pre])
 
   return state
 }
