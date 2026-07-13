@@ -141,19 +141,13 @@ export function toPts(run: RunData, d: Derived, rateMbps: number, bbrPhases: boo
     const delB = del.at(t)
     const code = st.at(t)
     const qP = q.at(t)
+    // Values are the measured (ACK-clocked, smoothed) estimates. Time-series
+    // figures plot them as is; the operating-point figure projects them onto
+    // the feasible envelope itself (see figure2a) because its axes assume
+    // same-instant measurement.
     const x = Number.isNaN(infB) ? 0.02 : Math.max(infB / d.bdpBytes, 0.02)
-    let y = Number.isNaN(delB) ? 0.02 : Math.max(delB / btlBps, 0.02)
-    let r = Number.isNaN(rttS) ? 1 : Math.max((rttS * 1000) / d.baseMs, 1)
-    // Project onto the feasible envelope. srtt and the delivery estimate
-    // measure packets ACKed an RTT ago, while x is instantaneous, so a
-    // fast inflight change briefly pairs a fresh x with stale estimators —
-    // placing points in the figure's infeasible regions (RTT below the
-    // queue-implied delay, delivery above the inflight-implied rate).
-    // Raising r to the envelope and capping y at it restores same-instant
-    // semantics; feasible excursions (srtt loops above the envelope,
-    // delivery dips below it) pass through untouched.
-    r = Math.max(r, Math.min(x, d.cliff))
-    y = Math.min(y, x)
+    const y = Number.isNaN(delB) ? 0.02 : Math.max(delB / btlBps, 0.02)
+    const r = Number.isNaN(rttS) ? 1 : Math.max((rttS * 1000) / d.baseMs, 1)
     pts.push({
       t,
       x,

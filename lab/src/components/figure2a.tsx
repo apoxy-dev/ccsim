@@ -2,6 +2,7 @@
 // over delivery rate, sharing one inflight axis, with app-limited /
 // bandwidth-limited / buffer-limited regions and live trails in both panels.
 
+import { useMemo } from 'react'
 import { FigureCard } from './figure-card'
 import { Transport, type TransportState } from './transport'
 import { COLORS, PHASE_LIGHT, cross, trail, type Scale } from '../lib/trail'
@@ -15,8 +16,8 @@ const syR: Scale = (v) => 250 - (Math.min(v, 2.3) - 0.9) * 161.4
 const syD: Scale = (v) => 560 - v * 208
 
 export function Figure2a({
-  cubic,
-  bbr,
+  cubic: cubicRaw,
+  bbr: bbrRaw,
   losses,
   d,
   tr,
@@ -31,6 +32,23 @@ export function Figure2a({
 }) {
   const t = tr.t
   const cliff = Math.min(d.cliff, 2.5)
+
+  // Project measured estimators onto the feasible envelope — only for this
+  // figure. Its axes assume same-instant measurement, but srtt and the
+  // delivery estimate describe packets ACKed an RTT ago while x is
+  // instantaneous, so fast inflight changes would otherwise plot states in
+  // the infeasible regions (RTT below the queue-implied delay, delivery
+  // above the inflight-implied rate). Feasible excursions — srtt loops
+  // above the envelope, delivery dips below it — pass through untouched.
+  // Time-series figures keep the raw measured values.
+  const project = (pts: Pt[]): Pt[] =>
+    pts.map((p) => ({
+      ...p,
+      r: Math.max(p.r, Math.min(p.x, d.cliff)),
+      y: Math.min(p.y, p.x),
+    }))
+  const cubic = useMemo(() => project(cubicRaw), [cubicRaw, d.cliff])
+  const bbr = useMemo(() => project(bbrRaw), [bbrRaw, d.cliff])
   // Inflight clamps at the buffer-full line: in recovery RFC 6675
   // outstanding legitimately exceeds cwnd by the SACKed-hole span, which
   // would otherwise run the trail past the loss point into the infeasible
