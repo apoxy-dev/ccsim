@@ -176,7 +176,15 @@ func (r *Recorder) LinkHooks() link.Hooks {
 		OnDrop: func(e link.Event) {
 			// Wire loss is not a queue drop but still counts as a drop record.
 			r.drops++
-			r.write(e.T, flowOrLink(e), stream.KindDrop, float64(e.Reason))
+			// Reverse-direction drops are attributed to the reverse-link
+			// pseudo-flow rather than the owning flow: the record carries no
+			// direction, and a consumer must be able to tell an ACK lost on
+			// the return path from a forward bottleneck drop.
+			fid := flowOrLink(e)
+			if e.Dir == link.Rev {
+				fid = stream.LinkRev
+			}
+			r.write(e.T, fid, stream.KindDrop, float64(e.Reason))
 		},
 		OnMark: func(e link.Event) {
 			r.marks++
