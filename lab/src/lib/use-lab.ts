@@ -7,6 +7,27 @@ import { useEffect, useRef, useState } from 'react'
 import { RunData } from './series'
 import { isDisposed, SimClient } from './sim-client'
 
+// Global worker-slot limiter. Each sim is a full Go runtime in a worker;
+// four of them contending for a phone's two performance cores makes every
+// run crawl, so small machines run at most two at a time (FIFO queue —
+// figure order on the page is start order).
+const MAX_SIMS =
+  (typeof navigator !== 'undefined' ? navigator.hardwareConcurrency || 4 : 4) >= 8 ? 4 : 2
+let slots = MAX_SIMS
+const waiters: (() => void)[] = []
+const acquireSlot = (): Promise<void> => {
+  if (slots > 0) {
+    slots--
+    return Promise.resolve()
+  }
+  return new Promise((r) => waiters.push(r))
+}
+const releaseSlot = () => {
+  const w = waiters.shift()
+  if (w) w()
+  else slots++
+}
+
 export interface SimPair {
   cubic: RunData
   bbr: RunData
@@ -31,7 +52,7 @@ export function useSimPair(cubicScn: object, bbrScn: object): SimPair {
     const cubic = new RunData()
     const bbr = new RunData()
     setState({ cubic, bbr, version: 0, running: true })
-    let clients: SimClient[] = []
+    const clients: SimClient[] = []
     const live = () => genRef.current === gen
     const bump = () => {
       if (live()) setState((s) => ({ ...s, version: s.version + 1 }))
@@ -41,17 +62,36 @@ export function useSimPair(cubicScn: object, bbrScn: object): SimPair {
     // SimClient spawns a worker that immediately starts fetching and
     // instantiating the wasm module, so creating them per input event
     // would burn a worker pair on every slider tick.
+    // Set when either run fails so a sibling still queued for a slot does
+    // not spawn a worker after the pair is already dead.
+    let aborted = false
+    const runOne = async (scn: object, data: RunData) => {
+      await acquireSlot()
+      if (!live() || aborted) {
+        releaseSlot()
+        return
+      }
+      const client = new SimClient()
+      clients.push(client)
+      try {
+        await client.run(scn, { onRecords: (r) => (data.push(r), bump()) })
+      } finally {
+        releaseSlot()
+      }
+    }
     const timer = setTimeout(() => {
       if (!live()) return
-      clients = [new SimClient(), new SimClient()]
-      Promise.all([
-        clients[0].run(cubicScn, { onRecords: (r) => (cubic.push(r), bump()) }),
-        clients[1].run(bbrScn, { onRecords: (r) => (bbr.push(r), bump()) }),
-      ])
-        .then(() => live() && setState((s) => ({ ...s, running: false })))
+      Promise.all([runOne(cubicScn, cubic), runOne(bbrScn, bbr)])
+        .then(() => {
+          if (live()) setState((s) => ({ ...s, running: false }))
+          // The runs are over and their records accumulated; terminating
+          // the workers frees two idle Go runtimes' worth of memory.
+          clients.forEach((c) => c.dispose())
+        })
         .catch((e) => {
           // One failed run must also stop its sibling, or the error UI
           // renders over a figure that keeps animating.
+          aborted = true
           clients.forEach((c) => c.dispose())
           if (live() && !isDisposed(e)) {
             setState((s) => ({ ...s, running: false, error: String(e) }))

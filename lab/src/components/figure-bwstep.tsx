@@ -135,7 +135,7 @@ export function FigureBwStep({
         </>
       }
     >
-      <svg viewBox="0 0 640 360" width="640" height="360" style={{ display: 'block' }}>
+      <svg viewBox="0 0 640 360" style={{ display: 'block', width: '100%', height: 'auto' }}>
         {lane(20, 110, 'DELIVERY RATE (MBPS)', [
           [yDel(10), '10'],
           [yDel(20), '20'],

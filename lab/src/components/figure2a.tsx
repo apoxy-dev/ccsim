@@ -101,7 +101,7 @@ export function Figure2a({
         </div>
       }
     >
-      <svg viewBox="0 0 640 610" width="640" height="610" style={{ display: 'block' }}>
+      <svg viewBox="0 0 640 610" style={{ display: 'block', width: '100%', height: 'auto' }}>
         <g fontFamily="JetBrains Mono" fontSize={10} fill={COLORS.stone} letterSpacing="0.08em">
           <text x={(56 + xB) / 2} y={14} textAnchor="middle">
             APP-LIMITED
