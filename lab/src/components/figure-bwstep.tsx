@@ -87,15 +87,16 @@ export function FigureBwStep({
       note={
         <>
           {error && <span className="err">run failed: {error} · </span>}
-          The paper's figure 3: on the up-step delivery converges within a probe cycle (max-filter
-          admits the new rate immediately); on the down-step the old BtlBw estimate must age out of
-          the filter, so inflight and rtt spike first, then drain.{' '}
-          {p && (
-            <span style={{ color: COLORS.bbr }}>
-              now: {(p.y * BWSTEP_CFG.rateMbps).toFixed(1)} Mbps · {((p.x * d.bdpBytes) / 1000).toFixed(0)} kB ·{' '}
-              {(p.r * d.baseMs).toFixed(1)} ms · {p.phase}
-            </span>
-          )}
+          <a
+            href="https://spawn-queue.acm.org/doi/pdf/10.1145/3012426.3022184"
+            target="_blank"
+            rel="noreferrer"
+          >
+            The paper's
+          </a>{' '}
+          figure 3: on the up-step delivery converges within a probe cycle (max-filter admits the
+          new rate immediately); on the down-step the old BtlBw estimate must age out of the
+          filter, so inflight and rtt spike first, then drain.
         </>
       }
     >
@@ -147,6 +148,21 @@ export function FigureBwStep({
         <line x1={tx(t)} y1={12} x2={tx(t)} y2={330} stroke={COLORS.ink} strokeWidth={1} strokeOpacity={0.4} />
       </svg>
       <Transport tr={tr} T={BWSTEP_DUR_S} />
+      {/* Fixed-width cells so live values don't reflow the row. */}
+      <div className="fig-readout" style={{ marginTop: 8, color: COLORS.bbr }}>
+        <span className="ro" style={{ minWidth: 96 }}>
+          {p ? `${(p.y * BWSTEP_CFG.rateMbps).toFixed(1)} Mbps` : '—'}
+        </span>
+        <span className="ro" style={{ minWidth: 72 }}>
+          {p ? `${((p.x * d.bdpBytes) / 1000).toFixed(0)} kB` : ''}
+        </span>
+        <span className="ro" style={{ minWidth: 88 }}>
+          {p ? `${(p.r * d.baseMs).toFixed(1)} ms` : ''}
+        </span>
+        <span className="ro" style={{ minWidth: 110 }}>
+          {p?.phase ?? ''}
+        </span>
+      </div>
     </FigureCard>
   )
 }

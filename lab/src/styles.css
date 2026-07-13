@@ -104,6 +104,13 @@ a:hover {
   flex-wrap: wrap;
 }
 
+/* Live readout cell: fixed min-width + tabular digits so changing values
+   never reflow the row. */
+.fig-readout .ro {
+  display: inline-block;
+  font-variant-numeric: tabular-nums;
+}
+
 .transport {
   display: flex;
   align-items: center;

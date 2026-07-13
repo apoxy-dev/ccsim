@@ -83,13 +83,13 @@ export function Figure2a({
       }
       note={
         <div className="fig-readout">
-          <span style={{ color: COLORS.cubic }}>
+          <span className="ro" style={{ minWidth: 200, color: COLORS.cubic }}>
             cubic {pc ? `${pc.x.toFixed(2)} bdp / rtt ${pc.r.toFixed(2)}×` : '—'}
           </span>
-          <span style={{ color: COLORS.bbr }}>
+          <span className="ro" style={{ minWidth: 200, color: COLORS.bbr }}>
             bbrv3 {pb ? `${pb.x.toFixed(2)} bdp / rtt ${pb.r.toFixed(2)}×` : '—'}
           </span>
-          <span>
+          <span className="ro" style={{ minWidth: 180 }}>
             bbr phase:{' '}
             <span style={{ color: (pb?.phase && PHASE_LIGHT[pb.phase]) || COLORS.bbr }}>
               ■ {pb?.phase ?? '—'}
