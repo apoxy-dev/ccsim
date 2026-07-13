@@ -1,0 +1,28 @@
+{
+	admin off
+	auto_https off
+}
+
+:8080 {
+	root * /srv
+	encode zstd gzip
+
+	@immutable path /assets/* /sim/main.*.wasm
+	header @immutable Cache-Control "public, max-age=31536000, immutable"
+	@revalidate {
+		not path /assets/* /sim/main.*.wasm
+	}
+	header @revalidate Cache-Control "no-cache"
+	header {
+		X-Content-Type-Options nosniff
+		Referrer-Policy strict-origin-when-cross-origin
+	}
+
+	# Previously cached workers may still request the original stable WASM URL.
+	# Keep it as a revalidated alias while new workers use the fingerprinted URL.
+	redir /wasm /wasm/ 308
+	rewrite /wasm/ /wasm/index.html
+	rewrite /wasm/main.wasm /sim/main.wasm
+	try_files {path} /index.html
+	file_server
+}

@@ -67,6 +67,17 @@ Figure-1 operating-point panels (RTT + delivery vs. inflight, live trails)
 and the bandwidth-change experiment (paper figure 3) straight from the
 decoded sample stream. `make lab-build` produces `lab/dist/`.
 
+The browser demos are deployed to Fly.io as the `ccsim` app in the
+`apoxy-inc` organization: CC Lab at `/` and the original smoke/demo page at
+`/wasm/`. The multi-stage `Dockerfile` builds one WebAssembly binary and the
+SPA, fingerprints the WASM filename, and injects it into both workers. Caddy
+serves fingerprinted assets with immutable caching while HTML and workers
+always revalidate. Deploy it with:
+
+```sh
+flyctl deploy --config fly.toml
+```
+
 The sim runs in **batch** mode (flat out) or **paced** mode (the worker glue
 drives `step()` on a wall-clock timer at a configurable sim/real ratio; same
 event loop). Live-settable while running: `link.rate_mbps`, `link.loss`,

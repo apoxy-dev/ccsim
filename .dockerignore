@@ -1,0 +1,12 @@
+.git
+.agents
+.claude
+.codex
+.playwright-cli
+ccsim
+*.bin
+wasm/main.wasm
+lab/node_modules
+lab/dist
+lab/public/sim
+lab/*.tsbuildinfo
