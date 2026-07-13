@@ -9,7 +9,16 @@ export interface LabCfg {
   qlimPkts: number
 }
 
-export const DEFAULT_CFG: LabCfg = { rateMbps: 100, owdMs: 20, lossPct: 0, qlimPkts: 350 }
+// Few-core machines are phones and small laptops: Go-wasm sim throughput
+// there is roughly an order of magnitude below native, so they also get a
+// 4× lighter default link (buffer rescaled to keep the same ~1×BDP shape).
+// The sliders still reach the full range.
+export const SMALL_MACHINE =
+  (typeof navigator !== 'undefined' ? navigator.hardwareConcurrency || 4 : 4) < 8
+
+export const DEFAULT_CFG: LabCfg = SMALL_MACHINE
+  ? { rateMbps: 25, owdMs: 20, lossPct: 0, qlimPkts: 90 }
+  : { rateMbps: 100, owdMs: 20, lossPct: 0, qlimPkts: 350 }
 
 export const RUN_DUR_S = 30
 

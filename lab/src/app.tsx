@@ -46,14 +46,14 @@ function StatusLine({
   left,
   error,
   running,
-  loadedT,
+  pct,
   durS,
   onReset,
 }: {
   left?: string
   error?: string
   running: boolean
-  loadedT: number
+  pct: number // combined progress of the pair, 0..1
   durS: number
   onReset: () => void
 }) {
@@ -64,7 +64,7 @@ function StatusLine({
         {error ? (
           <span className="err">{error}</span>
         ) : running ? (
-          `simulating… ${loadedT.toFixed(1)} / ${durS} s`
+          `simulating… ${Math.round(pct * 100)} %`
         ) : (
           `${durS} s × 2 runs ready`
         )}
@@ -158,7 +158,7 @@ export function App() {
               left={`BDP ${Math.round(d.bdpPkts)} pkt · buf ${d.bufX.toFixed(2)}×BDP · base rtt ${d.baseMs} ms`}
               error={runs.error}
               running={runs.running}
-              loadedT={loadedT}
+              pct={(runs.cubic.maxT + runs.bbr.maxT) / (2 * RUN_DUR_S)}
               durS={RUN_DUR_S}
               onReset={() => setCfg(DEFAULT_CFG)}
             />
@@ -177,7 +177,7 @@ export function App() {
             <StatusLine
               error={bw.error}
               running={bw.running}
-              loadedT={bwLoadedT}
+              pct={(bw.cubic.maxT + bw.bbr.maxT) / (2 * BWSTEP_DUR_S)}
               durS={BWSTEP_DUR_S}
               onReset={() => setBwLossPct(0)}
             />

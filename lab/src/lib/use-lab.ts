@@ -6,13 +6,14 @@
 import { useEffect, useRef, useState } from 'react'
 import { RunData } from './series'
 import { isDisposed, SimClient } from './sim-client'
+import { SMALL_MACHINE } from './scenario'
 
 // Global worker-slot limiter. Each sim is a full Go runtime in a worker;
 // four of them contending for a phone's two performance cores makes every
-// run crawl, so small machines run at most two at a time (FIFO queue —
-// figure order on the page is start order).
-const MAX_SIMS =
-  (typeof navigator !== 'undefined' ? navigator.hardwareConcurrency || 4 : 4) >= 8 ? 4 : 2
+// run crawl, so small machines run at most two at a time. Combined with
+// sequential pairs below, that gives every figure exactly one running sim
+// instead of one figure hogging both slots while the other looks dead.
+const MAX_SIMS = SMALL_MACHINE ? 2 : 4
 let slots = MAX_SIMS
 const waiters: (() => void)[] = []
 const acquireSlot = (): Promise<void> => {
@@ -81,7 +82,13 @@ export function useSimPair(cubicScn: object, bbrScn: object): SimPair {
     }
     const timer = setTimeout(() => {
       if (!live()) return
-      Promise.all([runOne(cubicScn, cubic), runOne(bbrScn, bbr)])
+      // Small machines run the pair back to back — one slot per figure —
+      // so both figures make visible progress instead of the first one
+      // hogging both slots while the second sits at zero for minutes.
+      const pair = SMALL_MACHINE
+        ? runOne(cubicScn, cubic).then(() => runOne(bbrScn, bbr))
+        : Promise.all([runOne(cubicScn, cubic), runOne(bbrScn, bbr)])
+      pair
         .then(() => {
           if (live()) setState((s) => ({ ...s, running: false }))
           // The runs are over and their records accumulated; terminating
