@@ -68,8 +68,9 @@ export function App() {
       <header className="hdr">
         <div className="hdr-title">CCSIM — CC LAB</div>
         <div className="hdr-sub">
-          two full netstacks · one bottleneck · deterministic replays — cubic and bbrv3 on
-          independent single-flow runs, drawn from the live wasm sample stream
+          The BBR paper's figures, drawn live: two full gVisor netstack instances — stock Cubic
+          and a from-scratch BBRv3 — drive a simulated bottleneck link in your browser. Move the
+          sliders to reshape the path; every run is deterministic and replays byte-for-byte.
         </div>
       </header>
 
