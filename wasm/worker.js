@@ -25,7 +25,25 @@ importScripts("wasm_exec.js");
 
 const go = new Go();
 let paceTimer = null;
+let streamSeq = 0; // bumped by stopPacing() to cancel an in-flight stream loop
 let gen = 0; // current run generation, echoed on outbound messages
+
+// Unclamped yield between stream batches. setTimeout(0) is subject to timer
+// clamping — iOS Safari under low-power throttling stretches it to hundreds
+// of milliseconds, turning the flat-out stream loop into a real-time
+// slideshow. A MessageChannel ping is an ordinary task with no clamp, and
+// still lets the mailbox drain so set/pause/load land mid-run.
+const yieldChan = new MessageChannel();
+let yieldCb = null;
+yieldChan.port1.onmessage = () => {
+  const cb = yieldCb;
+  yieldCb = null;
+  if (cb) cb();
+};
+function yieldNext(cb) {
+  yieldCb = cb;
+  yieldChan.port2.postMessage(0);
+}
 
 self.__ccsimReady = () => {
   postMessage({ type: "ready" });
@@ -72,9 +90,10 @@ self.onmessage = (e) => {
       // pause / load are honored mid-run) and the sample buffer is flushed
       // (so the chart's leading edge lags sim time by at most one batch).
       stopPacing();
+      const myGen = ++streamSeq;
       const batchMs = m.batch_ms || 250;
       const loop = () => {
-        paceTimer = null;
+        if (myGen !== streamSeq) return;
         const r = ccsim.step(batchMs);
         if (!r.ok) { fail(r); return; }
         ccsim.flush();
@@ -84,7 +103,7 @@ self.onmessage = (e) => {
           f.ok ? postMessage({ type: "summary", summary: JSON.parse(f.summary), gen }) : fail(f);
           return;
         }
-        paceTimer = setTimeout(loop, 0);
+        yieldNext(loop);
       };
       loop();
       break;
@@ -131,11 +150,10 @@ self.onmessage = (e) => {
 };
 
 function stopPacing() {
+  streamSeq++; // invalidates any in-flight stream loop
+  yieldCb = null;
   if (paceTimer !== null) {
-    // paceTimer may hold an interval (pace) or a timeout (stream); the two
-    // clear functions are interchangeable per the HTML spec, but be explicit.
     clearInterval(paceTimer);
-    clearTimeout(paceTimer);
     paceTimer = null;
   }
 }
