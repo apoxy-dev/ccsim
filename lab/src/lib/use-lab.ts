@@ -1,14 +1,13 @@
-// Run orchestration: two independent single-flow sims (cubic + bbr) per
-// parameter set, plus the fixed bandwidth-change run. Records accumulate
+// Run orchestration: each figure drives a pair of independent single-flow
+// sims (cubic + bbr) for one scenario parameter set. Records accumulate
 // into RunData while the workers stream; `version` bumps per batch so
 // consumers re-derive their views progressively.
 
-import { useEffect, useMemo, useRef, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { RunData } from './series'
 import { isDisposed, SimClient } from './sim-client'
-import { bwStepScenario, scenarioFor, type LabCfg } from './scenario'
 
-export interface LabRuns {
+export interface SimPair {
   cubic: RunData
   bbr: RunData
   version: number
@@ -16,8 +15,10 @@ export interface LabRuns {
   error?: string
 }
 
-export function useLabRuns(cfg: LabCfg): LabRuns {
-  const [state, setState] = useState<LabRuns>(() => ({
+// Runs the two scenarios side by side, restarting both whenever either
+// scenario object changes identity — callers must memoize them.
+export function useSimPair(cubicScn: object, bbrScn: object): SimPair {
+  const [state, setState] = useState<SimPair>(() => ({
     cubic: new RunData(),
     bbr: new RunData(),
     version: 0,
@@ -35,16 +36,17 @@ export function useLabRuns(cfg: LabCfg): LabRuns {
     const bump = () => {
       if (live()) setState((s) => ({ ...s, version: s.version + 1 }))
     }
-    // Debounce slider scrubbing. The clients are constructed inside the
-    // timeout on purpose: a SimClient spawns a worker that immediately
-    // starts fetching and instantiating the wasm module, so creating them
-    // per input event would burn a worker pair on every slider tick.
+    // Debounce slider scrubbing (and StrictMode's discarded first mount).
+    // The clients are constructed inside the timeout on purpose: a
+    // SimClient spawns a worker that immediately starts fetching and
+    // instantiating the wasm module, so creating them per input event
+    // would burn a worker pair on every slider tick.
     const timer = setTimeout(() => {
       if (!live()) return
       clients = [new SimClient(), new SimClient()]
       Promise.all([
-        clients[0].run(scenarioFor('cubic', cfg), { onRecords: (r) => (cubic.push(r), bump()) }),
-        clients[1].run(scenarioFor('bbr', cfg), { onRecords: (r) => (bbr.push(r), bump()) }),
+        clients[0].run(cubicScn, { onRecords: (r) => (cubic.push(r), bump()) }),
+        clients[1].run(bbrScn, { onRecords: (r) => (bbr.push(r), bump()) }),
       ])
         .then(() => live() && setState((s) => ({ ...s, running: false })))
         .catch((e) => {
@@ -60,43 +62,7 @@ export function useLabRuns(cfg: LabCfg): LabRuns {
       clearTimeout(timer)
       clients.forEach((c) => c.dispose())
     }
-  }, [cfg])
+  }, [cubicScn, bbrScn])
 
   return state
-}
-
-export interface BwStepRun {
-  run: RunData
-  version: number
-  running: boolean
-  error?: string
-}
-
-export function useBwStepRun(): BwStepRun {
-  const run = useMemo(() => new RunData(), [])
-  const [version, setVersion] = useState(0)
-  const [running, setRunning] = useState(true)
-  const [error, setError] = useState<string>()
-  useEffect(() => {
-    let client: SimClient | null = null
-    // A zero-delay timer keeps StrictMode's discarded first mount from
-    // spawning a worker and starting a throwaway run.
-    const timer = setTimeout(() => {
-      client = new SimClient()
-      client
-        .run(bwStepScenario(), { onRecords: (r) => (run.push(r), setVersion((v) => v + 1)) })
-        .then(() => setRunning(false))
-        .catch((e) => {
-          if (!isDisposed(e)) {
-            setError(String(e))
-            setRunning(false)
-          }
-        })
-    }, 0)
-    return () => {
-      clearTimeout(timer)
-      client?.dispose()
-    }
-  }, [run])
-  return { run, version, running, error }
 }

@@ -2,7 +2,7 @@
 // over delivery rate, sharing one inflight axis, with app-limited /
 // bandwidth-limited / buffer-limited regions and live trails in both panels.
 
-import { useMemo } from 'react'
+import { useMemo, type ReactNode } from 'react'
 import { FigureCard } from './figure-card'
 import { Transport, type TransportState } from './transport'
 import { COLORS, PHASE_LIGHT, cross, trail, type Scale } from '../lib/trail'
@@ -22,6 +22,7 @@ export function Figure2a({
   d,
   tr,
   T,
+  controls,
 }: {
   cubic: Pt[]
   bbr: Pt[]
@@ -29,6 +30,7 @@ export function Figure2a({
   d: Derived
   tr: TransportState
   T: number
+  controls?: ReactNode
 }) {
   const t = tr.t
   const cliff = Math.min(d.cliff, 2.5)
@@ -81,6 +83,7 @@ export function Figure2a({
           <span style={{ color: COLORS.loss }}>× loss</span>
         </div>
       }
+      controls={controls}
       note={
         <div className="fig-readout">
           <span className="ro" style={{ minWidth: 200, color: COLORS.cubic }}>

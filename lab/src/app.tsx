@@ -2,9 +2,18 @@ import { useMemo, useState } from 'react'
 import { Figure2a } from './components/figure2a'
 import { FigureBwStep } from './components/figure-bwstep'
 import { useTransport } from './components/transport'
-import { useBwStepRun, useLabRuns } from './lib/use-lab'
+import { useSimPair } from './lib/use-lab'
 import { lossMarks, toPts } from './lib/series'
-import { DEFAULT_CFG, RUN_DUR_S, BWSTEP_DUR_S, BWSTEP_CFG, derive, type LabCfg } from './lib/scenario'
+import {
+  DEFAULT_CFG,
+  RUN_DUR_S,
+  BWSTEP_DUR_S,
+  BWSTEP_CFG,
+  bwStepScenario,
+  derive,
+  scenarioFor,
+  type LabCfg,
+} from './lib/scenario'
 
 function Slider({
   label,
@@ -33,12 +42,55 @@ function Slider({
   )
 }
 
+function StatusLine({
+  left,
+  error,
+  running,
+  loadedT,
+  durS,
+  onReset,
+}: {
+  left?: string
+  error?: string
+  running: boolean
+  loadedT: number
+  durS: number
+  onReset: () => void
+}) {
+  return (
+    <div className="ctl-derived ctl-status">
+      <span>
+        {left && `${left} · `}
+        {error ? (
+          <span className="err">{error}</span>
+        ) : running ? (
+          `simulating… ${loadedT.toFixed(1)} / ${durS} s`
+        ) : (
+          `${durS} s × 2 runs ready`
+        )}
+      </span>
+      <button className="btn-toggle" onClick={onReset}>
+        RESET
+      </button>
+    </div>
+  )
+}
+
 export function App() {
   const [cfg, setCfg] = useState<LabCfg>(DEFAULT_CFG)
   const d = useMemo(() => derive(cfg), [cfg])
+  const set = (k: keyof LabCfg) => (v: number) => setCfg((c) => ({ ...c, [k]: v }))
 
-  const runs = useLabRuns(cfg)
-  const bw = useBwStepRun()
+  const [bwLossPct, setBwLossPct] = useState(0)
+
+  // Scenario identity drives the run hooks — memoize so unrelated renders
+  // don't restart the sims.
+  const cubicScn = useMemo(() => scenarioFor('cubic', cfg), [cfg])
+  const bbrScn = useMemo(() => scenarioFor('bbr', cfg), [cfg])
+  const runs = useSimPair(cubicScn, bbrScn)
+  const bwCubicScn = useMemo(() => bwStepScenario('cubic', bwLossPct), [bwLossPct])
+  const bwBbrScn = useMemo(() => bwStepScenario('bbr', bwLossPct), [bwLossPct])
+  const bw = useSimPair(bwCubicScn, bwBbrScn)
 
   // Re-derive figure points per sample batch; version is the cache key —
   // d/cfg are deliberately omitted because a cfg change replaces the
@@ -52,50 +104,86 @@ export function App() {
     [runs.bbr, runs.version],
   )
   const losses = useMemo(() => lossMarks(runs.cubic, cubicPts, d), [cubicPts])
-  const bwPts = useMemo(
-    () => toPts(bw.run, derive(BWSTEP_CFG), BWSTEP_CFG.rateMbps, true),
-    [bw.run, bw.version],
+  const bwD = derive(BWSTEP_CFG)
+  const bwCubicPts = useMemo(
+    () => toPts(bw.cubic, bwD, BWSTEP_CFG.rateMbps, false),
+    [bw.cubic, bw.version],
+  )
+  const bwBbrPts = useMemo(
+    () => toPts(bw.bbr, bwD, BWSTEP_CFG.rateMbps, true),
+    [bw.bbr, bw.version],
   )
 
   const loadedT = Math.min(runs.cubic.maxT, runs.bbr.maxT)
   const tr = useTransport(RUN_DUR_S, loadedT)
-  const trBw = useTransport(BWSTEP_DUR_S, bw.run.maxT)
-
-  const set = (k: keyof LabCfg) => (v: number) => setCfg((c) => ({ ...c, [k]: v }))
+  const bwLoadedT = Math.min(bw.cubic.maxT, bw.bbr.maxT)
+  const trBw = useTransport(BWSTEP_DUR_S, bwLoadedT)
 
   return (
     <div className="page">
       <header className="hdr">
         <div className="hdr-title">CCSIM — CC LAB</div>
         <div className="hdr-sub">
-          The BBR paper's figures, drawn live: two full gVisor netstack instances — stock Cubic
-          and a from-scratch BBRv3 — drive a simulated bottleneck link in your browser. Move the
-          sliders to reshape the path; every run is deterministic and replays byte-for-byte.
+          The{' '}
+          <a
+            href="https://spawn-queue.acm.org/doi/pdf/10.1145/3012426.3022184"
+            target="_blank"
+            rel="noreferrer"
+          >
+            BBR paper
+          </a>
+          's figures, drawn live: two full gVisor netstack instances (built to WebAssembly) —
+          stock Cubic and a from-scratch BBRv3 — drive a simulated bottleneck link in your
+          browser. Move the sliders to reshape the path; every run is deterministic and replays
+          byte-for-byte.
         </div>
       </header>
 
-      <div className="fig-card ctl-card">
-        <div className="fig-title">SCENARIO</div>
-        <div className="ctl-row">
-          <Slider label="link" value={cfg.rateMbps} min={10} max={400} step={5} fmt={(v) => `${v} Mbps`} onChange={set('rateMbps')} />
-          <Slider label="owd" value={cfg.owdMs} min={5} max={50} step={1} fmt={(v) => `${v} ms`} onChange={set('owdMs')} />
-          <Slider label="loss" value={cfg.lossPct} min={0} max={3} step={0.05} fmt={(v) => `${v.toFixed(2)} %`} onChange={set('lossPct')} />
-          <Slider label="buffer" value={cfg.qlimPkts} min={20} max={2000} step={10} fmt={(v) => `${v} pkt`} onChange={set('qlimPkts')} />
-        </div>
-        <div className="ctl-derived">
-          BDP {Math.round(d.bdpPkts)} pkt · buf {d.bufX.toFixed(2)}×BDP · base rtt {d.baseMs} ms ·{' '}
-          {runs.error ? (
-            <span className="err">{runs.error}</span>
-          ) : runs.running ? (
-            `simulating… ${loadedT.toFixed(1)} / ${RUN_DUR_S} s`
-          ) : (
-            `${RUN_DUR_S} s × 2 runs ready`
-          )}
-        </div>
-      </div>
-
-      <Figure2a cubic={cubicPts} bbr={bbrPts} losses={losses} d={d} tr={tr} T={RUN_DUR_S} />
-      <FigureBwStep pts={bwPts} tr={trBw} error={bw.error} />
+      <Figure2a
+        cubic={cubicPts}
+        bbr={bbrPts}
+        losses={losses}
+        d={d}
+        tr={tr}
+        T={RUN_DUR_S}
+        controls={
+          <>
+            <div className="ctl-row">
+              <Slider label="link" value={cfg.rateMbps} min={10} max={400} step={5} fmt={(v) => `${v} Mbps`} onChange={set('rateMbps')} />
+              <Slider label="owd" value={cfg.owdMs} min={5} max={50} step={1} fmt={(v) => `${v} ms`} onChange={set('owdMs')} />
+              <Slider label="loss" value={cfg.lossPct} min={0} max={3} step={0.05} fmt={(v) => `${v.toFixed(2)} %`} onChange={set('lossPct')} />
+              <Slider label="buffer" value={cfg.qlimPkts} min={20} max={2000} step={10} fmt={(v) => `${v} pkt`} onChange={set('qlimPkts')} />
+            </div>
+            <StatusLine
+              left={`BDP ${Math.round(d.bdpPkts)} pkt · buf ${d.bufX.toFixed(2)}×BDP · base rtt ${d.baseMs} ms`}
+              error={runs.error}
+              running={runs.running}
+              loadedT={loadedT}
+              durS={RUN_DUR_S}
+              onReset={() => setCfg(DEFAULT_CFG)}
+            />
+          </>
+        }
+      />
+      <FigureBwStep
+        cubic={bwCubicPts}
+        bbr={bwBbrPts}
+        tr={trBw}
+        controls={
+          <>
+            <div className="ctl-row">
+              <Slider label="loss" value={bwLossPct} min={0} max={3} step={0.05} fmt={(v) => `${v.toFixed(2)} %`} onChange={setBwLossPct} />
+            </div>
+            <StatusLine
+              error={bw.error}
+              running={bw.running}
+              loadedT={bwLoadedT}
+              durS={BWSTEP_DUR_S}
+              onReset={() => setBwLossPct(0)}
+            />
+          </>
+        }
+      />
 
       <footer className="ftr">
         deterministic: same scenario + seed ⇒ byte-identical streams, native and wasm ·{' '}

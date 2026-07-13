@@ -45,14 +45,16 @@ export function scenarioFor(cc: CC, cfg: LabCfg): object {
 }
 
 // The bandwidth-change experiment from the BBR paper (ACM Queue, figure 3):
-// a 10-Mbps, 40-ms BBR flow whose bottleneck doubles to 20 Mbps at t=20 s
-// and drops back to 10 Mbps at t=40 s.
+// a 10-Mbps, 40-ms flow whose bottleneck doubles to 20 Mbps at t=20 s and
+// drops back to 10 Mbps at t=40 s. Rate, delay, and buffer stay fixed —
+// the figure's chrome (link-rate step path, lane ranges, step labels) is
+// drawn to them — but wire loss is adjustable and either CC can run it.
 export const BWSTEP_DUR_S = 60
 export const BWSTEP_CFG: LabCfg = { rateMbps: 10, owdMs: 20, lossPct: 0, qlimPkts: 133 }
 
-export function bwStepScenario(): object {
+export function bwStepScenario(cc: CC, lossPct: number): object {
   return {
-    ...scenarioFor('bbr', BWSTEP_CFG),
+    ...scenarioFor(cc, { ...BWSTEP_CFG, lossPct }),
     dur_s: BWSTEP_DUR_S,
     events: [
       { at_s: 20, path: 'link.rate_mbps', value: 20 },

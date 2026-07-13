@@ -206,6 +206,19 @@ input[type='range']::-webkit-slider-thumb {
   color: var(--apx-graphite);
 }
 
+.fig-controls {
+  margin: 6px 0 16px;
+  padding-bottom: 16px;
+  border-bottom: 1px solid var(--apx-mist);
+}
+
+.ctl-status {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 16px;
+}
+
 .err {
   color: var(--apx-coral);
 }
