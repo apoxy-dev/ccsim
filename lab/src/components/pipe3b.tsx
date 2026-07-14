@@ -1,19 +1,63 @@
 // Figure 3 (design option 3b): the animated pipe — sender, bottleneck queue
 // and receiver with packet dots, drop ballistics, and the srtt strip that
 // spells out the bufferbloat equation (srtt = base + queueing delay).
+//
+// Wire-dot spacing is the figure's argument: right of the bottleneck the
+// spacing is always even — serialization at link rate paces everyone's
+// output — while the left side shows how the sender transmits: cubic's
+// ack-clocked bursts vs bbr's pacing. Flipping the CC toggle smooths the
+// left side and never changes the right, which is the entire basis of
+// delivery-rate estimation drawn as dot spacing.
 
 import { useMemo, type ReactElement } from 'react'
 import { FigureCard } from './figure-card'
 import { Transport, type TransportState } from './transport'
-import { COLORS } from '../lib/trail'
+import { COLORS, cross } from '../lib/trail'
 import { coalesce, ptAt, type Pt } from '../lib/series'
 import type { CC, Derived, LabCfg } from '../lib/scenario'
 
 const tx = (t: number) => 52 + t * 19.2
 
+// Playback cruises slow enough to read and drops another order of magnitude
+// around events: at cruise an RTT is tens of ms of wall time, so a drop
+// would be over before the eye lands on it.
+export const CRUISE_RATE = 0.4
+const SLOMO_RATE = 0.06
+const SLOMO_WIN = 0.2 // seconds of sim time on each side of an event
+
+// Times worth slowing down for: drop episodes (coalesced so a taildrop
+// burst is one event) plus BBR phase changes. Under heavy random loss the
+// event set gets dense enough that slow-mo would be permanent — worse than
+// none — so it disables itself.
+export function pipeEventTimes(pts: Pt[], dropTimes: number[]): number[] {
+  const evs = coalesce(dropTimes, 0.25)
+  for (let i = 1; i < pts.length; i++) {
+    if (pts[i].phase !== pts[i - 1].phase) evs.push(pts[i].t)
+  }
+  return evs.sort((a, b) => a - b)
+}
+
+export function rateAt(events: number[], t: number): number {
+  if (events.length > 40) return CRUISE_RATE
+  for (const e of events) {
+    if (Math.abs(t - e) <= SLOMO_WIN) return SLOMO_RATE
+    if (e > t + SLOMO_WIN) break
+  }
+  return CRUISE_RATE
+}
+
+// Queue stack geometry: the stack is scaled so a full buffer exactly
+// reaches the limit line — at the overflow frame, the most important one in
+// the animation, the stack must be visibly touching the line as the drop
+// glyph bounces off. Dots always render up to the limit; the count text is
+// a supplement, never a replacement.
+const STACK_BASE = 122
+const LIMIT_Y = 50
+
 export function Pipe3b({
   pts,
   dropTimes,
+  events,
   cfg,
   d,
   flow,
@@ -23,6 +67,7 @@ export function Pipe3b({
 }: {
   pts: Pt[]
   dropTimes: number[]
+  events: number[]
   cfg: LabCfg
   d: Derived
   flow: CC
@@ -37,8 +82,10 @@ export function Pipe3b({
   // spans [0.75, 2.25]×base so queueing delay reads as height above it.
   const yS = (r: number) => 280 - (48 * Math.max(0, Math.min((r - 0.75) * base, 1.5 * base))) / (1.5 * base)
 
-  const drops = useMemo(() => coalesce(dropTimes, 0.1), [dropTimes])
-  const pktPerQDot = Math.max(1, Math.round(d.bdpPkts / 11))
+  const limitDots = Math.max(4, Math.min(14, cfg.qlimPkts))
+  const pktPerQDot = cfg.qlimPkts / limitDots
+  const pitch = (STACK_BASE - LIMIT_Y) / limitDots
+  const qDotR = Math.min(2.6, pitch * 0.42)
 
   const srtt = useMemo(() => {
     if (pts.length < 2) return null
@@ -55,65 +102,82 @@ export function Pipe3b({
   if (p) {
     const infPkts = p.x * d.bdpPkts
     const q = Math.min(p.q, cfg.qlimPkts)
-    // queue stack seated on the bottleneck box, limit tick at y=50
-    const shown = Math.min(Math.floor(q / pktPerQDot), 12)
+    const shown = Math.min(Math.round(q / pktPerQDot), limitDots)
     for (let k = 0; k < shown; k++) {
-      els.push(<circle key={'q' + k} cx={279} cy={120 - 6 * k} r={2.6} fill={col} />)
+      els.push(
+        <circle key={'q' + k} cx={279} cy={(STACK_BASE - pitch * (k + 0.5)).toFixed(1)} r={qDotR} fill={col} />,
+      )
     }
-    if (q > 5) {
+    if (q >= 1) {
       els.push(
         <text key="qn" x={279} y={192} textAnchor="middle" fontFamily="JetBrains Mono" fontSize={9} fill={COLORS.slate}>
           q {Math.round(q)} pkt
         </text>,
       )
     }
-    // forward dots: sender->queue, bottleneck->receiver
-    const nM = Math.max(2, Math.min(16, Math.round((infPkts - q) / (d.bdpPkts / 13))))
-    for (let i = 0; i < nM; i++) {
-      const pr = (t * 0.55 + i / nM) % 1
-      const x = pr < 0.45 ? 114 + (pr / 0.45) * 148 : 296 + ((pr - 0.45) / 0.55) * 228
-      els.push(<circle key={'m' + i} cx={x.toFixed(1)} cy={140} r={3} fill={col} />)
+
+    // Pre-bottleneck wire: dot spacing shows the sender's transmit pattern.
+    // BBR paces — even spacing at pacing_rate. Cubic is ack-clocked — dots
+    // ride in bursts, and for a stretch after a drop the bursts pack even
+    // tighter (post-recovery clumping). Positions are a deterministic
+    // function of (t, i); no randomness.
+    const wirePkts = Math.max(0, infPkts - q)
+    const nPre = Math.min(12, Math.round(wirePkts / (d.bdpPkts / 10)))
+    let lastDrop = -Infinity
+    for (const dT of dropTimes) {
+      if (dT > t) break
+      lastDrop = dT
     }
-    // acks on the return path
-    const nA = Math.max(1, Math.round(p.y * 5))
-    for (let i = 0; i < nA; i++) {
-      const pr = (t * 0.5 + i / nA) % 1
-      els.push(<circle key={'ak' + i} cx={(556 - pr * 476).toFixed(1)} cy={200} r={2} fill={col} fillOpacity={0.55} />)
-    }
-    // drops eject up-and-right off the top of the stack, leaving a fading trace
-    drops.forEach((evT, i) => {
-      const d2 = t - evT
-      if (d2 < 0 || d2 >= 0.8) return
-      const px = (f: number) => 279 + f * 150
-      const py = (f: number) => 46 - f * 95 + f * f * 60
-      const fade = 1 - d2 / 0.8
-      const steps = 8
-      const trace: string[] = []
-      for (let s = 0; s <= steps; s++) {
-        const f = (d2 / 0.8) * (s / steps)
-        trace.push(px(f).toFixed(1) + ',' + py(f).toFixed(1))
+    const postRec = flow === 'cubic' && t - lastDrop < 1.2
+    for (let i = 0; i < nPre; i++) {
+      let ph: number
+      if (flow === 'bbr') {
+        ph = i / nPre
+      } else {
+        const burst = Math.floor(i / 3)
+        const nBursts = Math.ceil(nPre / 3)
+        const gap = postRec ? 0.008 : 0.02
+        ph = burst / nBursts + (i % 3) * gap + 0.04 * Math.sin(burst * 5.7)
       }
+      const pr = (((t * 0.55 + ph) % 1) + 1) % 1
+      els.push(<circle key={'w' + i} cx={(114 + pr * 148).toFixed(1)} cy={140} r={3} fill={col} />)
+    }
+
+    // Post-bottleneck spacing is serialization at link rate — always even,
+    // whatever the sender does. Density tracks measured delivery rate.
+    const nPost = Math.max(1, Math.min(10, Math.round(p.y * 10)))
+    for (let i = 0; i < nPost; i++) {
+      const pr = (t * 0.55 + i / nPost) % 1
+      els.push(<circle key={'p' + i} cx={(296 + pr * 228).toFixed(1)} cy={140} r={3} fill={col} />)
+    }
+    // ACKs inherit the bottleneck spacing — the even return stream is what
+    // ack-clocking feeds on — so they mirror the post-bottleneck dots.
+    for (let i = 0; i < nPost; i++) {
+      const pr = (t * 0.5 + i / nPost) % 1
       els.push(
-        <polyline
-          key={'drt' + i}
-          points={trace.join(' ')}
-          fill="none"
-          stroke={COLORS.loss}
-          strokeWidth={1.2}
-          strokeOpacity={0.45 * fade}
-          strokeDasharray="3 3"
-        />,
-        <circle
-          key={'dr' + i}
-          cx={px(d2 / 0.8).toFixed(1)}
-          cy={py(d2 / 0.8).toFixed(1)}
-          r={3}
-          fill={COLORS.loss}
-          fillOpacity={fade}
-        />,
+        <circle key={'ak' + i} cx={(556 - pr * 476).toFixed(1)} cy={200} r={2} fill={col} fillOpacity={0.6} />,
       )
-    })
+    }
+
+    // Each ✕ is one dropped packet. Losses are rare, discrete, and causally
+    // important, so they are exempt from the dot aggregation: the glyph
+    // bounces off the limit line and falls away, fanning so a burst reads
+    // as several packets rather than one smear.
+    let fan = 0
+    for (let i = 0; i < dropTimes.length; i++) {
+      const age = t - dropTimes[i]
+      if (age < 0) break
+      if (age >= 0.9) continue
+      const f = age / 0.9
+      const fx = 290 + f * (110 + (fan % 5) * 12)
+      const fy = LIMIT_Y - 2 - f * 80 + f * f * 150
+      els.push(cross(fx, fy, COLORS.loss, 1 - f, 'dx' + i, 3))
+      if (++fan > 24) break
+    }
   }
+
+  const nextEv = events.find((e) => e > t + SLOMO_WIN)
+  const slo = p != null && rateAt(events, t) < CRUISE_RATE
 
   return (
     <FigureCard
@@ -130,15 +194,19 @@ export function Pipe3b({
       }
       note={
         <>
-          One dot ≈ {pktPerQDot} packets; <span style={{ color: COLORS.loss }}>drops fall out of the stack</span>.
-          Above ~12 dots the queue renders as a count. Runs off the real sample stream of the selected flow's run.
+          Wire spacing is the story: right of the bottleneck it is always even — serialization at
+          link rate paces everyone's output — while the left side shows the sender's input:
+          cubic's ack-clocked bursts vs bbr's pacing. One queue dot ≈ {Math.max(1, Math.round(pktPerQDot))}{' '}
+          packets; each <span style={{ color: COLORS.loss }}>✕ is one dropped packet</span>.
+          Playback cruises at {CRUISE_RATE}× and drops to {SLOMO_RATE}× around losses and phase
+          changes. Runs off the real sample stream of the selected flow's run.
         </>
       }
     >
-      <svg viewBox="0 0 640 292" width="640" height="292" style={{ display: 'block' }}>
-        <line x1={271} y1={50} x2={287} y2={50} stroke={COLORS.loss} strokeWidth={1.2} />
-        <text x={294} y={53} fontFamily="JetBrains Mono" fontSize={9} fill={COLORS.loss}>
-          buffer limit
+      <svg viewBox="0 0 640 292" width="100%" style={{ display: 'block', maxWidth: 640 }}>
+        <line x1={266} y1={LIMIT_Y} x2={292} y2={LIMIT_Y} stroke={COLORS.loss} strokeWidth={1.2} />
+        <text x={298} y={LIMIT_Y + 3} fontFamily="JetBrains Mono" fontSize={9} fill={COLORS.loss}>
+          buffer limit · {Math.round(cfg.qlimPkts)} pkt
         </text>
         <rect x={24} y={110} width={86} height={60} fill="none" stroke={COLORS.ink} strokeWidth={1.3} />
         <text x={67} y={144} textAnchor="middle" fontFamily="JetBrains Mono" fontSize={10} fill={COLORS.ink}>
@@ -193,7 +261,24 @@ export function Pipe3b({
         )}
         {els}
       </svg>
-      <Transport tr={tr} T={T} />
+      <Transport
+        tr={tr}
+        T={T}
+        extra={
+          <>
+            <span className="transport-t" style={{ minWidth: 52 }}>
+              {slo ? 'slo-mo' : `${CRUISE_RATE.toFixed(2)}×`}
+            </span>
+            <button
+              className="btn-toggle"
+              disabled={nextEv == null}
+              onClick={() => nextEv != null && tr.seek(nextEv - 0.3)}
+            >
+              EVENT ▸
+            </button>
+          </>
+        }
+      />
     </FigureCard>
   )
 }

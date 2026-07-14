@@ -1,6 +1,7 @@
-import { useMemo, useState } from 'react'
+import { useCallback, useMemo, useState } from 'react'
 import { Figure2a } from './components/figure2a'
 import { FigureBwStep } from './components/figure-bwstep'
+import { Pipe3b, pipeEventTimes, rateAt } from './components/pipe3b'
 import { useTransport } from './components/transport'
 import { useSimPair } from './lib/use-lab'
 import { lossMarks, toPts } from './lib/series'
@@ -15,6 +16,7 @@ import {
   fig1Precomp,
   fig2Precomp,
   scenarioFor,
+  type CC,
   type LabCfg,
 } from './lib/scenario'
 
@@ -145,6 +147,16 @@ export function App() {
   const bwLoadedT = Math.min(bw.cubic.maxT, bw.bbr.maxT)
   const trBw = useTransport(BWSTEP_DUR_S, bwLoadedT)
 
+  // The pipe replays the selected flow of the FIG 1 run on its own
+  // transport: it cruises slower than real time and auto-slows around the
+  // flow's events, which would make the other figures crawl if shared.
+  const [pipeFlow, setPipeFlow] = useState<CC>('cubic')
+  const pipePts = pipeFlow === 'cubic' ? cubicPts : bbrPts
+  const pipeDrops = pipeFlow === 'cubic' ? runs.cubic.dropEvents : runs.bbr.dropEvents
+  const pipeEvents = useMemo(() => pipeEventTimes(pipePts, pipeDrops), [pipePts, pipeDrops])
+  const pipeRate = useCallback((t: number) => rateAt(pipeEvents, t), [pipeEvents])
+  const trPipe = useTransport(RUN_DUR_S, loadedT, true, pipeRate)
+
   return (
     <div className="page">
       <header className="hdr">
@@ -211,6 +223,18 @@ export function App() {
             <SlowWarning />
           </>
         }
+      />
+
+      <Pipe3b
+        pts={pipePts}
+        dropTimes={pipeDrops}
+        events={pipeEvents}
+        cfg={cfg}
+        d={d}
+        flow={pipeFlow}
+        onFlow={setPipeFlow}
+        tr={trPipe}
+        T={RUN_DUR_S}
       />
 
       <footer className="ftr">
