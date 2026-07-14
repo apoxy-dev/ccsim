@@ -191,41 +191,51 @@ export const Pipe3b = memo(function Pipe3b({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [pts, base, cfg.rateMbps])
 
-  // Rate strip: offered load (bytes presented to the queue, drops included,
-  // differentiated over a ±160 ms window) against delivered goodput. The gap
-  // between the two IS congestion: for naive it is permanent (150 in, ~94
-  // out), for cubic it flashes at each overshoot, for bbr it barely exists.
+  // Rate strip: offered load (bytes presented to the queue, drops included)
+  // against true goodput (receiver-side app bytes), both differentiated over
+  // a ±160 ms window. Goodput deliberately does NOT come from the sender's
+  // delivery-rate estimator: that is a per-burst instantaneous measure that
+  // reads near wire rate even when most carried bytes are duplicate
+  // retransmissions. The offered/goodput gap IS congestion: permanent
+  // collapse for naive, a flash per overshoot for cubic, nothing for bbr.
   const rateMax = cfg.rateMbps * 1.6
   const yR = (v: number) => 364 - 44 * Math.min(v / rateMax, 1)
   const rate = useMemo(() => {
     if (pts.length < 2) return null
-    const key: CounterKey | null = pts.some((p) => p.arrB != null)
+    const offKey: CounterKey | null = pts.some((p) => p.arrB != null)
       ? 'arrB'
       : pts.some((p) => p.enqB != null)
         ? 'enqB'
         : null
-    const offered = new Array<number>(pts.length).fill(0)
-    if (key) {
-      const W = 8
+    const W = 8
+    const deriv = (get: (p: Pt) => number | undefined) => {
+      const out = new Array<number>(pts.length).fill(0)
       for (let i = 0; i < pts.length; i++) {
         const a = pts[Math.max(0, i - W)]
         const b = pts[Math.min(pts.length - 1, i + W)]
         const dt2 = b.t - a.t
-        if (dt2 > 0) offered[i] = (((b[key] ?? 0) - (a[key] ?? 0)) * 8) / 1e6 / dt2
+        if (dt2 > 0) out[i] = ((get(b) ?? 0) - (get(a) ?? 0)) * 8 / 1e6 / dt2
       }
+      return out
     }
-    const path = (val: (i: number) => number) => {
+    const offered = offKey ? deriv((p) => p[offKey]) : new Array<number>(pts.length).fill(0)
+    const hasGood = pts.some((p) => p.goodB != null)
+    const good = hasGood
+      ? deriv((p) => p.goodB)
+      : pts.map((p) => p.y * cfg.rateMbps) // old streams: sender estimate fallback
+    const path = (vals: number[]) => {
       let s = ''
       for (let i = 0; i < pts.length; i += 3)
-        s += (s ? 'L' : 'M') + tx(pts[i].t).toFixed(1) + ' ' + yR(val(i)).toFixed(1)
+        s += (s ? 'L' : 'M') + tx(pts[i].t).toFixed(1) + ' ' + yR(vals[i]).toFixed(1)
       return s
     }
-    const good = path((i) => pts[i].y * cfg.rateMbps)
+    const goodPath = path(good)
     return {
       offered,
-      offeredPath: key ? path((i) => offered[i]) : null,
       good,
-      area: good + ' L 628 364 L 52 364 Z',
+      offeredPath: offKey ? path(offered) : null,
+      goodPath,
+      area: goodPath + ' L 628 364 L 52 364 Z',
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [pts, cfg.rateMbps])
@@ -431,7 +441,8 @@ export const Pipe3b = memo(function Pipe3b({
         ctx.lineTo(tx(t), 364)
         ctx.stroke()
         ctx.globalAlpha = 1
-        const good = p.y * cfg.rateMbps
+        const ri = Math.min(rate.good.length - 1, Math.max(0, Math.round(t / 0.02)))
+        const good = rate.good[ri]
         ctx.fillStyle = col
         ctx.strokeStyle = '#FFFFFF'
         ctx.lineWidth = 1.2
@@ -443,10 +454,9 @@ export const Pipe3b = memo(function Pipe3b({
         ctx.textAlign = 'right'
         ctx.fillText(`goodput ${good.toFixed(1)} Mbps`, 628, 306)
         const gw = ctx.measureText(`goodput ${good.toFixed(1)} Mbps`).width + 8
-        const off = rate.offered[Math.min(rate.offered.length - 1, Math.max(0, Math.round(t / 0.02)))]
         ctx.font = mono(9)
         ctx.fillStyle = COLORS.stone
-        ctx.fillText(`offered ${off.toFixed(1)} ·`, 628 - gw, 306)
+        ctx.fillText(`offered ${rate.offered[ri].toFixed(1)} ·`, 628 - gw, 306)
       }
     }
     raf = requestAnimationFrame(draw)
@@ -485,9 +495,10 @@ export const Pipe3b = memo(function Pipe3b({
             from the measured queue) while the sender&apos;s own srtt (dashed) barely moves — with
             thousands of packets in flight under sustained loss, TCP&apos;s smoothed estimator is
             nearly frozen. A sender this aggressive cannot even see the damage it does. The
-            delivery strip shows what the blast buys: {NAIVE_RATE_MBPS} Mbps offered, a third
-            dropped, and goodput below the link rate because part of what gets through is
-            retransmission of earlier losses.
+            delivery strip shows classic congestion collapse: {NAIVE_RATE_MBPS} Mbps offered, the
+            wire 100% busy — and goodput around a quarter of the link rate, because most of what
+            the bottleneck carries are duplicate retransmissions of data dropped on earlier
+            attempts. Useful work collapses while utilization stays perfect.
           </>
         ) : (
           <>
@@ -550,7 +561,7 @@ export const Pipe3b = memo(function Pipe3b({
           {rate && (
             <>
               <path d={rate.area} fill={col} fillOpacity={0.1} stroke="none" />
-              <path d={rate.good} fill="none" stroke={col} strokeWidth={1.3} />
+              <path d={rate.goodPath} fill="none" stroke={col} strokeWidth={1.3} />
               {rate.offeredPath && (
                 <path d={rate.offeredPath} fill="none" stroke={COLORS.stone} strokeWidth={0.9} strokeDasharray="3 3" />
               )}

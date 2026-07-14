@@ -32,6 +32,7 @@ export class RunData {
   cwnd = newTrack() // packets
   srtt = newTrack() // seconds
   delivery = newTrack() // bits/s
+  appBytes = newTrack() // cumulative receiver-side app bytes (true goodput counter)
   ccState = newTrack()
   qDepth = newTrack() // packets, forward link
   wireCV = newTrack() // bottleneck arrival-gap CV, forward link (wire_stats)
@@ -47,6 +48,7 @@ export class RunData {
     // Vite can retain RunData instances across a hot module replacement.
     // Lazily install newly added tracks so a development HMR cannot leave
     // an older instance shape behind.
+    this.appBytes ??= newTrack()
     this.fwdArrivalBytes ??= newTrack()
     this.fwdEnqueueBytes ??= newTrack()
     this.fwdDequeueBytes ??= newTrack()
@@ -103,6 +105,10 @@ export class RunData {
           this.delivery.t.push(r.t)
           this.delivery.v.push(r.value)
           break
+        case Kind.BytesAckedCum:
+          this.appBytes.t.push(r.t)
+          this.appBytes.v.push(r.value)
+          break
         case Kind.CCState:
           this.ccState.t.push(r.t)
           this.ccState.v.push(r.value)
@@ -123,6 +129,7 @@ export interface Pt {
   q: number // bottleneck queue, packets
   w?: number // cwnd, packets
   cv?: number // bottleneck arrival-gap CV (wire_stats; absent in old streams)
+  goodB?: number // cumulative receiver-side app bytes (true goodput)
   arrB?: number // cumulative forward bytes presented to the queue, including drops
   enqB?: number // cumulative forward bytes accepted by the simulated link
   deqB?: number // cumulative forward bytes dequeued for transmission
@@ -158,6 +165,7 @@ export function toPts(run: RunData, d: Derived, rateMbps: number, bbrPhases: boo
   const cwn = new Cursor(run.cwnd)
   const rtt = new Cursor(run.srtt)
   const del = new Cursor(run.delivery)
+  const app = new Cursor(run.appBytes ?? newTrack())
   const st = new Cursor(run.ccState)
   const q = new Cursor(run.qDepth)
   const wcv = new Cursor(run.wireCV)
@@ -190,6 +198,7 @@ export function toPts(run: RunData, d: Derived, rateMbps: number, bbrPhases: boo
     const y = Number.isNaN(delB) ? 0.02 : Math.max(delB / btlBps, 0.02)
     const r = Number.isNaN(rttS) ? 1 : Math.max((rttS * 1000) / d.baseMs, 1)
     const cvV = wcv.at(t)
+    const appV = app.at(t)
     const arrV = arr.at(t)
     const enqV = enq.at(t)
     const deqV = deq.at(t)
@@ -202,6 +211,7 @@ export function toPts(run: RunData, d: Derived, rateMbps: number, bbrPhases: boo
       q: Number.isNaN(qP) ? 0 : qP,
       w: Number.isNaN(cwB) ? undefined : cwB / 1500,
       cv: Number.isNaN(cvV) ? undefined : cvV,
+      goodB: Number.isNaN(appV) ? undefined : appV,
       arrB: Number.isNaN(arrV) ? undefined : arrV,
       enqB: Number.isNaN(enqV) ? undefined : enqV,
       deqB: Number.isNaN(deqV) ? undefined : deqV,
