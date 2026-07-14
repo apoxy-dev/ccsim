@@ -62,16 +62,17 @@ export function rateAt(events: number[], t: number): number {
 const STACK_BASE = 122
 const LIMIT_Y = 50
 
-// Visual wire physics. VIS_CAP is the bottleneck's visual serialization
-// rate in dots/s; the sender emits at VIS_CAP × (send-rate fraction of link
+// Visual wire physics. visCap is the bottleneck's visual serialization
+// rate in dots/s; the sender emits at visCap × (send-rate fraction of link
 // capacity), so occupancy and spacing carry real meaning: the pre-wire can
 // only get denser than the post-wire while the sender oversends, and the
-// surplus is exactly what the queue absorbs.
-const VIS_CAP = 6
+// surplus is exactly what the queue absorbs. visCap scales with the
+// configured link rate (√-compressed so the 10–400 Mbps slider range stays
+// readable): a faster link visibly serializes more, tighter-spaced dots.
+const visCapFor = (rateMbps: number) => Math.max(2.5, Math.min(16, 6 * Math.sqrt(rateMbps / 50)))
 const PRE_T = 1.5 // visual pre-bottleneck transit, seconds
 const POST_T = 1.4
 const ACK_T = 1.6
-const CLUMP_GAP = 0.045 // intra-burst dot gap at emission, seconds
 
 // Lower bound: first index with a[i] >= v.
 function lb(a: number[], v: number): number {
@@ -133,6 +134,11 @@ export const Pipe3b = memo(function Pipe3b({
   // size follows the measured arrival-gap CV (wire_stats record; paced bbr
   // ≈ 0, ack-clocked cubic ≈ 1, recovery spikes higher), averaged over
   // ±100 ms so a single-window spike doesn't restructure the train.
+  const visCap = visCapFor(cfg.rateMbps)
+  // Intra-burst gap at emission: just above back-to-back at the visual
+  // serialization pitch, so a clump reads as one burst at any link rate.
+  const clumpGap = 0.27 / visCap
+  const wireR = visCap > 9 ? 2.4 : 3 // dot radius shrinks on dense fast links
   const sched = useMemo(() => {
     const dt = 0.02
     const em: number[] = []
@@ -150,14 +156,14 @@ export const Pipe3b = memo(function Pipe3b({
       }
       const b = Math.min(1, (cvN ? cvS / cvN : flow === 'cubic' ? 1 : 0.05) / 1.2)
       const factor = Math.max(0, Math.min(1.8, p.x / Math.max(p.r, 0.5)))
-      const rate = factor * VIS_CAP
+      const rate = factor * visCap
       credit += rate * dt
       const cs = 1 + Math.round(2 * b)
       while (credit >= cs) {
         // Exact crossing time within the step, so even trains have no
         // 20 ms quantization jitter.
         const t0 = p.t - (credit - cs) / Math.max(rate, 1e-6)
-        for (let j = 0; j < cs; j++) em.push(t0 + j * CLUMP_GAP)
+        for (let j = 0; j < cs; j++) em.push(t0 + j * clumpGap)
         credit -= cs
       }
     }
@@ -167,11 +173,11 @@ export const Pipe3b = memo(function Pipe3b({
     const dep: number[] = new Array(em.length)
     let prev = -1e9
     for (let k = 0; k < em.length; k++) {
-      prev = Math.max(em[k] + PRE_T, prev + 1 / VIS_CAP)
+      prev = Math.max(em[k] + PRE_T, prev + 1 / visCap)
       dep[k] = prev
     }
     return { em, dep }
-  }, [pts, flow])
+  }, [pts, flow, visCap, clumpGap])
 
   const cvRef = useRef<HTMLCanvasElement>(null)
   useEffect(() => {
@@ -248,17 +254,17 @@ export const Pipe3b = memo(function Pipe3b({
       const { em, dep } = sched
       ctx.fillStyle = col
       for (let k = lb(em, t - PRE_T); k < em.length && em[k] <= t; k++) {
-        dot(114 + ((t - em[k]) / PRE_T) * 148, 140, 3)
+        dot(114 + ((t - em[k]) / PRE_T) * 148, 140, wireR)
       }
       for (let k = lb(dep, t - POST_T); k < dep.length && dep[k] <= t; k++) {
-        dot(296 + ((t - dep[k]) / POST_T) * 228, 140, 3)
+        dot(296 + ((t - dep[k]) / POST_T) * 228, 140, wireR)
       }
       // ACKs: one per delivered dot, departing the receiver when its packet
       // arrives — the return stream inherits the bottleneck's spacing,
       // which is what ack-clocking feeds on.
       ctx.globalAlpha = 0.6
       for (let k = lb(dep, t - POST_T - ACK_T); k < dep.length && dep[k] + POST_T <= t; k++) {
-        dot(556 - ((t - dep[k] - POST_T) / ACK_T) * 476, 200, 2)
+        dot(556 - ((t - dep[k] - POST_T) / ACK_T) * 476, 200, wireR - 1)
       }
       ctx.globalAlpha = 1
 
@@ -314,7 +320,7 @@ export const Pipe3b = memo(function Pipe3b({
     raf = requestAnimationFrame(draw)
     return () => cancelAnimationFrame(raf)
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [pts, sched, dropTimes, cfg, d, col, base, limitDots, pktPerQDot, pitch, qDotR, tr.tRef])
+  }, [pts, sched, dropTimes, cfg, d, col, base, limitDots, pktPerQDot, pitch, qDotR, wireR, tr.tRef])
 
   const t = tr.t
   const nextEv = events.find((e) => e > t + SLOMO_WIN)
@@ -343,7 +349,9 @@ export const Pipe3b = memo(function Pipe3b({
           itself can only hold about a bandwidth-delay product: once it is full, every further
           cwnd packet (bar, top left) lives in the queue, buying srtt instead of throughput — until
           the buffer limit, where <span style={{ color: COLORS.loss }}>✕ marks each dropped
-          packet</span>. One queue dot ≈ {Math.max(1, Math.round(pktPerQDot))} packets. Playback
+          packet</span>. The wire serializes faster on a faster link: at {cfg.rateMbps} Mbps one
+          wire dot ≈ {Math.max(1, Math.round((cfg.rateMbps * 1e6) / 8 / 1500 / visCap))} packets;
+          one queue dot ≈ {Math.max(1, Math.round(pktPerQDot))} packets. Playback
           cruises at {CRUISE_RATE}× and slows to {SLOMO_RATE}× around losses and phase changes.
         </>
       }
