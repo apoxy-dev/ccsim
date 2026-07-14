@@ -13,6 +13,7 @@ export const COLORS = {
   mist: '#EDECE8',
   cubic: '#C28A2A',
   bbr: '#3D91DC',
+  naive: '#8A5FA8',
   loss: '#EA6A4E',
 }
 

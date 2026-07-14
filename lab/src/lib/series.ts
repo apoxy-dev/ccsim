@@ -35,11 +35,22 @@ export class RunData {
   ccState = newTrack()
   qDepth = newTrack() // packets, forward link
   wireCV = newTrack() // bottleneck arrival-gap CV, forward link (wire_stats)
+  fwdArrivalBytes = newTrack() // cumulative bytes offered at qdisc, including drops
+  fwdEnqueueBytes = newTrack() // cumulative accepted bytes, actual link hook
+  fwdDequeueBytes = newTrack() // cumulative transmitted bytes, actual link hook
+  revEnqueuePkts = newTrack() // cumulative actual reverse packets (mostly ACKs)
   lossEvents: number[] = [] // cwnd-cut times
   dropEvents: number[] = [] // forward-link drop times
   maxT = 0
 
   push(recs: Rec[]) {
+    // Vite can retain RunData instances across a hot module replacement.
+    // Lazily install newly added tracks so a development HMR cannot leave
+    // an older instance shape behind.
+    this.fwdArrivalBytes ??= newTrack()
+    this.fwdEnqueueBytes ??= newTrack()
+    this.fwdDequeueBytes ??= newTrack()
+    this.revEnqueuePkts ??= newTrack()
     for (const r of recs) {
       if (r.t > this.maxT) this.maxT = r.t
       // Forward drops are attributed to the owning flow when known, with
@@ -56,10 +67,25 @@ export class RunData {
         } else if (r.kind === Kind.WireBurstCV) {
           this.wireCV.t.push(r.t)
           this.wireCV.v.push(r.value)
+        } else if (r.kind === Kind.LinkArrivalBytesCum) {
+          this.fwdArrivalBytes.t.push(r.t)
+          this.fwdArrivalBytes.v.push(r.value)
+        } else if (r.kind === Kind.LinkEnqueueBytesCum) {
+          this.fwdEnqueueBytes.t.push(r.t)
+          this.fwdEnqueueBytes.v.push(r.value)
+        } else if (r.kind === Kind.LinkDequeueBytesCum) {
+          this.fwdDequeueBytes.t.push(r.t)
+          this.fwdDequeueBytes.v.push(r.value)
         }
         continue
       }
-      if (r.flow === LINK_REV) continue
+      if (r.flow === LINK_REV) {
+        if (r.kind === Kind.LinkEnqueuePktsCum) {
+          this.revEnqueuePkts.t.push(r.t)
+          this.revEnqueuePkts.v.push(r.value)
+        }
+        continue
+      }
       switch (r.kind) {
         case Kind.InflightBytes:
           this.inflight.t.push(r.t)
@@ -97,6 +123,10 @@ export interface Pt {
   q: number // bottleneck queue, packets
   w?: number // cwnd, packets
   cv?: number // bottleneck arrival-gap CV (wire_stats; absent in old streams)
+  arrB?: number // cumulative forward bytes presented to the queue, including drops
+  enqB?: number // cumulative forward bytes accepted by the simulated link
+  deqB?: number // cumulative forward bytes dequeued for transmission
+  ackN?: number // cumulative reverse packets accepted (ACK stream in this scenario)
   phase?: Phase
 }
 
@@ -131,6 +161,10 @@ export function toPts(run: RunData, d: Derived, rateMbps: number, bbrPhases: boo
   const st = new Cursor(run.ccState)
   const q = new Cursor(run.qDepth)
   const wcv = new Cursor(run.wireCV)
+  const arr = new Cursor(run.fwdArrivalBytes ?? newTrack())
+  const enq = new Cursor(run.fwdEnqueueBytes ?? newTrack())
+  const deq = new Cursor(run.fwdDequeueBytes ?? newTrack())
+  const ack = new Cursor(run.revEnqueuePkts ?? newTrack())
   const btlBps = rateMbps * 1e6
   const pts: Pt[] = []
   const n = Math.floor(run.maxT / dt)
@@ -156,6 +190,10 @@ export function toPts(run: RunData, d: Derived, rateMbps: number, bbrPhases: boo
     const y = Number.isNaN(delB) ? 0.02 : Math.max(delB / btlBps, 0.02)
     const r = Number.isNaN(rttS) ? 1 : Math.max((rttS * 1000) / d.baseMs, 1)
     const cvV = wcv.at(t)
+    const arrV = arr.at(t)
+    const enqV = enq.at(t)
+    const deqV = deq.at(t)
+    const ackV = ack.at(t)
     pts.push({
       t,
       x,
@@ -164,6 +202,10 @@ export function toPts(run: RunData, d: Derived, rateMbps: number, bbrPhases: boo
       q: Number.isNaN(qP) ? 0 : qP,
       w: Number.isNaN(cwB) ? undefined : cwB / 1500,
       cv: Number.isNaN(cvV) ? undefined : cvV,
+      arrB: Number.isNaN(arrV) ? undefined : arrV,
+      enqB: Number.isNaN(enqV) ? undefined : enqV,
+      deqB: Number.isNaN(deqV) ? undefined : deqV,
+      ackN: Number.isNaN(ackV) ? undefined : ackV,
       phase: bbrPhases && !Number.isNaN(code) ? BBR_PHASE[code] : undefined,
     })
   }

@@ -18,6 +18,7 @@ mkdirSync(outDir, { recursive: true })
 const scenarios = {
   'fig1-cubic': scenarioFor('cubic', HEAVY_CFG),
   'fig1-bbr': scenarioFor('bbr', HEAVY_CFG),
+  'fig1-naive': scenarioFor('naive', HEAVY_CFG),
   'fig1-cubic-lite': scenarioFor('cubic', LITE_CFG),
   'fig1-bbr-lite': scenarioFor('bbr', LITE_CFG),
   'fig2-cubic': bwStepScenario('cubic', 0),

@@ -3,10 +3,11 @@ import { Figure2a } from './components/figure2a'
 import { FigureBwStep } from './components/figure-bwstep'
 import { Pipe3b, pipeEventTimes, rateAt } from './components/pipe3b'
 import { useTransport } from './components/transport'
-import { useSimPair } from './lib/use-lab'
+import { useSimPair, useSimRun } from './lib/use-lab'
 import { lossMarks, toPts } from './lib/series'
 import {
   DEFAULT_CFG,
+  HEAVY_CFG,
   RUN_DUR_S,
   BWSTEP_DUR_S,
   BWSTEP_CFG,
@@ -111,6 +112,11 @@ export function App() {
     return c && b ? { cubic: c, bbr: b } : null
   }, [cfg])
   const runs = useSimPair(cubicScn, bbrScn, pre1)
+  // The naive pipe is a fixed control experiment: 150 Mbps offered into
+  // the canonical 100 Mbps bottleneck, independent of the comparison sliders.
+  const naiveScn = useMemo(() => scenarioFor('naive', HEAVY_CFG), [])
+  const naivePre = useMemo(() => fig1Precomp('naive', HEAVY_CFG), [])
+  const naive = useSimRun(naiveScn, naivePre)
   const bwCubicScn = useMemo(() => bwStepScenario('cubic', bwLossPct), [bwLossPct])
   const bwBbrScn = useMemo(() => bwStepScenario('bbr', bwLossPct), [bwLossPct])
   const pre2 = useMemo(() => {
@@ -130,6 +136,11 @@ export function App() {
   const bbrPts = useMemo(
     () => toPts(runs.bbr, d, cfg.rateMbps, true),
     [runs.bbr, runs.version],
+  )
+  const naiveD = useMemo(() => derive(HEAVY_CFG), [])
+  const naivePts = useMemo(
+    () => toPts(naive.data, naiveD, HEAVY_CFG.rateMbps, false),
+    [naive.data, naive.version],
   )
   const losses = useMemo(() => lossMarks(runs.cubic, cubicPts, d), [cubicPts])
   const bwD = derive(BWSTEP_CFG)
@@ -151,14 +162,22 @@ export function App() {
   // transport: it cruises slower than real time and auto-slows around the
   // flow's events, which would make the other figures crawl if shared.
   const [pipeFlow, setPipeFlow] = useState<CC>('cubic')
-  const pipePts = pipeFlow === 'cubic' ? cubicPts : bbrPts
-  const pipeDrops = pipeFlow === 'cubic' ? runs.cubic.dropEvents : runs.bbr.dropEvents
+  const pipePts = pipeFlow === 'cubic' ? cubicPts : pipeFlow === 'bbr' ? bbrPts : naivePts
+  const pipeDrops =
+    pipeFlow === 'cubic'
+      ? runs.cubic.dropEvents
+      : pipeFlow === 'bbr'
+        ? runs.bbr.dropEvents
+        : naive.data.dropEvents
   const pipeEvents = useMemo(() => pipeEventTimes(pipePts, pipeDrops), [pipePts, pipeDrops])
   const pipeRate = useCallback((t: number) => rateAt(pipeEvents, t), [pipeEvents])
   // coarse: the pipe animates from tr.tRef on a canvas, so its React tick
   // only needs to drive the slider row (~8 Hz) and the card stops
   // re-rendering at frame rate.
-  const trPipe = useTransport(RUN_DUR_S, loadedT, true, pipeRate, true)
+  const pipeLoadedT = pipeFlow === 'naive' ? naive.data.maxT : loadedT
+  const trPipe = useTransport(RUN_DUR_S, pipeLoadedT, true, pipeRate, true)
+  const pipeCfg = pipeFlow === 'naive' ? HEAVY_CFG : cfg
+  const pipeD = pipeFlow === 'naive' ? naiveD : d
 
   return (
     <div className="page">
@@ -173,9 +192,9 @@ export function App() {
           >
             BBR paper
           </a>
-          's figures, drawn live: two full gVisor netstack instances (built to WebAssembly) —
-          stock Cubic and a from-scratch BBRv3 — drive a simulated bottleneck link in your
-          browser. Move the sliders to reshape the path; every run is deterministic and replays
+          's figures, drawn live: full gVisor sender/receiver netstacks (built to WebAssembly)
+          drive a simulated bottleneck link in your browser. Compare stock Cubic, a from-scratch
+          BBRv3, and Fig. 3's fixed-rate naive control; every run is deterministic and replays
           byte-for-byte.
         </div>
       </header>
@@ -192,6 +211,7 @@ export function App() {
             <div className="ctl-row">
               <Slider label="link" value={cfg.rateMbps} min={10} max={400} step={5} fmt={(v) => `${v} Mbps`} onChange={set('rateMbps')} />
               <Slider label="owd" value={cfg.owdMs} min={5} max={50} step={1} fmt={(v) => `${v} ms`} onChange={set('owdMs')} />
+              <Slider label="jitter" value={cfg.jitterMs} min={0} max={10} step={0.5} fmt={(v) => `${v.toFixed(1)} ms`} onChange={set('jitterMs')} />
               <Slider label="loss" value={cfg.lossPct} min={0} max={3} step={0.05} fmt={(v) => `${v.toFixed(2)} %`} onChange={set('lossPct')} />
               <Slider label="buffer" value={cfg.qlimPkts} min={20} max={2000} step={10} fmt={(v) => `${v} pkt`} onChange={set('qlimPkts')} />
             </div>
@@ -232,10 +252,13 @@ export function App() {
         pts={pipePts}
         dropTimes={pipeDrops}
         events={pipeEvents}
-        cfg={cfg}
-        d={d}
+        cfg={pipeCfg}
+        d={pipeD}
         flow={pipeFlow}
-        onFlow={setPipeFlow}
+        onFlow={(f) => {
+          setPipeFlow(f)
+          trPipe.seek(0)
+        }}
         tr={trPipe}
         T={RUN_DUR_S}
       />

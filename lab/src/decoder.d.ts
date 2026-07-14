@@ -26,6 +26,11 @@ declare module '*/stream/decoder.mjs' {
     PktEnqueue: number
     PktDequeue: number
     PktDrop: number
+    WireBurstCV: number
+    LinkEnqueueBytesCum: number
+    LinkDequeueBytesCum: number
+    LinkEnqueuePktsCum: number
+    LinkArrivalBytesCum: number
   }>
   export function decode(
     buf: ArrayBuffer | Uint8Array,

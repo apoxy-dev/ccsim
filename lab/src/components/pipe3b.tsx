@@ -1,16 +1,17 @@
 // Figure 3 (design option 3b): the animated pipe — sender, bottleneck queue
-// and receiver with packet dots, drop ballistics, and the srtt strip that
-// spells out the bufferbloat equation (srtt = base + queueing delay).
+// and receiver with packet dots, drop ballistics, and the RTT strip that
+// spells out the bufferbloat equation (rtt = base + queueing delay), with
+// the sender's own srtt estimate dashed alongside the measured truth.
 //
-// The wire is a particle system with permanent dot identity, precomputed
-// from the run data. Each visual dot has a fixed emission time (integrated
-// from the sampled send rate = inflight/rtt, clumped by the measured
-// arrival-gap CV) and flows through an actual FIFO at the bottleneck:
-// depart[k] = max(arrive[k], depart[k-1] + serialization). Even output
-// spacing is therefore not painted on — it emerges only while the queue is
-// backlogged, and when the queue drains (after a cwnd cut) the sender's
-// clumps pass straight through. A dot on the wire can never disappear or
-// respace mid-flight: its position is a pure function of its schedule.
+// The wire is an aggregate particle view of actual simulator telemetry.
+// Forward particles are crossings of cumulative bytes presented to and
+// dequeued from the simulated qdisc; ACK particles are crossings of
+// cumulative reverse packets. Queue-input arrivals include rejected packets,
+// so overload remains visible instead of disappearing into the drop counter.
+// The browser never runs its own queue or re-spaces dots.
+// To keep the stream small, the cumulative counters are sampled at the run's
+// metric cadence and crossing times are linearly interpolated between those
+// measured points.
 //
 // Rendering: static chrome and the per-run srtt path are SVG; everything
 // that moves is drawn on a canvas overlay from its own rAF loop reading
@@ -22,7 +23,7 @@ import { FigureCard } from './figure-card'
 import { Transport, type TransportState } from './transport'
 import { COLORS } from '../lib/trail'
 import { coalesce, ptAt, type Pt } from '../lib/series'
-import type { CC, Derived, LabCfg } from '../lib/scenario'
+import { NAIVE_RATE_MBPS, type CC, type Derived, type LabCfg } from '../lib/scenario'
 
 const tx = (t: number) => 52 + t * 19.2
 
@@ -62,17 +63,70 @@ export function rateAt(events: number[], t: number): number {
 const STACK_BASE = 122
 const LIMIT_Y = 50
 
-// Visual wire physics. visCap is the bottleneck's visual serialization
-// rate in dots/s; the sender emits at visCap × (send-rate fraction of link
-// capacity), so occupancy and spacing carry real meaning: the pre-wire can
-// only get denser than the post-wire while the sender oversends, and the
-// surplus is exactly what the queue absorbs. visCap scales with the
-// configured link rate (√-compressed so the 10–400 Mbps slider range stays
-// readable): a faster link visibly serializes more, tighter-spaced dots.
+// Visual density target. Together with the configured link rate this picks
+// the byte quantum represented by one dot; all dot times still come from
+// measured cumulative counters. The target is √-compressed so the 10–400
+// Mbps slider range stays readable rather than becoming a solid band.
 const visCapFor = (rateMbps: number) => Math.max(2.5, Math.min(16, 6 * Math.sqrt(rateMbps / 50)))
-const PRE_T = 1.5 // visual pre-bottleneck transit, seconds
-const POST_T = 1.4
+// The forward segments use one screen-space velocity so dot density can be
+// compared across the box without a geometry-induced distortion.
+const WIRE_PX_PER_S = 160
+const PRE_T = 148 / WIRE_PX_PER_S
+const POST_T = 228 / WIRE_PX_PER_S
 const ACK_T = 1.6
+
+// ACK return-path geometry. Keeping this in one place prevents the particle
+// animation from silently taking a horizontal shortcut across the SVG path.
+const ACK_PATH = [
+  { x: 571, y: 170 },
+  { x: 571, y: 200 },
+  { x: 67, y: 200 },
+  { x: 67, y: 176 },
+] as const
+const ACK_LEGS = ACK_PATH.slice(1).map((p, i) => {
+  const from = ACK_PATH[i]
+  return { from, to: p, len: Math.hypot(p.x - from.x, p.y - from.y) }
+})
+const ACK_PATH_LEN = ACK_LEGS.reduce((n, leg) => n + leg.len, 0)
+
+function ackPos(progress: number): { x: number; y: number } {
+  let left = Math.max(0, Math.min(1, progress)) * ACK_PATH_LEN
+  for (const leg of ACK_LEGS) {
+    if (left <= leg.len) {
+      const f = leg.len === 0 ? 0 : left / leg.len
+      return {
+        x: leg.from.x + (leg.to.x - leg.from.x) * f,
+        y: leg.from.y + (leg.to.y - leg.from.y) * f,
+      }
+    }
+    left -= leg.len
+  }
+  return ACK_PATH[ACK_PATH.length - 1]
+}
+
+type CounterKey = 'arrB' | 'enqB' | 'deqB' | 'ackN'
+
+// Times at which a measured cumulative counter crosses successive display
+// quanta. Linear interpolation is only a 20 ms visualization decimation; the
+// counter values themselves come directly from link enqueue/dequeue hooks.
+function counterCrossings(pts: Pt[], key: CounterKey, quantum: number): number[] {
+  const out: number[] = []
+  let prevT = 0
+  let prevV = 0
+  let next = quantum
+  for (const p of pts) {
+    const v = p[key]
+    if (v == null || v < prevV) continue
+    const dv = v - prevV
+    while (dv > 0 && next <= v) {
+      out.push(prevT + ((next - prevV) / dv) * (p.t - prevT))
+      next += quantum
+    }
+    prevT = p.t
+    prevV = v
+  }
+  return out
+}
 
 // Lower bound: first index with a[i] >= v.
 function lb(a: number[], v: number): number {
@@ -107,7 +161,7 @@ export const Pipe3b = memo(function Pipe3b({
   tr: TransportState
   T: number
 }) {
-  const col = flow === 'cubic' ? COLORS.cubic : COLORS.bbr
+  const col = flow === 'cubic' ? COLORS.cubic : flow === 'bbr' ? COLORS.bbr : COLORS.naive
   const base = d.baseMs
   // srtt strip y-scale: base RTT sits on the dashed rule at y=272; the strip
   // spans [0.75, 2.25]×base so queueing delay reads as height above it.
@@ -118,72 +172,51 @@ export const Pipe3b = memo(function Pipe3b({
   const pitch = (STACK_BASE - LIMIT_Y) / limitDots
   const qDotR = Math.min(2.6, pitch * 0.42)
 
-  const srtt = useMemo(() => {
+  // Actual RTT is derived from the measured queue depth (base + q packets ×
+  // serialization time) rather than the sender's srtt: a sender with a huge
+  // window under sustained loss barely updates its smoothed estimate (RFC
+  // 7323 App. G divides the EWMA gain by inflight/2), so srtt can sit near
+  // base while the buffer is pinned full. Both are drawn so the gap itself
+  // is visible.
+  const rttOf = (p: Pt) => 1 + (p.q * 12) / cfg.rateMbps / base
+  const rtt = useMemo(() => {
     if (pts.length < 2) return null
-    const line = pts
-      .filter((_, i) => i % 3 === 0)
-      .map((p, i) => (i ? 'L' : 'M') + tx(p.t).toFixed(1) + ' ' + yS(p.r).toFixed(1))
-      .join(' ')
-    return { line, area: line + ' L 628 280 L 52 280 Z' }
+    const path = (val: (p: Pt) => number) =>
+      pts
+        .filter((_, i) => i % 3 === 0)
+        .map((p, i) => (i ? 'L' : 'M') + tx(p.t).toFixed(1) + ' ' + yS(val(p)).toFixed(1))
+        .join(' ')
+    const actual = path(rttOf)
+    return { actual, area: actual + ' L 628 280 L 52 280 Z', srtt: path((p) => p.r) }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [pts, base])
+  }, [pts, base, cfg.rateMbps])
 
-  // The dot schedule, precomputed once per run. Emission integrates the
-  // sampled send rate (inflight/rtt, as a fraction of link capacity — the
-  // standard rate identity); burstiness batches emissions into clumps whose
-  // size follows the measured arrival-gap CV (wire_stats record; paced bbr
-  // ≈ 0, ack-clocked cubic ≈ 1, recovery spikes higher), averaged over
-  // ±100 ms so a single-window spike doesn't restructure the train.
+  // Display aggregation only: the quantum controls how many actual bytes one
+  // visible dot represents. Its timing comes from measured cumulative link
+  // counters below, not from cwnd, RTT, or a browser-side service model.
   const visCap = visCapFor(cfg.rateMbps)
-  // Intra-burst gap at emission: just above back-to-back at the visual
-  // serialization pitch, so a clump reads as one burst at any link rate.
-  const clumpGap = 0.27 / visCap
+  const dataQuantum = (cfg.rateMbps * 1e6) / 8 / visCap
+  // Delayed ACKs commonly cover multiple data packets. Choose an ACK display
+  // quantum that yields a readable return stream while retaining the timing
+  // of the simulator's actual reverse packets.
+  const ackQuantum = Math.max(1, dataQuantum / 1500 / 2)
   const wireR = visCap > 9 ? 2.4 : 3 // dot radius shrinks on dense fast links
   const sched = useMemo(() => {
-    const dt = 0.02
-    const em: number[] = []
-    let credit = 0
-    for (let i = 0; i < pts.length; i++) {
-      const p = pts[i]
-      let cvS = 0
-      let cvN = 0
-      for (let k = -5; k <= 5; k++) {
-        const pp = pts[i + k]
-        if (pp?.cv != null) {
-          cvS += pp.cv
-          cvN++
-        }
-      }
-      const b = Math.min(1, (cvN ? cvS / cvN : flow === 'cubic' ? 1 : 0.05) / 1.2)
-      const factor = Math.max(0, Math.min(1.8, p.x / Math.max(p.r, 0.5)))
-      const rate = factor * visCap
-      credit += rate * dt
-      const cs = 1 + Math.round(2 * b)
-      while (credit >= cs) {
-        // Exact crossing time within the step, so even trains have no
-        // 20 ms quantization jitter.
-        const t0 = p.t - (credit - cs) / Math.max(rate, 1e-6)
-        for (let j = 0; j < cs; j++) em.push(t0 + j * clumpGap)
-        credit -= cs
-      }
-    }
-    em.sort((a, b2) => a - b2)
-    // The bottleneck FIFO: arrivals that find the server busy wait; while
-    // backlogged, departures tick at exactly the serialization pitch. The
-    // backlog test is the run's measured queue depth, not the visual
-    // integral, so the box only evens spacing out during the windows where
-    // the real buffer actually held packets (cubic: ~99% of the run; bbr:
-    // ~10%) and passes the sender's gaps through everywhere else.
-    const dep: number[] = new Array(em.length)
-    let prev = -1e9
-    for (let k = 0; k < em.length; k++) {
-      const arr = em[k] + PRE_T
-      const backlogged = (ptAt(pts, arr)?.q ?? 0) >= 2
-      prev = Math.max(arr, backlogged ? prev + 1 / visCap : prev)
-      dep[k] = prev
-    }
-    return { em, dep }
-  }, [pts, flow, visCap, clumpGap])
+    // New streams carry all qdisc arrivals, including packets rejected by a
+    // full queue. Fall back to accepted enqueue bytes for older streams.
+    const arrivalKey: CounterKey = pts.some((p) => p.arrB != null) ? 'arrB' : 'enqB'
+    const em = counterCrossings(pts, arrivalKey, dataQuantum)
+    // Dequeue timestamps are already the simulator's real service schedule.
+    // PRE_T is only the schematic sender-to-qdisc travel offset.
+    const dep = counterCrossings(pts, 'deqB', dataQuantum).map((t) => t + PRE_T)
+    // The simulator counter is stamped where the reverse packet enters the
+    // link. Shift the whole measured series onto the schematic timeline so
+    // ACKs begin at the receiver after the corresponding forward traversal,
+    // without changing any measured inter-ACK spacing.
+    const ackShift = PRE_T + POST_T - cfg.owdMs / 1000
+    const ack = counterCrossings(pts, 'ackN', ackQuantum).map((t) => t + ackShift)
+    return { em, dep, ack }
+  }, [pts, dataQuantum, ackQuantum, cfg.owdMs])
 
   const cvRef = useRef<HTMLCanvasElement>(null)
   useEffect(() => {
@@ -218,6 +251,8 @@ export const Pipe3b = memo(function Pipe3b({
       // Queue stack + count.
       const infPkts = p.x * d.bdpPkts
       const q = Math.min(p.q, cfg.qlimPkts)
+      const queuedPkts = Math.min(q, infPkts)
+      const pathPkts = Math.max(0, infPkts - queuedPkts)
       const shown = Math.min(Math.round(q / pktPerQDot), limitDots)
       ctx.fillStyle = col
       for (let k = 0; k < shown; k++) dot(279, STACK_BASE - pitch * (k + 0.5), qDotR)
@@ -228,30 +263,49 @@ export const Pipe3b = memo(function Pipe3b({
         ctx.fillText(`q ${Math.round(q)} pkt`, 279, 192)
       }
 
-      // Sender gauge: cwnd and in-flight in packets, on a scale of
-      // BDP + buffer (the most the path can hold). The bar sawtooths for
-      // cubic and holds flat for bbr.
-      const maxPkts = d.bdpPkts + cfg.qlimPkts
-      const barW = 86
-      ctx.globalAlpha = 0.45
-      ctx.fillStyle = col
-      ctx.fillRect(24, 96, barW * Math.min(1, infPkts / maxPkts), 6)
-      ctx.globalAlpha = 1
-      ctx.strokeStyle = COLORS.fog
-      ctx.lineWidth = 0.75
-      ctx.strokeRect(24, 96, barW, 6)
       ctx.fillStyle = COLORS.slate
       ctx.font = mono(8.5)
       ctx.textAlign = 'left'
-      ctx.fillText(`cwnd ${p.w != null ? Math.round(p.w) : '–'} · in flight ${Math.round(infPkts)} pkt`, 24, 90)
-      if (p.w != null) {
-        const cwX = 24 + barW * Math.min(1, p.w / maxPkts)
-        ctx.strokeStyle = COLORS.ink
-        ctx.lineWidth = 1.2
-        ctx.beginPath()
-        ctx.moveTo(cwX, 94)
-        ctx.lineTo(cwX, 104)
-        ctx.stroke()
+      if (flow === 'naive') {
+        // Under persistent loss SND.NXT-SND.UNA includes SACKed bytes behind
+        // holes and is not a meaningful physical path occupancy. Show the
+        // controller's actual invariant instead of relabeling that span.
+        ctx.fillText(`fixed pacer ${NAIVE_RATE_MBPS} Mbps`, 24, 87)
+        ctx.font = mono(7.5)
+        ctx.fillText('ignores congestion feedback', 24, 100)
+      } else {
+        // Sender gauge: cwnd and in-flight in packets, on a scale of BDP +
+        // buffer (the most the path can hold). Split the in-flight fill into
+        // packets on the path and packets queued at the bottleneck. Cubic's
+        // window growth is mostly the latter once the wire reaches capacity;
+        // a faster-looking post-wire stream would incorrectly imply that the
+        // fixed-rate bottleneck had gained bandwidth.
+        const maxPkts = d.bdpPkts + cfg.qlimPkts
+        const barW = 86
+        const pathW = barW * Math.min(1, pathPkts / maxPkts)
+        const queueW = barW * Math.min(1 - pathW / barW, queuedPkts / maxPkts)
+        ctx.globalAlpha = 0.2
+        ctx.fillStyle = col
+        ctx.fillRect(24, 94, pathW, 6)
+        ctx.globalAlpha = 0.68
+        ctx.fillRect(24 + pathW, 94, queueW, 6)
+        ctx.globalAlpha = 1
+        ctx.strokeStyle = COLORS.fog
+        ctx.lineWidth = 0.75
+        ctx.strokeRect(24, 94, barW, 6)
+        ctx.fillStyle = COLORS.slate
+        ctx.fillText(`cwnd ${p.w != null ? Math.round(p.w) : '–'} · in flight ${Math.round(infPkts)} pkt`, 24, 87)
+        ctx.font = mono(7.5)
+        ctx.fillText(`path ${Math.round(pathPkts)} + queue ${Math.round(queuedPkts)}`, 24, 107)
+        if (p.w != null) {
+          const cwX = 24 + barW * Math.min(1, p.w / maxPkts)
+          ctx.strokeStyle = COLORS.ink
+          ctx.lineWidth = 1.2
+          ctx.beginPath()
+          ctx.moveTo(cwX, 92)
+          ctx.lineTo(cwX, 102)
+          ctx.stroke()
+        }
       }
 
       // Wire dots: pure functions of each dot's fixed schedule. A dot lives
@@ -265,25 +319,32 @@ export const Pipe3b = memo(function Pipe3b({
       for (let k = lb(dep, t - POST_T); k < dep.length && dep[k] <= t; k++) {
         dot(296 + ((t - dep[k]) / POST_T) * 228, 140, wireR)
       }
-      // ACKs: one per delivered dot, departing the receiver when its packet
-      // arrives — the return stream inherits the bottleneck's spacing,
-      // which is what ack-clocking feeds on.
+      // ACKs: aggregate crossings of actual reverse packets emitted by the
+      // receiver-side stack, including its delayed-ACK behavior.
       ctx.globalAlpha = 0.6
-      for (let k = lb(dep, t - POST_T - ACK_T); k < dep.length && dep[k] + POST_T <= t; k++) {
-        dot(556 - ((t - dep[k] - POST_T) / ACK_T) * 476, 200, wireR - 1)
+      const { ack } = sched
+      for (let k = lb(ack, t - ACK_T); k < ack.length && ack[k] <= t; k++) {
+        const a = ackPos((t - ack[k]) / ACK_T)
+        dot(a.x, a.y, Math.max(1.5, wireR - 1))
       }
       ctx.globalAlpha = 1
 
-      // Each ✕ is one dropped packet. Losses are rare, discrete, and
-      // causally important, so they are exempt from the dot aggregation:
-      // the glyph bounces off the limit line and falls away, fanning so a
-      // burst reads as several packets rather than one smear.
+      // Each ✕ is an actual dropped packet. Sparse losses render one-for-one;
+      // persistent overload is evenly sampled to 25 visible glyphs per
+      // window. A glyph bounces off the limit line and falls away, fanning so
+      // a burst reads as several packets rather than one smear.
       ctx.strokeStyle = COLORS.loss
       ctx.lineWidth = 1.4
       let fan = 0
-      for (let i = 0; i < dropTimes.length; i++) {
+      const firstDrop = lb(dropTimes, t - 0.9)
+      const afterDrop = lb(dropTimes, t + 1e-6)
+      // Dense overload can produce thousands of drops in this window. Draw
+      // an even sample across the ballistic lifetime so the cap does not
+      // select only the oldest, almost-transparent crosses.
+      const dropStride = Math.max(1, Math.ceil((afterDrop - firstDrop) / 25))
+      for (let i = firstDrop; i < afterDrop; i += dropStride) {
         const age = t - dropTimes[i]
-        if (age < 0) break
+        if (age < 0) continue
         if (age >= 0.9) continue
         const f = age / 0.9
         const fx = 290 + f * (110 + (fan % 5) * 12)
@@ -295,7 +356,7 @@ export const Pipe3b = memo(function Pipe3b({
         ctx.moveTo(fx - 3, fy + 3)
         ctx.lineTo(fx + 3, fy - 3)
         ctx.stroke()
-        if (++fan > 24) break
+        fan++
       }
       ctx.globalAlpha = 1
 
@@ -312,16 +373,16 @@ export const Pipe3b = memo(function Pipe3b({
       ctx.strokeStyle = '#FFFFFF'
       ctx.lineWidth = 1.2
       ctx.beginPath()
-      ctx.arc(tx(t), yS(p.r), 3.2, 0, Math.PI * 2)
+      ctx.arc(tx(t), yS(rttOf(p)), 3.2, 0, Math.PI * 2)
       ctx.fill()
       ctx.stroke()
+      const qMs = (p.q * 12) / cfg.rateMbps
       ctx.font = mono(10.5, 600)
       ctx.textAlign = 'right'
-      ctx.fillText(
-        `srtt ${(p.r * base).toFixed(1)} ms = ${base} base + ${((p.r - 1) * base).toFixed(1)} queue`,
-        628,
-        230,
-      )
+      ctx.fillText(`rtt ${(base + qMs).toFixed(1)} ms = ${base} base + ${qMs.toFixed(1)} queue`, 628, 220)
+      ctx.font = mono(9)
+      ctx.fillStyle = COLORS.stone
+      ctx.fillText(`sender srtt ${(p.r * base).toFixed(1)} ms`, 628, 232)
     }
     raf = requestAnimationFrame(draw)
     return () => cancelAnimationFrame(raf)
@@ -343,29 +404,39 @@ export const Pipe3b = memo(function Pipe3b({
           <button className={flow === 'bbr' ? 'btn-toggle on' : 'btn-toggle'} onClick={() => onFlow('bbr')}>
             BBRV3
           </button>
+          <button className={flow === 'naive' ? 'btn-toggle on' : 'btn-toggle'} onClick={() => onFlow('naive')}>
+            NAIVE
+          </button>
         </div>
       }
       note={
-        <>
-          Why congestion control exists, drawn live. Each dot's journey is fixed the moment the
-          sender emits it: emission rate and clumping come from the run's measured send rate
-          (inflight/rtt) and burstiness (inter-arrival CV), and the bottleneck box is a real FIFO —
-          while it is backlogged, dots leave at exactly the serialization pitch; when it drains
-          (watch right after a cubic cwnd cut) the sender's gaps pass straight through. The wire
-          itself can only hold about a bandwidth-delay product: once it is full, every further
-          cwnd packet (bar, top left) lives in the queue, buying srtt instead of throughput — until
-          the buffer limit, where <span style={{ color: COLORS.loss }}>✕ marks each dropped
-          packet</span>. The wire serializes faster on a faster link: at {cfg.rateMbps} Mbps one
-          wire dot ≈ {Math.max(1, Math.round((cfg.rateMbps * 1e6) / 8 / 1500 / visCap))} packets;
-          one queue dot ≈ {Math.max(1, Math.round(pktPerQDot))} packets. Playback
-          cruises at {CRUISE_RATE}× and slows to {SLOMO_RATE}× around losses and phase changes.
-        </>
+        flow === 'naive' ? (
+          <>
+            Naive ignores congestion and keeps offering {NAIVE_RATE_MBPS} Mbps. On a{' '}
+            {cfg.rateMbps} Mbps bottleneck, the denser input train fills the queue and the excess
+            becomes <span style={{ color: COLORS.loss }}>actual tail drops</span>; the output train
+            remains limited by the simulated link. ACKs and retransmissions are still real TCP.
+            Note the RTT strip: the pinned-full buffer inflates the real round trip (solid line,
+            from the measured queue) while the sender&apos;s own srtt (dashed) barely moves — with
+            thousands of packets in flight under sustained loss, TCP&apos;s smoothed estimator is
+            nearly frozen. A sender this aggressive cannot even see the damage it does.
+          </>
+        ) : (
+          <>
+            Actual simulated traffic, aggregated so the particles remain readable. Their timing
+            comes from forward and reverse link activity; the browser does not run another traffic
+            model or impose output spacing. Cubic's growing window appears in the in-flight bar and
+            queue stack, ACKs follow the complete return path, and{' '}
+            <span style={{ color: COLORS.loss }}>✕ marks actual dropped packets</span>. Playback
+            cruises at {CRUISE_RATE}× and slows to {SLOMO_RATE}× around losses and phase changes.
+          </>
+        )
       }
     >
       <div style={{ position: 'relative', maxWidth: 640 }}>
         <svg viewBox="0 0 640 292" width="100%" style={{ display: 'block' }}>
           <line x1={266} y1={LIMIT_Y} x2={292} y2={LIMIT_Y} stroke={COLORS.loss} strokeWidth={1.2} />
-          <text x={298} y={LIMIT_Y + 3} fontFamily="JetBrains Mono" fontSize={9} fill={COLORS.loss}>
+          <text x={260} y={LIMIT_Y + 3} textAnchor="end" fontFamily="JetBrains Mono" fontSize={9} fill={COLORS.loss}>
             buffer limit · {Math.round(cfg.qlimPkts)} pkt
           </text>
           <rect x={24} y={110} width={86} height={60} fill="none" stroke={COLORS.ink} strokeWidth={1.3} />
@@ -375,7 +446,7 @@ export const Pipe3b = memo(function Pipe3b({
           <line x1={110} y1={140} x2={266} y2={140} stroke={COLORS.fog} strokeWidth={1} />
           <rect x={266} y={126} width={26} height={28} fill="none" stroke={COLORS.ink} strokeWidth={1.3} />
           <text x={279} y={180} textAnchor="middle" fontFamily="JetBrains Mono" fontSize={9} fill={COLORS.slate}>
-            bottleneck {cfg.rateMbps} Mbps
+            tail-drop q · {cfg.rateMbps} Mbps link
           </text>
           <line x1={292} y1={140} x2={528} y2={140} stroke={COLORS.fog} strokeWidth={1} />
           <rect x={528} y={110} width={86} height={60} fill="none" stroke={COLORS.ink} strokeWidth={1.3} />
@@ -394,10 +465,11 @@ export const Pipe3b = memo(function Pipe3b({
           <text x={52} y={288} fontFamily="JetBrains Mono" fontSize={9} fill={COLORS.stone}>
             base rtt {base} ms
           </text>
-          {srtt && (
+          {rtt && (
             <>
-              <path d={srtt.area} fill={col} fillOpacity={0.1} stroke="none" />
-              <path d={srtt.line} fill="none" stroke={col} strokeWidth={1.3} />
+              <path d={rtt.area} fill={col} fillOpacity={0.1} stroke="none" />
+              <path d={rtt.actual} fill="none" stroke={col} strokeWidth={1.3} />
+              <path d={rtt.srtt} fill="none" stroke={COLORS.stone} strokeWidth={0.9} strokeDasharray="3 3" />
             </>
           )}
         </svg>

@@ -1,7 +1,7 @@
-// Run orchestration: each figure drives a pair of independent single-flow
-// sims (cubic + bbr) for one scenario parameter set. Records accumulate
-// into RunData while the workers stream; `version` bumps per batch so
-// consumers re-derive their views progressively.
+// Run orchestration: comparison figures drive pairs of independent
+// single-flow sims (cubic + bbr); Fig. 3 adds one independent naive run.
+// Records accumulate into RunData while workers stream; `version` bumps per
+// batch so consumers re-derive their views progressively.
 
 import { useEffect, useRef, useState } from 'react'
 import { decode } from '../../../stream/decoder.mjs'
@@ -42,6 +42,78 @@ export interface SimPair {
 export interface PrePair {
   cubic: string
   bbr: string
+}
+
+export interface SimRun {
+  data: RunData
+  version: number
+  running: boolean
+  error?: string
+}
+
+// Runs one independent scenario. Fig. 3 uses this for its fixed-rate naive
+// control case without making the two-run comparison figures pay for a third
+// simulation or changing their atomic pair-loading behavior.
+export function useSimRun(scn: object, pre: string | null): SimRun {
+  const [state, setState] = useState<SimRun>(() => ({
+    data: new RunData(),
+    version: 0,
+    running: false,
+  }))
+  const genRef = useRef(0)
+
+  useEffect(() => {
+    const gen = ++genRef.current
+    const data = new RunData()
+    setState({ data, version: 0, running: true })
+    let client: SimClient | undefined
+    const live = () => genRef.current === gen
+    const bump = () => {
+      if (live()) setState((s) => ({ ...s, version: s.version + 1 }))
+    }
+    const runLive = async () => {
+      await acquireSlot()
+      if (!live()) {
+        releaseSlot()
+        return
+      }
+      client = new SimClient()
+      try {
+        await client.run(scn, { onRecords: (r) => (data.push(r), bump()) })
+        if (live()) setState((s) => ({ ...s, running: false }))
+      } catch (e) {
+        if (live() && !isDisposed(e)) {
+          setState((s) => ({ ...s, running: false, error: String(e) }))
+        }
+      } finally {
+        releaseSlot()
+        client.dispose()
+      }
+    }
+    const loadPre = async (url: string) => {
+      const resp = await fetch(url)
+      if (!resp.ok) throw new Error('precomputed stream missing')
+      data.push(decode(await resp.arrayBuffer()))
+    }
+    const timer = setTimeout(() => {
+      if (!live()) return
+      if (pre) {
+        loadPre(pre)
+          .then(() => live() && setState((s) => ({ ...s, version: s.version + 1, running: false })))
+          .catch(() => {
+            if (live()) return runLive()
+          })
+      } else {
+        runLive()
+      }
+    }, 250)
+    return () => {
+      clearTimeout(timer)
+      client?.dispose()
+    }
+  }, [scn, pre])
+
+  return state
 }
 
 // Runs the two scenarios side by side, restarting both whenever either
