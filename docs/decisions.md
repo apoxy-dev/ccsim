@@ -31,6 +31,8 @@ registered) in `ccsimWrapper` and adds:
 
 - `RegisterSimCC(name, factory)` consulted by `initCongestionControl`, and
   the protocol's available-CC list extended at stack creation.
+- The wrapper is installed before a registered CC factory runs, allowing a
+  controller to set its initial pacing rate before the first data burst.
 - Delivery-rate estimation in the style of draft-cheng-iccrg-delivery-rate-
   estimation: per-segment `(delivered, delivered_time, first_sent)` stamps
   at transmit, one `SimRateSample` per ACK computed in a pre/post wrapper
@@ -171,3 +173,27 @@ upstream (verified: byte-identical sample streams before/after); it is a
 performance patch only. Bufferbloat wall time: 19.7 s → 2.1 s. The same
 cost exists in real gVisor during SACK recovery on large-window paths;
 an incremental-pipe variant would be the proper upstream fix.
+
+## 10. Jitter is a correlated delay walk, not iid per-packet noise
+
+`link.jitter_ms` was first implemented the netem way: each packet draws an
+independent uniform extra delay, with a FIFO clamp to prevent reordering.
+That model is wrong in a way that matters: for streams paced faster than
+the jitter magnitude (ACKs at 250 µs spacing vs 5 ms jitter), the clamp
+turns white-noise delays into same-instant delivery batches — measured 11
+ACKs at one timestamp — and the resulting ACK-compression bursts overflow
+queues that survive on real jittery paths. Cubic lost 9% goodput and took
+3.6k retransmits at just 5 ms; real WANs carry far more delay variance
+without that.
+
+Real jitter is cross-traffic queueing at other hops, which drifts over
+tens of milliseconds and delays neighboring packets almost identically.
+The model now follows that: the delay offset is a piecewise-linear walk —
+a new uniform [0, jitter) target every 100 ms, interpolated between — so
+spacing is approximately preserved (slew rate ≤ jitter/100 ms) and the
+FIFO clamp almost never binds. With the correlated model cubic is
+unaffected at 5 ms and degrades gradually from ~20 ms, which matches
+expectations for a 40 ms-RTT path. The walk consumes its own seeded PCG
+sub-stream, advanced lazily by sim time, so enabling jitter never
+perturbs the loss sequence and jitter=0 draws nothing (byte-identical
+streams).

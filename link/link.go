@@ -63,10 +63,15 @@ type Config struct {
 	RateBps int64         // serialization rate, bits/s (both directions)
 	Delay   time.Duration // one-way propagation delay per direction
 	LossP   float64       // Bernoulli per-packet wire loss probability
-	// Jitter is the maximum extra per-packet delivery delay, drawn
-	// uniformly from [0, Jitter). Deliveries stay FIFO: a small draw never
-	// overtakes an earlier large one, modeling delay variance accumulated
-	// at downstream hops rather than packet reordering.
+	// Jitter is the peak extra delivery delay. The offset is not drawn per
+	// packet: it is a piecewise-linear random walk — a new target uniform
+	// in [0, Jitter) every jitterCorrT, linearly interpolated between —
+	// so nearby packets see nearly the same delay and inter-packet spacing
+	// is approximately preserved. IID per-packet draws (netem's default)
+	// were tried first and rejected: with the FIFO clamp they collapse a
+	// densely paced stream into same-instant delivery batches (measured 11
+	// ACKs at one timestamp for 250us spacing at 5 ms jitter), an ACK-
+	// compression artifact that overflows queues no real path would.
 	Jitter    time.Duration
 	MTU       uint32 // link MTU (default 1500)
 	MakeQdisc func(dir Dir, sink QdiscSink) Qdisc
@@ -195,9 +200,18 @@ type pipe struct {
 	jitter     time.Duration
 	rng        *rand.Rand
 	jrng       *rand.Rand
+	// Correlated jitter walk state: the delay offset interpolates linearly
+	// from jStartVal at jSegStart to jEndVal at jSegStart+jitterCorrT,
+	// then a new target is drawn. Segments advance lazily with sim time,
+	// so the draw sequence depends only on how far time has progressed.
+	jSegStart time.Duration
+	jSegEnd   time.Duration
+	jStartVal float64 // ns
+	jEndVal   float64 // ns
 	// lastJitterAt is the latest jittered delivery time handed to
 	// scheduleDelivery; the FIFO clamp in onTxTimer floors each new
-	// delivery to it so jitter widens gaps without reordering.
+	// delivery to it so jitter can never reorder (the walk's slew rate
+	// makes this a rarely-binding safety net for Jitter < jitterCorrT).
 	lastJitterAt time.Duration
 	extraDelay   map[int]time.Duration
 	busy       bool // serializer transmitting
@@ -308,7 +322,7 @@ func (p *pipe) onTxTimer() {
 		}
 		at := p.now() + d
 		if p.jitter > 0 {
-			at += time.Duration(p.jrng.Float64() * float64(p.jitter))
+			at += p.jitterOffset(p.now())
 			// FIFO clamp: never deliver before an earlier jittered packet.
 			if at < p.lastJitterAt {
 				at = p.lastJitterAt
@@ -318,6 +332,25 @@ func (p *pipe) onTxTimer() {
 		p.scheduleDelivery(at, pk)
 	}
 	p.startNext()
+}
+
+// jitterCorrT is the correlation timescale of the jitter walk: how long the
+// delay offset takes to slew to a fresh uniform target. 100 ms matches the
+// burst durations of the cross-traffic queueing that jitter stands in for.
+const jitterCorrT = 100 * time.Millisecond
+
+// jitterOffset returns the smoothly varying extra delay at time t.
+func (p *pipe) jitterOffset(t time.Duration) time.Duration {
+	for p.jSegEnd <= t {
+		p.jSegStart = p.jSegEnd
+		p.jStartVal = p.jEndVal
+		p.jEndVal = p.jrng.Float64() * float64(p.jitter)
+		p.jSegEnd += jitterCorrT
+	}
+	frac := float64(t-p.jSegStart) / float64(jitterCorrT)
+	// Explicit conversion forces intermediate rounding so the compiler
+	// cannot fuse the multiply-add (native/wasm parity, decisions.md §6).
+	return time.Duration(p.jStartVal + float64((p.jEndVal-p.jStartVal)*frac))
 }
 
 // scheduleDelivery inserts pk into the time-ordered pending list and arms

@@ -24,7 +24,7 @@ type LinkConfig struct {
 	RateMbps float64     `json:"rate_mbps"`
 	OwdMs    float64     `json:"owd_ms"`               // one-way delay, each direction
 	RevOwdMs float64     `json:"rev_owd_ms,omitempty"` // reverse-direction delay override (0 = symmetric)
-	JitterMs float64     `json:"jitter_ms,omitempty"`  // max extra delivery delay, uniform [0, jitter), FIFO-preserving
+	JitterMs float64     `json:"jitter_ms,omitempty"`  // peak extra delivery delay; correlated walk (100 ms), FIFO-preserving
 	Loss     float64     `json:"loss"`                 // bernoulli, per packet
 	Queue    QueueConfig `json:"queue"`
 }
