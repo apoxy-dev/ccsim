@@ -95,6 +95,7 @@ export interface Pt {
   y: number // delivery, ×BtlBw
   r: number // srtt, ×base RTT
   q: number // bottleneck queue, packets
+  w?: number // cwnd, packets
   cv?: number // bottleneck arrival-gap CV (wire_stats; absent in old streams)
   phase?: Phase
 }
@@ -161,6 +162,7 @@ export function toPts(run: RunData, d: Derived, rateMbps: number, bbrPhases: boo
       y,
       r,
       q: Number.isNaN(qP) ? 0 : qP,
+      w: Number.isNaN(cwB) ? undefined : cwB / 1500,
       cv: Number.isNaN(cvV) ? undefined : cvV,
       phase: bbrPhases && !Number.isNaN(code) ? BBR_PHASE[code] : undefined,
     })

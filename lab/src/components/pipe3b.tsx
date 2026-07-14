@@ -116,43 +116,81 @@ export function Pipe3b({
       )
     }
 
-    // Pre-bottleneck wire: dot spacing is driven by the measured arrival
-    // burstiness at the bottleneck — the wire_stats inter-arrival CV, one
-    // record per sample window. Measured values: paced BBR ≈ 0.0–0.06,
-    // ack-clocked cubic ≈ 1.0, recovery/probing spikes 4+. The layout
-    // lerps from even spacing (b=0) to tight clumps of 3 (b=1); positions
-    // are a deterministic function of (t, i), no randomness.
+    // Sender gauge: cwnd and in-flight in packets, on a scale of
+    // BDP + buffer (the most the path can hold). This is the congestion
+    // control loop made visible: the CC raises cwnd, in-flight follows,
+    // the wire fills, the queue builds, a drop bounces off the limit line,
+    // cwnd is cut. The bar sawtooths for cubic and holds flat for bbr.
+    const maxPkts = d.bdpPkts + cfg.qlimPkts
+    const barW = 86
+    els.push(
+      <rect key="ib" x={24} y={96} width={(barW * Math.min(1, infPkts / maxPkts)).toFixed(1)} height={6} fill={col} fillOpacity={0.45} />,
+      <rect key="ibf" x={24} y={96} width={barW} height={6} fill="none" stroke={COLORS.fog} strokeWidth={0.75} />,
+      <text key="cwt" x={24} y={90} fontFamily="JetBrains Mono" fontSize={8.5} fill={COLORS.slate}>
+        cwnd {p.w != null ? Math.round(p.w) : '–'} · in flight {Math.round(infPkts)} pkt
+      </text>,
+    )
+    if (p.w != null) {
+      const cwX = 24 + barW * Math.min(1, p.w / maxPkts)
+      els.push(<line key="cw" x1={cwX.toFixed(1)} y1={94} x2={cwX.toFixed(1)} y2={104} stroke={COLORS.ink} strokeWidth={1.2} />)
+    }
+
+    // Wire burstiness from the measured arrival-gap CV (wire_stats record;
+    // paced bbr ≈ 0.0–0.06, ack-clocked cubic ≈ 1.0, recovery spikes 4+),
+    // averaged over ±100 ms so single-window spikes don't jerk the dots.
+    const i0 = Math.round(t / 0.02)
+    let cvSum = 0
+    let cvN = 0
+    for (let k = -5; k <= 5; k++) {
+      const pp = pts[i0 + k]
+      if (pp?.cv != null) {
+        cvSum += pp.cv
+        cvN++
+      }
+    }
+    const b = Math.min(1, (cvN ? cvSum / cvN : flow === 'cubic' ? 1 : 0.05) / 1.2)
+
+    // Pre-bottleneck wire: dot layout lerps from even spacing (b=0) to
+    // tight clumps of 3 (b=1). Slot positions are fixed — a count change
+    // pops a dot at the train's end instead of reshuffling every phase.
     const wirePkts = Math.max(0, infPkts - q)
-    const nPre = Math.min(12, Math.round(wirePkts / (d.bdpPkts / 10)))
-    const b = Math.min(1, (p.cv ?? (flow === 'cubic' ? 1 : 0.05)) / 1.2)
-    for (let i = 0; i < nPre; i++) {
+    const PRE_SLOTS = 12
+    const filledPre = Math.min(PRE_SLOTS, Math.round(wirePkts / (d.bdpPkts / 10)))
+    for (let i = 0; i < filledPre; i++) {
       const burst = Math.floor(i / 3)
-      const nBursts = Math.ceil(nPre / 3)
-      const evenPh = i / nPre
-      const clumpPh = burst / nBursts + (i % 3) * 0.008 + 0.04 * Math.sin(burst * 5.7)
+      const evenPh = i / PRE_SLOTS
+      const clumpPh = burst / (PRE_SLOTS / 3) + (i % 3) * 0.008 + 0.04 * Math.sin(burst * 5.7)
       const ph = evenPh + (clumpPh - evenPh) * b
       const pr = (((t * 0.55 + ph) % 1) + 1) % 1
       els.push(<circle key={'w' + i} cx={(114 + pr * 148).toFixed(1)} cy={140} r={3} fill={col} />)
     }
 
-    // Post-bottleneck spacing is serialization at link rate — a fixed, even
-    // pitch that never changes, whatever the sender does. Sub-saturation
-    // delivery renders as missing dots (idle gaps in the train), never as
-    // stretched spacing: the pitch IS the link rate.
+    // Post-bottleneck: a backlogged bottleneck emits back-to-back — even
+    // spacing at exactly the serialization pitch, whatever the sender does.
+    // An idle link instead passes the sender's gaps through: bursts leave
+    // at the pitch (never tighter), separated by the sender's idle gaps.
     const POST_SLOTS = 10
     const filled = Math.max(1, Math.min(POST_SLOTS, Math.round(p.y * POST_SLOTS)))
+    const idle = Math.max(0, Math.min(1, 1 - q / 5)) * b
+    const postPh: number[] = []
     for (let i = 0; i < filled; i++) {
-      const pr = (t * 0.55 + i / POST_SLOTS) % 1
-      els.push(<circle key={'p' + i} cx={(296 + pr * 228).toFixed(1)} cy={140} r={3} fill={col} />)
+      const burst = Math.floor(i / 3)
+      const evenPh = i / POST_SLOTS
+      const clumpPh = burst / Math.ceil(POST_SLOTS / 3) + (i % 3) / POST_SLOTS
+      postPh.push(evenPh + (clumpPh - evenPh) * idle)
     }
-    // ACKs inherit the bottleneck spacing — the even return stream is what
-    // ack-clocking feeds on — so they mirror the post-bottleneck train.
-    for (let i = 0; i < filled; i++) {
-      const pr = (t * 0.5 + i / POST_SLOTS) % 1
+    postPh.forEach((ph, i) => {
+      const pr = (((t * 0.55 + ph) % 1) + 1) % 1
+      els.push(<circle key={'p' + i} cx={(296 + pr * 228).toFixed(1)} cy={140} r={3} fill={col} />)
+    })
+    // ACKs inherit the bottleneck spacing — the return stream mirrors the
+    // post-bottleneck train, and that is what ack-clocking feeds on.
+    postPh.forEach((ph, i) => {
+      const pr = (((t * 0.5 + ph) % 1) + 1) % 1
       els.push(
         <circle key={'ak' + i} cx={(556 - pr * 476).toFixed(1)} cy={200} r={2} fill={col} fillOpacity={0.6} />,
       )
-    }
+    })
 
     // Each ✕ is one dropped packet. Losses are rare, discrete, and causally
     // important, so they are exempt from the dot aggregation: the glyph
@@ -189,13 +227,16 @@ export function Pipe3b({
       }
       note={
         <>
-          Wire spacing is the story: right of the bottleneck it is always even — serialization at
-          link rate paces everyone's output — while left-side clumping is drawn from the measured
-          arrival burstiness at the bottleneck (inter-arrival CV, sampled per 20 ms window):
-          cubic's ack-clocked bursts vs bbr's pacing. One queue dot ≈ {Math.max(1, Math.round(pktPerQDot))}{' '}
-          packets; each <span style={{ color: COLORS.loss }}>✕ is one dropped packet</span>.
-          Playback cruises at {CRUISE_RATE}× and drops to {SLOMO_RATE}× around losses and phase
-          changes. Runs off the real sample stream of the selected flow's run.
+          The congestion-control loop, drawn live: the sender raises cwnd (bar), in-flight fills
+          the wire, the surplus stacks up in the queue, a drop bounces off the buffer limit, cwnd
+          is cut. While the queue is backlogged the bottleneck emits back-to-back — even spacing
+          at link rate, whatever the sender does; an idle link passes the sender's gaps through.
+          Left-side spacing is the measured arrival burstiness (inter-arrival CV per 20 ms
+          window): cubic's ack-clocked bursts vs bbr's pacing. One queue dot ≈{' '}
+          {Math.max(1, Math.round(pktPerQDot))} packets; each{' '}
+          <span style={{ color: COLORS.loss }}>✕ is one dropped packet</span>. Playback cruises at{' '}
+          {CRUISE_RATE}× and slows to {SLOMO_RATE}× around losses and phase changes; everything is
+          driven by the selected run's real sample stream.
         </>
       }
     >
