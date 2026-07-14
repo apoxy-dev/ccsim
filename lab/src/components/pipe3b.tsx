@@ -22,7 +22,7 @@ const tx = (t: number) => 52 + t * 19.2
 // around events: at cruise an RTT is tens of ms of wall time, so a drop
 // would be over before the eye lands on it.
 export const CRUISE_RATE = 0.4
-const SLOMO_RATE = 0.06
+const SLOMO_RATE = 0.15
 const SLOMO_WIN = 0.2 // seconds of sim time on each side of an event
 
 // Times worth slowing down for: drop episodes (coalesced so a taildrop
@@ -143,17 +143,20 @@ export function Pipe3b({
       els.push(<circle key={'w' + i} cx={(114 + pr * 148).toFixed(1)} cy={140} r={3} fill={col} />)
     }
 
-    // Post-bottleneck spacing is serialization at link rate — always even,
-    // whatever the sender does. Density tracks measured delivery rate.
-    const nPost = Math.max(1, Math.min(10, Math.round(p.y * 10)))
-    for (let i = 0; i < nPost; i++) {
-      const pr = (t * 0.55 + i / nPost) % 1
+    // Post-bottleneck spacing is serialization at link rate — a fixed, even
+    // pitch that never changes, whatever the sender does. Sub-saturation
+    // delivery renders as missing dots (idle gaps in the train), never as
+    // stretched spacing: the pitch IS the link rate.
+    const POST_SLOTS = 10
+    const filled = Math.max(1, Math.min(POST_SLOTS, Math.round(p.y * POST_SLOTS)))
+    for (let i = 0; i < filled; i++) {
+      const pr = (t * 0.55 + i / POST_SLOTS) % 1
       els.push(<circle key={'p' + i} cx={(296 + pr * 228).toFixed(1)} cy={140} r={3} fill={col} />)
     }
     // ACKs inherit the bottleneck spacing — the even return stream is what
-    // ack-clocking feeds on — so they mirror the post-bottleneck dots.
-    for (let i = 0; i < nPost; i++) {
-      const pr = (t * 0.5 + i / nPost) % 1
+    // ack-clocking feeds on — so they mirror the post-bottleneck train.
+    for (let i = 0; i < filled; i++) {
+      const pr = (t * 0.5 + i / POST_SLOTS) % 1
       els.push(
         <circle key={'ak' + i} cx={(556 - pr * 476).toFixed(1)} cy={200} r={2} fill={col} fillOpacity={0.6} />,
       )
