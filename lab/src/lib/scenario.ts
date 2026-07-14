@@ -46,8 +46,8 @@ export function fig1Precomp(cc: CC, cfg: LabCfg): string | null {
   return null
 }
 
-export function fig2Precomp(cc: CC, lossPct: number): string | null {
-  return lossPct === 0 ? `/sim/pre/fig2-${cc}.bin` : null
+export function fig2Precomp(cc: CC, lossPct: number, jitterMs: number): string | null {
+  return lossPct === 0 && jitterMs === 0 ? `/sim/pre/fig2-${cc}.bin` : null
 }
 
 export const RUN_DUR_S = 30
@@ -95,15 +95,16 @@ export function scenarioFor(cc: CC, cfg: LabCfg): object {
 // a 10-Mbps, 40-ms flow whose bottleneck doubles to 20 Mbps at t=20 s and
 // drops back to 10 Mbps at t=40 s. Rate, delay, and buffer stay fixed —
 // the figure's chrome (link-rate step path, lane ranges, step labels) is
-// drawn to them — but wire loss is adjustable and either CC can run it.
+// drawn to them — but wire loss and jitter are adjustable and either CC can
+// run it.
 export const BWSTEP_DUR_S = 60
-// jitter 0: the bandwidth-step figure reproduces the paper's clean-path
-// experiment; only wire loss is adjustable there.
+// jitter 0 default: the precomputed streams reproduce the paper's clean-path
+// experiment; the sliders opt into a dirtier path.
 export const BWSTEP_CFG: LabCfg = { rateMbps: 10, owdMs: 20, jitterMs: 0, lossPct: 0, qlimPkts: 133 }
 
-export function bwStepScenario(cc: CC, lossPct: number): object {
+export function bwStepScenario(cc: CC, lossPct: number, jitterMs = 0): object {
   return {
-    ...scenarioFor(cc, { ...BWSTEP_CFG, lossPct }),
+    ...scenarioFor(cc, { ...BWSTEP_CFG, lossPct, jitterMs }),
     dur_s: BWSTEP_DUR_S,
     events: [
       { at_s: 20, path: 'link.rate_mbps', value: 20 },

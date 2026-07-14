@@ -101,6 +101,7 @@ export function App() {
   const set = (k: keyof LabCfg) => (v: number) => setCfg((c) => ({ ...c, [k]: v }))
 
   const [bwLossPct, setBwLossPct] = useState(0)
+  const [bwJitterMs, setBwJitterMs] = useState(0)
 
   // Scenario identity drives the run hooks — memoize so unrelated renders
   // don't restart the sims.
@@ -117,13 +118,13 @@ export function App() {
   const naiveScn = useMemo(() => scenarioFor('naive', HEAVY_CFG), [])
   const naivePre = useMemo(() => fig1Precomp('naive', HEAVY_CFG), [])
   const naive = useSimRun(naiveScn, naivePre)
-  const bwCubicScn = useMemo(() => bwStepScenario('cubic', bwLossPct), [bwLossPct])
-  const bwBbrScn = useMemo(() => bwStepScenario('bbr', bwLossPct), [bwLossPct])
+  const bwCubicScn = useMemo(() => bwStepScenario('cubic', bwLossPct, bwJitterMs), [bwLossPct, bwJitterMs])
+  const bwBbrScn = useMemo(() => bwStepScenario('bbr', bwLossPct, bwJitterMs), [bwLossPct, bwJitterMs])
   const pre2 = useMemo(() => {
-    const c = fig2Precomp('cubic', bwLossPct)
-    const b = fig2Precomp('bbr', bwLossPct)
+    const c = fig2Precomp('cubic', bwLossPct, bwJitterMs)
+    const b = fig2Precomp('bbr', bwLossPct, bwJitterMs)
     return c && b ? { cubic: c, bbr: b } : null
-  }, [bwLossPct])
+  }, [bwLossPct, bwJitterMs])
   const bw = useSimPair(bwCubicScn, bwBbrScn, pre2)
 
   // Re-derive figure points per sample batch; version is the cache key —
@@ -235,13 +236,17 @@ export function App() {
           <>
             <div className="ctl-row">
               <Slider label="loss" value={bwLossPct} min={0} max={3} step={0.05} fmt={(v) => `${v.toFixed(2)} %`} onChange={setBwLossPct} />
+              <Slider label="jitter" value={bwJitterMs} min={0} max={10} step={0.5} fmt={(v) => `${v.toFixed(1)} ms`} onChange={setBwJitterMs} />
             </div>
             <StatusLine
               error={bw.error}
               running={bw.running}
               pct={(bw.cubic.maxT + bw.bbr.maxT) / (2 * BWSTEP_DUR_S)}
               durS={BWSTEP_DUR_S}
-              onReset={() => setBwLossPct(0)}
+              onReset={() => {
+                setBwLossPct(0)
+                setBwJitterMs(0)
+              }}
             />
             <SlowWarning />
           </>
