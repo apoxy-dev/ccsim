@@ -25,6 +25,7 @@ export const Kind = Object.freeze({
   PktEnqueue: 17,
   PktDequeue: 18,
   PktDrop: 19,
+  WireBurstCV: 20,
 });
 
 export const LINK_FWD = 0xffff;

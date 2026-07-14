@@ -69,6 +69,7 @@ type InjectEvent struct {
 type SampleConfig struct {
 	IntervalMs   float64 `json:"interval_ms,omitempty"`   // default 1ms
 	PacketEvents bool    `json:"packet_events,omitempty"` // per-packet event stream
+	WireStats    bool    `json:"wire_stats,omitempty"`    // per-window arrival burstiness records
 }
 
 // Interval returns the sampling interval with the default applied.

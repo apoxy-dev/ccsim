@@ -116,29 +116,21 @@ export function Pipe3b({
       )
     }
 
-    // Pre-bottleneck wire: dot spacing shows the sender's transmit pattern.
-    // BBR paces — even spacing at pacing_rate. Cubic is ack-clocked — dots
-    // ride in bursts, and for a stretch after a drop the bursts pack even
-    // tighter (post-recovery clumping). Positions are a deterministic
-    // function of (t, i); no randomness.
+    // Pre-bottleneck wire: dot spacing is driven by the measured arrival
+    // burstiness at the bottleneck — the wire_stats inter-arrival CV, one
+    // record per sample window. Measured values: paced BBR ≈ 0.0–0.06,
+    // ack-clocked cubic ≈ 1.0, recovery/probing spikes 4+. The layout
+    // lerps from even spacing (b=0) to tight clumps of 3 (b=1); positions
+    // are a deterministic function of (t, i), no randomness.
     const wirePkts = Math.max(0, infPkts - q)
     const nPre = Math.min(12, Math.round(wirePkts / (d.bdpPkts / 10)))
-    let lastDrop = -Infinity
-    for (const dT of dropTimes) {
-      if (dT > t) break
-      lastDrop = dT
-    }
-    const postRec = flow === 'cubic' && t - lastDrop < 1.2
+    const b = Math.min(1, (p.cv ?? (flow === 'cubic' ? 1 : 0.05)) / 1.2)
     for (let i = 0; i < nPre; i++) {
-      let ph: number
-      if (flow === 'bbr') {
-        ph = i / nPre
-      } else {
-        const burst = Math.floor(i / 3)
-        const nBursts = Math.ceil(nPre / 3)
-        const gap = postRec ? 0.008 : 0.02
-        ph = burst / nBursts + (i % 3) * gap + 0.04 * Math.sin(burst * 5.7)
-      }
+      const burst = Math.floor(i / 3)
+      const nBursts = Math.ceil(nPre / 3)
+      const evenPh = i / nPre
+      const clumpPh = burst / nBursts + (i % 3) * 0.008 + 0.04 * Math.sin(burst * 5.7)
+      const ph = evenPh + (clumpPh - evenPh) * b
       const pr = (((t * 0.55 + ph) % 1) + 1) % 1
       els.push(<circle key={'w' + i} cx={(114 + pr * 148).toFixed(1)} cy={140} r={3} fill={col} />)
     }
@@ -198,7 +190,8 @@ export function Pipe3b({
       note={
         <>
           Wire spacing is the story: right of the bottleneck it is always even — serialization at
-          link rate paces everyone's output — while the left side shows the sender's input:
+          link rate paces everyone's output — while left-side clumping is drawn from the measured
+          arrival burstiness at the bottleneck (inter-arrival CV, sampled per 20 ms window):
           cubic's ack-clocked bursts vs bbr's pacing. One queue dot ≈ {Math.max(1, Math.round(pktPerQDot))}{' '}
           packets; each <span style={{ color: COLORS.loss }}>✕ is one dropped packet</span>.
           Playback cruises at {CRUISE_RATE}× and drops to {SLOMO_RATE}× around losses and phase

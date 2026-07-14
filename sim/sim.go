@@ -56,6 +56,7 @@ func New(cfg *scenario.ScenarioConfig, w *stream.Writer) (*Sim, error) {
 	}
 	s.rec = probe.NewRecorder(w, len(cfg.Flows), ccNames)
 	s.rec.PacketEvents = cfg.Sample.PacketEvents
+	s.rec.WireStats = cfg.Sample.WireStats
 
 	qcfg := cfg.Link.Queue
 	hasReverse := false

@@ -70,7 +70,10 @@ export function scenarioFor(cc: CC, cfg: LabCfg): object {
     // The figures resample onto a 20 ms grid (series.toPts dt), so finer
     // sampling is pure stream weight — this cuts streams 20× vs the 1 ms
     // default, which is what makes shipping precomputed defaults viable.
-    sample: { interval_ms: 20 },
+    // wire_stats adds one arrival-burstiness record per window (the pipe
+    // figure draws its dot spacing from it) — batched to the sample rate,
+    // not the per-packet rate.
+    sample: { interval_ms: 20, wire_stats: true },
   }
 }
 

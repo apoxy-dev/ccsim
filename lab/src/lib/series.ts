@@ -34,6 +34,7 @@ export class RunData {
   delivery = newTrack() // bits/s
   ccState = newTrack()
   qDepth = newTrack() // packets, forward link
+  wireCV = newTrack() // bottleneck arrival-gap CV, forward link (wire_stats)
   lossEvents: number[] = [] // cwnd-cut times
   dropEvents: number[] = [] // forward-link drop times
   maxT = 0
@@ -52,6 +53,9 @@ export class RunData {
         if (r.kind === Kind.QDepthPkts) {
           this.qDepth.t.push(r.t)
           this.qDepth.v.push(r.value)
+        } else if (r.kind === Kind.WireBurstCV) {
+          this.wireCV.t.push(r.t)
+          this.wireCV.v.push(r.value)
         }
         continue
       }
@@ -91,6 +95,7 @@ export interface Pt {
   y: number // delivery, ×BtlBw
   r: number // srtt, ×base RTT
   q: number // bottleneck queue, packets
+  cv?: number // bottleneck arrival-gap CV (wire_stats; absent in old streams)
   phase?: Phase
 }
 
@@ -124,6 +129,7 @@ export function toPts(run: RunData, d: Derived, rateMbps: number, bbrPhases: boo
   const del = new Cursor(run.delivery)
   const st = new Cursor(run.ccState)
   const q = new Cursor(run.qDepth)
+  const wcv = new Cursor(run.wireCV)
   const btlBps = rateMbps * 1e6
   const pts: Pt[] = []
   const n = Math.floor(run.maxT / dt)
@@ -148,12 +154,14 @@ export function toPts(run: RunData, d: Derived, rateMbps: number, bbrPhases: boo
     const x = Number.isNaN(infB) ? 0.02 : Math.max(infB / d.bdpBytes, 0.02)
     const y = Number.isNaN(delB) ? 0.02 : Math.max(delB / btlBps, 0.02)
     const r = Number.isNaN(rttS) ? 1 : Math.max((rttS * 1000) / d.baseMs, 1)
+    const cvV = wcv.at(t)
     pts.push({
       t,
       x,
       y,
       r,
       q: Number.isNaN(qP) ? 0 : qP,
+      cv: Number.isNaN(cvV) ? undefined : cvV,
       phase: bbrPhases && !Number.isNaN(code) ? BBR_PHASE[code] : undefined,
     })
   }

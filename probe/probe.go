@@ -77,6 +77,7 @@ type flowState struct {
 type Recorder struct {
 	W            *stream.Writer
 	PacketEvents bool
+	WireStats    bool
 
 	flows []flowState
 
@@ -85,6 +86,16 @@ type Recorder struct {
 	qDepthSamples  int
 	qDepthMax      int
 	deliveredBytes [2]uint64 // per direction, since last link sample
+
+	// Forward-link arrival-gap accumulators for the wire_stats record: the
+	// CV of inter-enqueue gaps over one sample window summarizes the
+	// sender's transmit pattern (paced ≈ 0, ack-clocked bursts ≫ 0) at
+	// sample rate instead of per-packet event rate.
+	wireSeen     bool
+	wireLastT    time.Duration
+	wireGapN     int
+	wireGapSum   float64
+	wireGapSqSum float64
 }
 
 // NewRecorder creates a Recorder for n flows writing to w (which may be nil
@@ -165,6 +176,24 @@ func (r *Recorder) OnLinkSample(t time.Duration, qPkts, qBytes int, window time.
 	if qPkts > r.qDepthMax {
 		r.qDepthMax = qPkts
 	}
+	if r.WireStats {
+		// Idle or single-arrival windows emit nothing: a CV needs at least
+		// two gaps, and consumers hold the last value across quiet windows.
+		if r.wireGapN >= 2 && r.wireGapSum > 0 {
+			n := float64(r.wireGapN)
+			mean := r.wireGapSum / n
+			// Explicit conversion blocks FMA fusion; see docs/decisions.md §6.
+			m2 := float64(mean * mean)
+			v := r.wireGapSqSum/n - m2
+			if v < 0 {
+				v = 0
+			}
+			r.write(t, stream.LinkFwd, stream.KindWireBurstCV, math.Sqrt(v)/mean)
+		}
+		r.wireGapN = 0
+		r.wireGapSum = 0
+		r.wireGapSqSum = 0
+	}
 }
 
 // LinkHooks returns link.Hooks wired into this recorder. The per-packet
@@ -194,10 +223,27 @@ func (r *Recorder) LinkHooks() link.Hooks {
 			r.deliveredBytes[e.Dir] += uint64(e.Size)
 		},
 	}
-	if r.PacketEvents {
+	if r.PacketEvents || r.WireStats {
 		h.OnEnqueue = func(e link.Event) {
-			r.write(e.T, flowOrLink(e), stream.KindPktEnqueue, float64(e.Size))
+			if r.PacketEvents {
+				r.write(e.T, flowOrLink(e), stream.KindPktEnqueue, float64(e.Size))
+			}
+			if r.WireStats && e.Dir == link.Fwd {
+				if r.wireSeen {
+					g := (e.T - r.wireLastT).Seconds()
+					r.wireGapSum += g
+					// Explicit conversion blocks FMA fusion; see
+					// docs/decisions.md §6.
+					sq := float64(g * g)
+					r.wireGapSqSum += sq
+					r.wireGapN++
+				}
+				r.wireSeen = true
+				r.wireLastT = e.T
+			}
 		}
+	}
+	if r.PacketEvents {
 		h.OnDequeue = func(e link.Event) {
 			r.write(e.T, flowOrLink(e), stream.KindPktDequeue, float64(e.Size))
 		}

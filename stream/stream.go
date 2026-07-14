@@ -48,6 +48,7 @@ const (
 	KindPktEnqueue     Kind = 17 // per-packet event stream (optional)
 	KindPktDequeue     Kind = 18
 	KindPktDrop        Kind = 19
+	KindWireBurstCV    Kind = 20 // bottleneck arrival-gap CV over the sample window (wire_stats)
 )
 
 // Pseudo flow ids for link-level records.
