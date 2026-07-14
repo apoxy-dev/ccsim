@@ -197,3 +197,28 @@ expectations for a 40 ms-RTT path. The walk consumes its own seeded PCG
 sub-stream, advanced lazily by sim time, so enabling jitter never
 perturbs the loss sequence and jitter=0 draws nothing (byte-identical
 streams).
+
+## 11. BBR rate samples carry pipe-based inflight, not the sequence span
+
+`SimRateSample.InflightBytes` originally reported `SND.NXT - SND.UNA`.
+Under persistent random loss the flow lives in SACK recovery with SND.UNA
+pinned behind a hole, so that span overstates packets in the network by
+the width of the SACK holes (measured 964 pkt raw vs 645 cwnd at 0.35%
+loss). BBR's ProbeBW:DOWN exit compares inflight to 1.0x estimated BDP —
+with the inflated signal the drain "never completes", and the phase
+histogram showed the flow wedged in DOWN 84% of the time, holding a
+cwnd-limited standing queue (mean 253 of 350 pkt) that pegged the fig 1
+operating point at the loss cliff.
+
+Linux BBRv3 (google/bbr, v3 branch) never uses the sequence span:
+`rs.prior_in_flight = tcp_packets_in_flight(tp)` = packets_out -
+(sacked_out + lost_out) + retrans_out, further reduced by the EDT
+correction in `bbr_packets_in_net_at_edt()`. gVisor already maintains the
+equivalent quantity: `snd.Outstanding` is kept per send/ack and
+recomputed as the RFC 6675 pipe during recovery (§9), so the sample now
+carries `Outstanding * MSS`. Effect at 0.35% loss / 1.05xBDP buffer:
+DOWN occupancy 84% -> 39% (CRUISE 50%), mean queue 253 -> 128 pkt, srtt
+57 -> 48 ms; goodput 83 -> 68 Mbps because bw_lo/inflight_lo loss bounds
+now govern from cruise instead of being masked by a permanently full
+pipe. Clean-path presets shift within noise; goldens regenerated (see
+golden_changelog.md), conformance suite unchanged.

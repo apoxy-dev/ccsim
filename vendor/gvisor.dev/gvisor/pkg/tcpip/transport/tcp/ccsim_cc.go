@@ -273,12 +273,14 @@ func (w *ccsimWrapper) PostRecovery() { w.inner.PostRecovery() }
 // ccsimInitCC is called from initCongestionControl to build the CC chain.
 func (s *sender) ccsimInitCC(name tcpip.CongestionControlOption, stock congestionControl) congestionControl {
 	w := &ccsimWrapper{s: s, inner: stock}
+	// Install the wrapper before invoking an external constructor so its
+	// SimSender can configure pacing immediately, before the first data burst.
+	s.ccsim.wrap = w
 	if f, ok := simCCRegistry[string(name)]; ok {
 		sim := f(SimSender{s})
 		w.inner = sim
 		w.sim = sim
 	}
-	s.ccsim.wrap = w
 	return w
 }
 
@@ -433,7 +435,15 @@ func (s *sender) ccsimPostAck(rcvdSeg *segment) {
 		AckedBytes:     st.scratchAcked,
 		Delivered:      st.delivered,
 		PriorDelivered: -1,
-		InflightBytes:  int64(s.SndUna.Size(s.SndNxt)),
+		// Packets actually in the network, matching Linux's rate_sample
+		// prior_in_flight = tcp_packets_in_flight(): s.Outstanding is
+		// maintained per send/ack and recomputed as the RFC 6675 pipe
+		// during SACK recovery. The raw span SND.NXT-SND.UNA was used
+		// first and rejected: under persistent random loss a pinned
+		// SND.UNA inflates it by the SACK-hole width, so BBR's
+		// ProbeBW:DOWN drain condition never satisfies and the flow
+		// wedges in DOWN holding a cwnd-limited standing queue.
+		InflightBytes:  int64(s.Outstanding) * int64(s.MaxPayloadSize),
 		ECE:            ece,
 		RetransSegsCum: s.ep.stats.SendErrors.Retransmits.Value(),
 	}
