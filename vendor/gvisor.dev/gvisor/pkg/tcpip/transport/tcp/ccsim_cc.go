@@ -66,6 +66,21 @@ type SimRateSample struct {
 	// RetransSegsCum is the endpoint's cumulative retransmitted segment
 	// count (loss proxy).
 	RetransSegsCum uint64
+	// TxInflight is C.inflight at the transmit time of the segment this
+	// rate sample was taken from (the draft's P.tx_in_flight), 0 when the
+	// ACK produced no sample.
+	TxInflight int64
+	// LostBytes is the volume newly marked lost between that transmit and
+	// this ACK (the draft's RS.lost = C.lost - P.lost).
+	LostBytes int64
+	// LostBytesCum is the cumulative marked-lost byte count (C.lost).
+	// Loss is counted when the RFC 6675 scoreboard first implies a
+	// sequence range is lost (mark time), or when an RTO fires, not when
+	// data is retransmitted.
+	LostBytesCum int64
+	// IsCwndLimited reports whether the most recent send attempt ended
+	// with the congestion window fully utilized.
+	IsCwndLimited bool
 }
 
 // SimSender is the restricted sender handle given to registered CCs.
@@ -213,6 +228,13 @@ type ccsimSenderState struct {
 	appLimitedSeq seqnum.Value // app-limited until this sequence is acked
 	appLimited    bool
 
+	// lostCum is the cumulative marked-lost byte count (the draft's
+	// C.lost), fed by the RFC 6675 scoreboard walk and the RTO path.
+	lostCum int64
+	// cwndLimited records whether the last sendData pass ended with the
+	// window fully used (the draft's C.is_cwnd_limited).
+	cwndLimited bool
+
 	// Reusable scratch for ccsimSetPipe: scoreboard snapshot and suffix
 	// byte sums (index i holds the total SACKed bytes in ranges[i:]).
 	pipeRanges   []header.SACKBlock `state:"nosave"`
@@ -227,6 +249,8 @@ type ccsimSenderState struct {
 		firstSent     tcpip.MonotonicTime
 		xmitTime      tcpip.MonotonicTime
 		appLimited    bool
+		txInflight    int64
+		lostAtTx      int64
 	}
 }
 
@@ -237,6 +261,14 @@ type ccsimSegState struct {
 	firstSent     tcpip.MonotonicTime
 	appLimited    bool
 	counted       bool
+	// txInflight is C.inflight at this segment's (most recent) transmit,
+	// including the segment itself (P.tx_in_flight).
+	txInflight int64
+	// lostAtTx is the cumulative marked-lost count at transmit (P.lost).
+	lostAtTx int64
+	// lostCounted is set once this segment has been tallied into lostCum;
+	// cleared on (re)transmit so a lost retransmission is counted again.
+	lostCounted bool
 }
 
 // ccsimWrapper wraps the active CC.
@@ -261,6 +293,10 @@ func (w *ccsimWrapper) HandleLossDetected() {
 
 func (w *ccsimWrapper) HandleRTOExpired() {
 	w.rtoCount++
+	// An RTO means everything outstanding and not SACKed is presumed lost
+	// (the tcp_enter_loss analog). This runs before the caller expunges
+	// the scoreboard, so SACKed ranges are still excluded.
+	w.s.ccsimMarkAllLost()
 	w.inner.HandleRTOExpired()
 }
 
@@ -341,6 +377,14 @@ func (s *sender) ccsimStampSegment(seg *segment) {
 	seg.ccsim.firstSent = st.firstSent
 	seg.ccsim.appLimited = st.appLimited
 	seg.ccsim.counted = false
+	// P.tx_in_flight: s.Outstanding does not yet include a first
+	// transmission (sendData increments it after sendSegment) and is the
+	// RFC 6675 pipe during recovery, so add this segment explicitly.
+	seg.ccsim.txInflight = int64(s.Outstanding)*int64(s.MaxPayloadSize) + int64(seg.payloadSize())
+	seg.ccsim.lostAtTx = st.lostCum
+	// A fresh (re)transmission supersedes any earlier lost mark; if this
+	// copy is lost too the scoreboard walk counts it again.
+	seg.ccsim.lostCounted = false
 	st.firstSent = now
 }
 
@@ -352,6 +396,7 @@ func (s *sender) ccsimMarkAppLimited() {
 		st.appLimited = true
 		st.appLimitedSeq = s.SndNxt
 	}
+	st.cwndLimited = s.Outstanding >= s.SndCwnd
 }
 
 // ccsimPreAck captures delivery information for segments about to be acked
@@ -405,6 +450,8 @@ func (s *sender) ccsimPreAck(rcvdSeg *segment) {
 			st.scratchSeg.firstSent = seg.ccsim.firstSent
 			st.scratchSeg.xmitTime = seg.xmitTime
 			st.scratchSeg.appLimited = seg.ccsim.appLimited
+			st.scratchSeg.txInflight = seg.ccsim.txInflight
+			st.scratchSeg.lostAtTx = seg.ccsim.lostAtTx
 		}
 	}
 }
@@ -446,9 +493,13 @@ func (s *sender) ccsimPostAck(rcvdSeg *segment) {
 		InflightBytes:  int64(s.Outstanding) * int64(s.MaxPayloadSize),
 		ECE:            ece,
 		RetransSegsCum: s.ep.stats.SendErrors.Retransmits.Value(),
+		LostBytesCum:   st.lostCum,
+		IsCwndLimited:  st.cwndLimited,
 	}
 	if st.scratchHasSample {
 		sc := &st.scratchSeg
+		sample.TxInflight = sc.txInflight
+		sample.LostBytes = st.lostCum - sc.lostAtTx
 		sample.PriorDelivered = sc.delivered
 		ackElapsed := nowMT.Sub(sc.deliveredTime)
 		sendElapsed := sc.xmitTime.Sub(sc.firstSent)
@@ -689,6 +740,16 @@ func (s *sender) ccsimSetPipe() int {
 			// SetPipe(): (a) if IsLost(S1) returns false, Pipe++.
 			if !ccsimRangeLost(ranges, suf, i, r, lostBytes) {
 				pipe++
+			} else if s1.xmitCount == 1 && !s1.ccsim.lostCounted {
+				// First time the scoreboard implies this segment is
+				// lost: tally it at mark time (C.lost). Counted per
+				// segment, not per chunk — sim segments are one MSS.
+				// Only original transmissions: a retransmitted segment's
+				// range stays IsLost until the retransmit is SACKed, and
+				// recounting it here would double every loss (a lost
+				// retransmission is tallied by the RTO path instead).
+				s1.ccsim.lostCounted = true
+				s.ccsim.lostCum += int64(s1.payloadSize())
 			}
 			// SetPipe(): (b) if S1 <= HighRxt, Pipe++.
 			if s1.sequenceNumber.LessThanEq(s.FastRecovery.HighRxt) {
@@ -697,6 +758,24 @@ func (s *sender) ccsimSetPipe() int {
 		}
 	}
 	return pipe
+}
+
+// ccsimMarkAllLost tallies every sent, un-SACKed, not-yet-counted segment
+// into the marked-lost counter. Called on RTO, before the scoreboard is
+// expunged.
+//
+// +checklocks:s.ep.mu
+func (s *sender) ccsimMarkAllLost() {
+	for seg := s.writeList.Front(); seg != nil && seg.xmitCount != 0; seg = seg.Next() {
+		if seg.payloadSize() == 0 || seg.ccsim.lostCounted {
+			continue
+		}
+		if s.ep.SACKPermitted && s.ep.scoreboard.IsSACKED(seg.sackBlock()) {
+			continue
+		}
+		seg.ccsim.lostCounted = true
+		s.ccsim.lostCum += int64(seg.payloadSize())
+	}
 }
 
 // ccsimRangeLost mirrors SACKScoreboard.IsRangeLost for a chunk r that is

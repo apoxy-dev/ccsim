@@ -171,12 +171,12 @@ func TestLossResponseMath(t *testing.T) {
 		trace(b, f, 80e6, rtt, time.Second)
 	}
 	pre := b.bw()
-	// One loss round: delivery rate halves, retransmissions observed.
+	// One loss round: delivery rate halves, ten segments marked lost.
 	f.now += 10 * time.Millisecond
 	b.OnAck(tcp.SimRateSample{
 		Now: f.now, AckedBytes: mss, Delivered: b.lastSample.Delivered + mss,
 		DeliveryRateBps: 40e6, RTT: rtt, Interval: 10 * time.Millisecond,
-		InflightBytes: f.inflight, RetransSegsCum: 10,
+		InflightBytes: f.inflight, LostBytesCum: 10 * mss,
 	})
 	// Complete the round so adaptLowerBounds runs.
 	trace(b, f, 40e6, rtt, 2*rtt)
@@ -233,15 +233,18 @@ func TestInflightTooHighAbortsProbe(t *testing.T) {
 	b, f := newTestBBR()
 	rtt := 30 * time.Millisecond
 	trace(b, f, 80e6, rtt, 3*time.Second)
-	// Force UP state with accumulated loss above 2% of inflight.
+	// Force UP state with a sample whose lost-since-transmit volume is
+	// above 2% of its transmit-time inflight.
 	b.enter(StateProbeBWUp, f.now)
-	b.lossEventsRound = 3
-	b.lostBytesRound = int64(0.1 * float64(f.inflight))
+	// As set by REFILL entry; rewind the probe mark so this sample counts
+	// as probe-sent.
+	b.bwProbeSamples, b.probeStartDelivered = true, 0
 	f.now += 10 * time.Millisecond
 	b.OnAck(tcp.SimRateSample{
 		Now: f.now, AckedBytes: mss, Delivered: b.lastSample.Delivered + mss,
 		DeliveryRateBps: 80e6, RTT: rtt, Interval: 10 * time.Millisecond,
 		InflightBytes: f.inflight,
+		TxInflight:    f.inflight, LostBytes: int64(0.1 * float64(f.inflight)),
 	})
 	if b.state == StateProbeBWUp {
 		t.Fatal("PROBE_UP survived loss above the 2% threshold")

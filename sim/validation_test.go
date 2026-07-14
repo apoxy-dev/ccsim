@@ -138,17 +138,16 @@ func bbrOperatingPointCell(t *testing.T, seed int64, rateMbps, rttMs float64) (i
 func TestLateJoinerConvergence(t *testing.T) {
 	var rows []string
 	for _, cc := range []string{"cubic", "bbr"} {
-		// bbr reallocates through probe cycles only: with the draft's
-		// BBRSetCwnd (cwnd grows by at most newly-acked data per ACK; no
-		// jump-to-target), the joiner gains share a probe at a time, which
-		// takes many 2-3 s cycles and varies widely with seed (0-132 s over
-		// seeds 34-37; this seed measures 60.0 s). Characterized in
-		// docs/validation.md ("late-joiner convergence"); the
-		// pre-conformance <15 s came from the old assignment-law cwnd
-		// leaping to the model target.
+		// bbr reallocates through probe cycles (draft BBRSetCwnd: cwnd
+		// grows by at most newly-acked data per ACK, no jump-to-target),
+		// so it converges slower than cubic and with seed variance:
+		// 8-13 s over seeds 34-37 with mark-time loss signals (this seed
+		// 8.0 s). See docs/validation.md ("late-joiner convergence") for
+		// the history — the pre-conformance assignment-law cwnd made this
+		// look like 4 s, and retransmit-time loss counting made it 60+ s.
 		dur, bound := 100.0, 15.0
 		if cc == "bbr" {
-			dur, bound = 160.0, 90.0
+			bound = 30.0
 		}
 		cfg := vCfg(34, dur, 100, 15, bdpPkts(100, 30), vBulk(cc, 0), vBulk(cc, 60))
 		recs, _ := runCfg(t, cfg)

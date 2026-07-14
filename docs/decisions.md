@@ -285,3 +285,69 @@ trade-off; the bound is pinned at 90 s. Steady-state fairness and the
 operating-point surface are unchanged. Regression pinned by
 `TestCwndGrowByAckedControlLaw`; goldens regenerated (all seven
 bbr-involving presets shift; cubic presets byte-identical).
+
+## 14. Rate-sample signals: mark-time loss, tx_in_flight, delivered volume
+
+Audit finding 3: the sample plumbing exposed post-ACK pipe occupancy and
+a cumulative retransmission counter, and BBR consumed both with the
+wrong temporal meaning. Three signal fixes, all inside the `ccsim_*`
+patch files:
+
+- **Loss at mark time.** `C.lost` (`SimRateSample.LostBytesCum`) now
+  counts a segment when the RFC 6675 scoreboard first implies it is lost
+  (tallied inside the `ccsimSetPipe` walk that already runs per
+  SACK-carrying ACK, original transmissions only) plus a mark-everything
+  pass on RTO before the scoreboard is expunged — not when data is
+  retransmitted. Retransmit-time counting was late by a round trip and,
+  worse, a retransmitted segment's range stays `IsLost` until the
+  retransmit is SACKed, so counting without the `xmitCount == 1` guard
+  double-counted every loss (measured: 1% Bernoulli loss read as ~2%,
+  sitting exactly on BBR's LossThresh — every probe aborted and the
+  model death-spiraled to ~30 Mbps on a 100 Mbps link). A lost
+  retransmission is recounted by the RTO path (its `lostCounted` bit is
+  cleared on re-transmit).
+- **tx_in_flight.** Each segment is stamped at (re)transmit with
+  `C.inflight` including itself (`P.tx_in_flight`) and the then-current
+  `C.lost` (`P.lost`). The sample carries `TxInflight` and
+  `LostBytes = C.lost - P.lost`, so the draft's `IsInflightTooHigh`
+  (`RS.lost > RS.tx_in_flight * LossThresh`) and the `inflight_hi` latch
+  (`max(RS.tx_in_flight, beta*target)`) now use the operating point that
+  *sent* the losing data, not the pipe left after the ACK that revealed
+  it. The per-lost-packet `BBRHandleLostPacket`/lost-prefix
+  interpolation is still approximated at rate-sample granularity.
+- **inflight_latest is delivered volume.** The round's
+  `BBR.inflight_latest` is now `max(RS.delivered)` — the largest volume
+  actually delivered over one sample's flight — rather than max pipe
+  occupancy, so the `inflight_lo` floor is a demonstrated delivery
+  volume (draft `BBRUpdateLatestDeliverySignals`).
+
+Two consumers gained their missing draft gates: `inflight_hi` only grows
+in PROBE_UP while `C.is_cwnd_limited` and cwnd is pressing against it
+(`BBRProbeInflightLongtermUpward`; the new `IsCwndLimited` bit latches
+"sendData ended with the window full"), and the loss abort applies only
+to samples the probe itself transmitted, at most once per probe
+(`BBR.bw_probe_samples` + a delivered-count mark at REFILL entry; the
+draft scopes the gate to packets "sent in one of the accelerating
+phases"). Without that scoping, residual mark-time losses from CRUISE
+aborted every probe on its first ACK.
+
+Net effect on the random-loss preset (100 Mbps, 40 ms, 1% loss): 89.5
+Mbps at 47 ms mean SRTT, vs 87.5 Mbps at 50 ms before — same throughput,
+smaller standing queue, and the loss signals now mean what the draft
+says they mean. State-machine occupancy checks keep using post-ACK
+inflight: that *is* the draft's `C.inflight` at ACK-processing time
+(prior_in_flight is a Linux EDT implementation detail, not plumbed).
+
+The validation surface moved substantially (all re-measured, tables and
+findings updated in docs/validation.md): RTT-fairness exponent -1.17 →
+0.24 (the pathological long-RTT dominance was a loss-signal artifact),
+shallow-buffer coexistence 73/79 → 94/96 Mbps (meets the original 85%
+target; finding 3 there re-characterized as resolved), late-joiner
+convergence 60 s → 8 s (the provisional 90 s pin from §13 tightened to
+30 s — retransmit-time loss counting had been suppressing the joiner's
+probes), sub-BDP RTO rate 36 → 13/min (goodput 82% → 67%), and small-N
+intra-bbr aggregates dip (N=2 81.5 Mbps, pinned at 80) because the
+short-term bounds now floor at demonstrated delivered volume. Goldens
+regenerated (four presets shift: bbr-single, coexist-1bdp, determinism,
+fairness; the lossless/ECN-only bbr presets and all cubic presets are
+byte-identical).

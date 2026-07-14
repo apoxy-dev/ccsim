@@ -299,16 +299,20 @@ func TestLossResponseTable(t *testing.T) {
 }
 
 // Loss crossing the 2% threshold during UP aborts the probe and latches
-// inflight_hi from the delivered inflight sample (floored at beta*BDP).
+// inflight_hi from the sample's transmit-time inflight (floored at
+// beta*BDP).
 func TestProbeAbortSetsInflightHi(t *testing.T) {
 	b, f := newTestBBR()
 	rtt := 20 * time.Millisecond
 	trace(b, f, 100e6, rtt, 3*time.Second)
 	b.enter(StateProbeBWUp, f.now)
-	b.lossEventsRound = 1
-	inflight := f.inflight
-	b.lostBytesRound = int64(0.03 * float64(inflight)) // 3% > 2% threshold
-	b.OnAck(steadySample(b, f, 100e6, rtt, 10*time.Millisecond))
+	// As set by REFILL entry; rewind the probe mark so this sample counts
+	// as probe-sent.
+	b.bwProbeSamples, b.probeStartDelivered = true, 0
+	s := steadySample(b, f, 100e6, rtt, 10*time.Millisecond)
+	s.TxInflight = f.inflight
+	s.LostBytes = int64(0.03 * float64(f.inflight)) // 3% > 2% threshold
+	b.OnAck(s)
 	if b.state == StateProbeBWUp {
 		t.Fatal("UP survived 3% loss")
 	}
@@ -451,12 +455,13 @@ func TestStartupExitOnLoss(t *testing.T) {
 	if b.state != StateStartup {
 		t.Fatal("left startup prematurely")
 	}
-	// A round with >= fullLossCount loss events and > 2% lost bytes.
+	// A round with >= fullLossCount loss events, closed by a sample whose
+	// lost-since-transmit volume exceeds 2% of its transmit-time inflight.
 	b.lossInRound = true
 	b.lossEventsRound = fullLossCount
-	b.lostBytesRound = int64(0.05 * float64(f.inflight))
-	// Deliver the round-closing sample.
 	s := steadySample(b, f, 20e6, rtt, rtt)
+	s.TxInflight = f.inflight
+	s.LostBytes = int64(0.05 * float64(f.inflight))
 	b.OnAck(s)
 	if b.state == StateStartup {
 		t.Fatalf("startup survived %d loss events at 5%% lost bytes", fullLossCount)
