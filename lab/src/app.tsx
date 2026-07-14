@@ -155,7 +155,10 @@ export function App() {
   const pipeDrops = pipeFlow === 'cubic' ? runs.cubic.dropEvents : runs.bbr.dropEvents
   const pipeEvents = useMemo(() => pipeEventTimes(pipePts, pipeDrops), [pipePts, pipeDrops])
   const pipeRate = useCallback((t: number) => rateAt(pipeEvents, t), [pipeEvents])
-  const trPipe = useTransport(RUN_DUR_S, loadedT, true, pipeRate)
+  // coarse: the pipe animates from tr.tRef on a canvas, so its React tick
+  // only needs to drive the slider row (~8 Hz) and the card stops
+  // re-rendering at frame rate.
+  const trPipe = useTransport(RUN_DUR_S, loadedT, true, pipeRate, true)
 
   return (
     <div className="page">

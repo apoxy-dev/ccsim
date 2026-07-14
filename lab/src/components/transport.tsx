@@ -1,9 +1,13 @@
 // Play/scrub transport row shared by the figures, plus the rAF clock hook.
 
-import { useEffect, useRef, useState, type ReactNode } from 'react'
+import { useEffect, useMemo, useRef, useState, type MutableRefObject, type ReactNode } from 'react'
 
 export interface TransportState {
   t: number
+  // The live clock, advanced every rAF tick regardless of `coarse`. Canvas
+  // layers read this from their own draw loop so animation never routes
+  // through React state.
+  tRef: MutableRefObject<number>
   playing: boolean
   scrub: (t: number) => void // pause and jump (slider drags)
   seek: (t: number) => void // jump without pausing (event skip)
@@ -14,15 +18,20 @@ export interface TransportState {
 // edge so progressive draws don't flatline at zero. rateOf lets a figure
 // modulate playback speed as a function of sim time (auto slow-mo around
 // events); it is read through a ref so its identity never restarts the loop.
+// coarse throttles the React state mirror to ~8 Hz for figures that animate
+// from tRef on a canvas — the state tick then only drives the slider row.
 export function useTransport(
   T: number,
   loadedT: number,
   autoplay = true,
   rateOf?: (t: number) => number,
+  coarse = false,
 ): TransportState {
   const [t, setT] = useState(0)
   const [playing, setPlaying] = useState(autoplay)
+  const tRef = useRef(0)
   const last = useRef(performance.now())
+  const lastPush = useRef(0)
   const edge = useRef(loadedT)
   edge.current = loadedT
   const rate = useRef(rateOf)
@@ -34,30 +43,42 @@ export function useTransport(
     const tick = (now: number) => {
       const d = (now - last.current) / 1000
       last.current = now
-      setT((cur) => {
-        let next = cur + d * (rate.current ? rate.current(cur) : 1)
-        if (next > T) next = 0
-        if (next > edge.current) next = edge.current > 0 ? cur : 0
-        return next
-      })
+      const cur = tRef.current
+      let next = cur + d * (rate.current ? rate.current(cur) : 1)
+      if (next > T) next = 0
+      if (next > edge.current) next = edge.current > 0 ? cur : 0
+      tRef.current = next
+      if (!coarse || now - lastPush.current > 125) {
+        lastPush.current = now
+        setT(next)
+      }
       raf = requestAnimationFrame(tick)
     }
     raf = requestAnimationFrame(tick)
     return () => cancelAnimationFrame(raf)
-  }, [playing, T])
-  return {
-    t,
-    playing,
-    scrub: (v) => {
-      setPlaying(false)
-      setT(Math.min(v, edge.current))
-    },
-    seek: (v) => {
-      setT(Math.min(Math.max(0, v), edge.current))
-      setPlaying(true)
-    },
-    toggle: () => setPlaying((p) => !p),
-  }
+  }, [playing, T, coarse])
+  return useMemo(
+    () => ({
+      t,
+      tRef,
+      playing,
+      scrub: (v: number) => {
+        setPlaying(false)
+        const nv = Math.min(v, edge.current)
+        tRef.current = nv
+        setT(nv)
+      },
+      seek: (v: number) => {
+        const nv = Math.min(Math.max(0, v), edge.current)
+        tRef.current = nv
+        setT(nv)
+        setPlaying(true)
+      },
+      toggle: () => setPlaying((p) => !p),
+    }),
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [t, playing],
+  )
 }
 
 export function Transport({ tr, T, extra }: { tr: TransportState; T: number; extra?: ReactNode }) {
