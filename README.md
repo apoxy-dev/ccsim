@@ -4,15 +4,18 @@ An event-driven TCP congestion control simulation harness built on gVisor's
 netstack (`gvisor.dev/gvisor/pkg/tcpip`). Two full netstack instances
 (sender / receiver) are connected through a configurable bottleneck link
 model (rate, delay, loss, pluggable queue disciplines, ECN). Includes a
-from-scratch **BBRv3** implementation registered alongside the stock Cubic,
-a binary metric sample stream, a CLI runner, and a wasm build whose output
-is **byte-identical** to the native build.
+from-scratch **BBRv3** implementation registered alongside stock Cubic, plus
+a deliberately congestion-oblivious fixed-rate controller for demonstrations,
+a binary metric sample stream, a CLI runner, and a wasm build whose output is
+**byte-identical** to the native build.
 
 ```
 clock/      virtual clock implementing tcpip.Clock (single timer heap)
-link/       bottleneck model: token-bucket rate, delay, seeded loss,
-            tail-drop / RED / CoDel / FQ-CoDel, ECN CE marking, telemetry
+link/       bottleneck model: token-bucket rate, delay, seeded loss and
+            jitter, tail-drop / RED / CoDel / FQ-CoDel, ECN CE marking,
+            telemetry
 bbr/        BBRv3 (draft-ietf-ccwg-bbr-03) as a netstack congestion control
+naive/      fixed-rate 150 Mbps demonstration congestion control
 probe/      per-flow taps, sample records, summaries, windowed analysis
 scenario/   ScenarioConfig JSON model, validation, presets
 sim/        harness: stacks, flow drivers, event loop, live-settable params
@@ -61,11 +64,12 @@ decimation. Self-contained page, no chart library.
 
 **CC Lab** (`lab/`) is a Vite + React SPA over the same worker glue:
 `make lab-dev` builds the wasm binary, copies it with the worker into
-`lab/public/sim/`, and starts the dev server. It runs cubic and bbrv3 as
-independent single-flow runs per parameter set and draws the BBR paper's
-Figure-1 operating-point panels (RTT + delivery vs. inflight, live trails)
-and the bandwidth-change experiment (paper figure 3) straight from the
-decoded sample stream. `make lab-build` produces `lab/dist/`.
+`lab/public/sim/`, and starts the dev server. It runs Cubic and BBRv3 as
+independent single-flow runs per parameter set, with a third fixed-rate naive
+run for the animated pipe, and draws the BBR paper's Figure-1 operating-point
+panels (RTT + delivery vs. inflight, live trails) and the bandwidth-change
+experiment (paper figure 3) straight from the decoded sample stream.
+`make lab-build` produces `lab/dist/`.
 
 The browser demos are deployed to Fly.io as the `ccsim` app in the
 `apoxy-inc` organization: CC Lab at `/` and the original smoke/demo page at

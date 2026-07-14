@@ -78,6 +78,7 @@ func New(cfg *scenario.ScenarioConfig, w *stream.Writer) (*Sim, error) {
 		RateBps:   cfg.Link.RateBps(),
 		Delay:     cfg.Link.Owd(),
 		LossP:     cfg.Link.Loss,
+		Jitter:    cfg.Link.Jitter(),
 		MakeQdisc: makeQdisc,
 	}, cfg.Seed, s.rec.LinkHooks())
 	s.lnk.Classify = s.classify
@@ -288,6 +289,8 @@ func (s *Sim) Set(path string, v float64) error {
 		s.lnk.SetLoss(v)
 	case "link.owd_ms":
 		s.lnk.SetDelay(time.Duration(v * float64(time.Millisecond)))
+	case "link.jitter_ms":
+		s.lnk.SetJitter(time.Duration(v * float64(time.Millisecond)))
 	case "link.queue.limit_pkts":
 		s.lnk.SetQueueLimit(int(v), 0)
 	case "link.queue.limit_bytes":

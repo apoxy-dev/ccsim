@@ -243,3 +243,54 @@ func TestREDDropsBeforeFull(t *testing.T) {
 		t.Fatalf("RED hit the hard limit (%d tail drops) before AQM", tailDrops)
 	}
 }
+
+func TestJitter(t *testing.T) {
+	const jitter = 2 * time.Millisecond
+	run := func() []time.Duration {
+		clk := vclock.New()
+		var delivered []time.Duration
+		l := newTestLink(t, clk, Config{
+			RateBps: 8_000_000, // 1ms tx per 1000-byte packet
+			Delay:   10 * time.Millisecond,
+			Jitter:  jitter,
+		}, Hooks{OnDeliver: func(e Event) { delivered = append(delivered, e.T) }})
+		for i := 0; i < 50; i++ {
+			l.pipes[Fwd].send(mkPkt(1000, 100, 200, false))
+		}
+		clk.RunUntilIdle()
+		return delivered
+	}
+	a := run()
+	if len(a) != 50 {
+		t.Fatalf("delivered %d packets, want 50", len(a))
+	}
+	varied := false
+	for i, at := range a {
+		// Packet i finishes serialization at (i+1)ms; jitter-free delivery
+		// would be at (i+11)ms. The FIFO clamp can only delay further, so
+		// the bound is [base, base+jitter+accumulated clamp) — check the
+		// simple per-packet window against base and monotonicity globally.
+		base := time.Duration(i+11) * time.Millisecond
+		if at < base {
+			t.Fatalf("packet %d delivered at %v, before jitter-free time %v", i, at, base)
+		}
+		if at >= base+jitter {
+			t.Fatalf("packet %d delivered at %v, want < %v", i, at, base+jitter)
+		}
+		if i > 0 && at < a[i-1] {
+			t.Fatalf("reordered delivery: packet %d at %v before packet %d at %v", i, at, i-1, a[i-1])
+		}
+		if at != base {
+			varied = true
+		}
+	}
+	if !varied {
+		t.Fatal("jitter had no effect on delivery times")
+	}
+	b := run()
+	for i := range a {
+		if a[i] != b[i] {
+			t.Fatalf("nondeterministic jitter: packet %d %v vs %v", i, a[i], b[i])
+		}
+	}
+}

@@ -24,6 +24,7 @@ type LinkConfig struct {
 	RateMbps float64     `json:"rate_mbps"`
 	OwdMs    float64     `json:"owd_ms"`               // one-way delay, each direction
 	RevOwdMs float64     `json:"rev_owd_ms,omitempty"` // reverse-direction delay override (0 = symmetric)
+	JitterMs float64     `json:"jitter_ms,omitempty"`  // max extra delivery delay, uniform [0, jitter), FIFO-preserving
 	Loss     float64     `json:"loss"`                 // bernoulli, per packet
 	Queue    QueueConfig `json:"queue"`
 }
@@ -43,7 +44,7 @@ type QueueConfig struct {
 
 // FlowConfig describes one TCP flow.
 type FlowConfig struct {
-	CC         string    `json:"cc"` // "cubic" | "bbr" | "reno"
+	CC         string    `json:"cc"` // "cubic" | "bbr" | "reno" | "naive"
 	StartAt    float64   `json:"start_at_s"`
 	ExtraOwdMs float64   `json:"extra_owd_ms,omitempty"`
 	Reverse    bool      `json:"reverse,omitempty"` // data flows receiver->sender (two-way traffic scenarios)
@@ -69,7 +70,7 @@ type InjectEvent struct {
 type SampleConfig struct {
 	IntervalMs   float64 `json:"interval_ms,omitempty"`   // default 1ms
 	PacketEvents bool    `json:"packet_events,omitempty"` // per-packet event stream
-	WireStats    bool    `json:"wire_stats,omitempty"`    // per-window arrival burstiness records
+	WireStats    bool    `json:"wire_stats,omitempty"`    // compact sampled link counters and arrival burstiness
 }
 
 // Interval returns the sampling interval with the default applied.
@@ -91,6 +92,11 @@ func (l *LinkConfig) RateBps() int64 { return int64(l.RateMbps * 1e6) }
 // Owd returns the one-way delay.
 func (l *LinkConfig) Owd() time.Duration {
 	return time.Duration(l.OwdMs * float64(time.Millisecond))
+}
+
+// Jitter returns the maximum per-packet extra delivery delay.
+func (l *LinkConfig) Jitter() time.Duration {
+	return time.Duration(l.JitterMs * float64(time.Millisecond))
 }
 
 // Parse decodes and validates a scenario from JSON.
@@ -122,6 +128,9 @@ func (c *ScenarioConfig) Validate() error {
 	if c.Link.RevOwdMs < 0 {
 		return fmt.Errorf("scenario: link.rev_owd_ms must be >= 0, got %v", c.Link.RevOwdMs)
 	}
+	if c.Link.JitterMs < 0 {
+		return fmt.Errorf("scenario: link.jitter_ms must be >= 0, got %v", c.Link.JitterMs)
+	}
 	if c.Link.Loss < 0 || c.Link.Loss >= 1 {
 		return fmt.Errorf("scenario: link.loss must be in [0,1), got %v", c.Link.Loss)
 	}
@@ -142,9 +151,9 @@ func (c *ScenarioConfig) Validate() error {
 	}
 	for i, f := range c.Flows {
 		switch f.CC {
-		case "cubic", "reno", "bbr":
+		case "cubic", "reno", "bbr", "naive":
 		default:
-			return fmt.Errorf("scenario: flows[%d].cc %q unknown (want cubic|reno|bbr)", i, f.CC)
+			return fmt.Errorf("scenario: flows[%d].cc %q unknown (want cubic|reno|bbr|naive)", i, f.CC)
 		}
 		if f.StartAt < 0 || f.StartAt >= c.Dur {
 			return fmt.Errorf("scenario: flows[%d].start_at_s %v outside [0,%v)", i, f.StartAt, c.Dur)
@@ -167,8 +176,8 @@ func (c *ScenarioConfig) Validate() error {
 			return fmt.Errorf("scenario: events[%d].at_s %v outside [0,%v]", i, e.At, c.Dur)
 		}
 		switch e.Path {
-		case "link.rate_mbps", "link.loss", "link.owd_ms", "link.queue.limit_pkts",
-			"link.queue.limit_bytes", "link.drop_next":
+		case "link.rate_mbps", "link.loss", "link.owd_ms", "link.jitter_ms",
+			"link.queue.limit_pkts", "link.queue.limit_bytes", "link.drop_next":
 		default:
 			return fmt.Errorf("scenario: events[%d].path %q is not live-settable "+
 				"(want link.rate_mbps|link.loss|link.owd_ms|link.queue.limit_pkts|link.queue.limit_bytes|link.drop_next)", i, e.Path)

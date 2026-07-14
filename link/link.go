@@ -50,6 +50,7 @@ type Event struct {
 
 // Hooks receives link telemetry. Any hook may be nil.
 type Hooks struct {
+	OnArrival func(Event) // packet presented to the qdisc, accepted or dropped
 	OnEnqueue func(Event)
 	OnDequeue func(Event)
 	OnDrop    func(Event)
@@ -59,10 +60,15 @@ type Hooks struct {
 
 // Config is the runtime-independent link configuration.
 type Config struct {
-	RateBps   int64         // serialization rate, bits/s (both directions)
-	Delay     time.Duration // one-way propagation delay per direction
-	LossP     float64       // Bernoulli per-packet wire loss probability
-	MTU       uint32        // link MTU (default 1500)
+	RateBps int64         // serialization rate, bits/s (both directions)
+	Delay   time.Duration // one-way propagation delay per direction
+	LossP   float64       // Bernoulli per-packet wire loss probability
+	// Jitter is the maximum extra per-packet delivery delay, drawn
+	// uniformly from [0, Jitter). Deliveries stay FIFO: a small draw never
+	// overtakes an earlier large one, modeling delay variance accumulated
+	// at downstream hops rather than packet reordering.
+	Jitter    time.Duration
+	MTU       uint32 // link MTU (default 1500)
 	MakeQdisc func(dir Dir, sink QdiscSink) Qdisc
 }
 
@@ -97,8 +103,12 @@ func New(clk *vclock.Clock, cfg Config, seed int64, hooks Hooks) *Link {
 			rateBps: cfg.RateBps,
 			delay:   cfg.Delay,
 			lossP:   cfg.LossP,
-			// Independent, seed-derived PRNG stream per direction.
-			rng: rand.New(rand.NewPCG(uint64(seed), 0x9E3779B97F4A7C15*uint64(d+1))),
+			jitter:  cfg.Jitter,
+			// Independent, seed-derived PRNG stream per direction. Jitter
+			// gets its own stream so toggling it cannot perturb the loss
+			// draw sequence of an otherwise identical scenario.
+			rng:  rand.New(rand.NewPCG(uint64(seed), 0x9E3779B97F4A7C15*uint64(d+1))),
+			jrng: rand.New(rand.NewPCG(uint64(seed), 0xC2B2AE3D27D4EB4F*uint64(d+1))),
 		}
 		p.q = cfg.MakeQdisc(d, p)
 		l.pipes[d] = p
@@ -129,6 +139,14 @@ func (l *Link) SetLoss(p float64) {
 func (l *Link) SetDelay(d time.Duration) {
 	for _, p := range l.pipes {
 		p.delay = d
+	}
+}
+
+// SetJitter updates the maximum per-packet extra delivery delay of both
+// directions.
+func (l *Link) SetJitter(d time.Duration) {
+	for _, p := range l.pipes {
+		p.jitter = d
 	}
 }
 
@@ -174,8 +192,14 @@ type pipe struct {
 	rateBps    int64
 	delay      time.Duration
 	lossP      float64
+	jitter     time.Duration
 	rng        *rand.Rand
-	extraDelay map[int]time.Duration
+	jrng       *rand.Rand
+	// lastJitterAt is the latest jittered delivery time handed to
+	// scheduleDelivery; the FIFO clamp in onTxTimer floors each new
+	// delivery to it so jitter widens gaps without reordering.
+	lastJitterAt time.Duration
+	extraDelay   map[int]time.Duration
 	busy       bool // serializer transmitting
 	seq        uint64
 	forceDrop  int // pending scripted drops (DropNext)
@@ -229,6 +253,9 @@ func (p *pipe) send(data []byte) {
 	if c := p.link.Classify; c != nil {
 		pk.Flow = c(pk)
 	}
+	if h := p.link.hooks.OnArrival; h != nil {
+		h(p.event(pk, 0))
+	}
 	if p.forceDrop > 0 {
 		p.forceDrop--
 		p.qdiscDropped(pk, DropForced)
@@ -279,7 +306,16 @@ func (p *pipe) onTxTimer() {
 		if extra, ok := p.extraDelay[pk.Flow]; ok {
 			d += extra
 		}
-		p.scheduleDelivery(p.now()+d, pk)
+		at := p.now() + d
+		if p.jitter > 0 {
+			at += time.Duration(p.jrng.Float64() * float64(p.jitter))
+			// FIFO clamp: never deliver before an earlier jittered packet.
+			if at < p.lastJitterAt {
+				at = p.lastJitterAt
+			}
+			p.lastJitterAt = at
+		}
+		p.scheduleDelivery(at, pk)
 	}
 	p.startNext()
 }
