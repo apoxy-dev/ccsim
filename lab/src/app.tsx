@@ -229,7 +229,7 @@ export function App() {
             <div className="ctl-row">
               <Slider label="link" value={cfg.rateMbps} min={10} max={400} step={5} fmt={(v) => `${v} Mbps`} onChange={set('rateMbps')} />
               <Slider label="owd" value={cfg.owdMs} min={5} max={50} step={1} fmt={(v) => `${v} ms`} onChange={set('owdMs')} />
-              <Slider label="jitter" value={cfg.jitterMs} min={0} max={10} step={0.5} fmt={(v) => `${v.toFixed(1)} ms`} onChange={set('jitterMs')} />
+              <Slider label="jitter" value={cfg.jitterMs} min={0} max={100} step={1} fmt={(v) => `${v} ms`} onChange={set('jitterMs')} />
               <Slider label="loss" value={cfg.lossPct} min={0} max={3} step={0.05} fmt={(v) => `${v.toFixed(2)} %`} onChange={set('lossPct')} />
               <Slider label="buffer" value={cfg.qlimPkts} min={20} max={2000} step={10} fmt={(v) => `${v} pkt`} onChange={set('qlimPkts')} />
             </div>
@@ -253,7 +253,7 @@ export function App() {
           <>
             <div className="ctl-row">
               <Slider label="loss" value={bwLossPct} min={0} max={3} step={0.05} fmt={(v) => `${v.toFixed(2)} %`} onChange={setBwLossPct} />
-              <Slider label="jitter" value={bwJitterMs} min={0} max={10} step={0.5} fmt={(v) => `${v.toFixed(1)} ms`} onChange={setBwJitterMs} />
+              <Slider label="jitter" value={bwJitterMs} min={0} max={100} step={1} fmt={(v) => `${v} ms`} onChange={setBwJitterMs} />
             </div>
             <StatusLine
               error={bw.error}

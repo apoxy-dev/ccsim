@@ -13,12 +13,18 @@ import (
 )
 
 func TestJitterNoBatching(t *testing.T) {
+	for _, j := range []time.Duration{5 * time.Millisecond, 100 * time.Millisecond} {
+		t.Run(j.String(), func(t *testing.T) { testJitterNoBatching(t, j) })
+	}
+}
+
+func testJitterNoBatching(t *testing.T, jitter time.Duration) {
 	clk := vclock.New()
 	var times []time.Duration
 	l := newTestLink(t, clk, Config{
 		RateBps: 100_000_000,
 		Delay:   20 * time.Millisecond,
-		Jitter:  5 * time.Millisecond,
+		Jitter:  jitter,
 	}, Hooks{OnDeliver: func(e Event) { times = append(times, e.T) }})
 	// 2000 packets paced at 250us (ACK-like spacing), spanning 0.5 s — five
 	// jitter walk segments.
