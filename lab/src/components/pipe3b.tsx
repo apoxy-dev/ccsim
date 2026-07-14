@@ -583,7 +583,9 @@ export const Pipe3b = memo(function Pipe3b({
             </span>
             <button
               className="btn-toggle"
-              disabled={nextEv == null}
+              // naive is one continuous drop episode; skipping "to the next
+              // event" is meaningless there.
+              disabled={flow === 'naive' || nextEv == null}
               onClick={() => nextEv != null && tr.seek(nextEv - 0.3)}
             >
               EVENT ▸

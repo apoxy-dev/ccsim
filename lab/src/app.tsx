@@ -226,20 +226,24 @@ export function App() {
         T={RUN_DUR_S}
         controls={
           <>
+            {/* Link rate is fixed at the default: above ~100 Mbps a live 30 s
+                wasm run is impractically slow even on a fast laptop. */}
             <div className="ctl-row">
-              <Slider label="link" value={cfg.rateMbps} min={10} max={400} step={5} fmt={(v) => `${v} Mbps`} onChange={set('rateMbps')} />
               <Slider label="owd" value={cfg.owdMs} min={5} max={50} step={1} fmt={(v) => `${v} ms`} onChange={set('owdMs')} />
               <Slider label="jitter" value={cfg.jitterMs} min={0} max={100} step={1} fmt={(v) => `${v} ms`} onChange={set('jitterMs')} />
               <Slider label="loss" value={cfg.lossPct} min={0} max={3} step={0.05} fmt={(v) => `${v.toFixed(2)} %`} onChange={set('lossPct')} />
               <Slider label="buffer" value={cfg.qlimPkts} min={20} max={2000} step={10} fmt={(v) => `${v} pkt`} onChange={set('qlimPkts')} />
             </div>
             <StatusLine
-              left={`BDP ${Math.round(d.bdpPkts)} pkt · buf ${d.bufX.toFixed(2)}×BDP · base rtt ${d.baseMs} ms`}
+              left={`link ${cfg.rateMbps} Mbps · BDP ${Math.round(d.bdpPkts)} pkt · buf ${d.bufX.toFixed(2)}×BDP · base rtt ${d.baseMs} ms`}
               error={runs.error}
               running={runs.running}
               pct={(runs.cubic.maxT + runs.bbr.maxT) / (2 * RUN_DUR_S)}
               durS={RUN_DUR_S}
-              onReset={() => setCfg(DEFAULT_CFG)}
+              onReset={() => {
+                setCfg(DEFAULT_CFG)
+                tr.scrub(0)
+              }}
             />
             <SlowWarning />
           </>
@@ -263,6 +267,7 @@ export function App() {
               onReset={() => {
                 setBwLossPct(0)
                 setBwJitterMs(0)
+                trBw.scrub(0)
               }}
             />
             <SlowWarning />
