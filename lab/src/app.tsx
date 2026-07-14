@@ -162,7 +162,9 @@ export function App() {
   // The pipe replays the selected flow of the FIG 1 run on its own
   // transport: it cruises slower than real time and auto-slows around the
   // flow's events, which would make the other figures crawl if shared.
-  const [pipeFlow, setPipeFlow] = useState<CC>('cubic')
+  // naive default: the pipe leads the page as the "why congestion control
+  // exists" exhibit, so it opens on the congestion-oblivious control case.
+  const [pipeFlow, setPipeFlow] = useState<CC>('naive')
   const pipePts = pipeFlow === 'cubic' ? cubicPts : pipeFlow === 'bbr' ? bbrPts : naivePts
   const pipeDrops =
     pipeFlow === 'cubic'
@@ -199,6 +201,21 @@ export function App() {
           byte-for-byte.
         </div>
       </header>
+
+      <Pipe3b
+        pts={pipePts}
+        dropTimes={pipeDrops}
+        events={pipeEvents}
+        cfg={pipeCfg}
+        d={pipeD}
+        flow={pipeFlow}
+        onFlow={(f) => {
+          setPipeFlow(f)
+          trPipe.seek(0)
+        }}
+        tr={trPipe}
+        T={RUN_DUR_S}
+      />
 
       <Figure2a
         cubic={cubicPts}
@@ -251,21 +268,6 @@ export function App() {
             <SlowWarning />
           </>
         }
-      />
-
-      <Pipe3b
-        pts={pipePts}
-        dropTimes={pipeDrops}
-        events={pipeEvents}
-        cfg={pipeCfg}
-        d={pipeD}
-        flow={pipeFlow}
-        onFlow={(f) => {
-          setPipeFlow(f)
-          trPipe.seek(0)
-        }}
-        tr={trPipe}
-        T={RUN_DUR_S}
       />
 
       <footer className="ftr">

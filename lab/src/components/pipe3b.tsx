@@ -191,6 +191,53 @@ export const Pipe3b = memo(function Pipe3b({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [pts, base, cfg.rateMbps])
 
+  // Rate strip: offered load (bytes presented to the queue, drops included,
+  // differentiated over a ±160 ms window) against delivered goodput. The gap
+  // between the two IS congestion: for naive it is permanent (150 in, ~94
+  // out), for cubic it flashes at each overshoot, for bbr it barely exists.
+  const rateMax = cfg.rateMbps * 1.6
+  const yR = (v: number) => 364 - 44 * Math.min(v / rateMax, 1)
+  const rate = useMemo(() => {
+    if (pts.length < 2) return null
+    const key: CounterKey | null = pts.some((p) => p.arrB != null)
+      ? 'arrB'
+      : pts.some((p) => p.enqB != null)
+        ? 'enqB'
+        : null
+    const offered = new Array<number>(pts.length).fill(0)
+    if (key) {
+      const W = 8
+      for (let i = 0; i < pts.length; i++) {
+        const a = pts[Math.max(0, i - W)]
+        const b = pts[Math.min(pts.length - 1, i + W)]
+        const dt2 = b.t - a.t
+        if (dt2 > 0) offered[i] = (((b[key] ?? 0) - (a[key] ?? 0)) * 8) / 1e6 / dt2
+      }
+    }
+    const path = (val: (i: number) => number) => {
+      let s = ''
+      for (let i = 0; i < pts.length; i += 3)
+        s += (s ? 'L' : 'M') + tx(pts[i].t).toFixed(1) + ' ' + yR(val(i)).toFixed(1)
+      return s
+    }
+    const good = path((i) => pts[i].y * cfg.rateMbps)
+    return {
+      offered,
+      offeredPath: key ? path((i) => offered[i]) : null,
+      good,
+      area: good + ' L 628 364 L 52 364 Z',
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [pts, cfg.rateMbps])
+
+  // Drop glyph decimation happens once so each surviving ✕ keeps a stable
+  // index (and thus fan lane) for its whole ballistic flight; per-frame
+  // sampling would reshuffle the population and read as flicker.
+  // pts is in the deps because dropTimes (RunData.dropEvents) is mutated in
+  // place as sample batches arrive — its identity never changes, but a new
+  // pts array is derived per batch and marks the data as refreshed.
+  const visDrops = useMemo(() => coalesce(dropTimes, 0.9 / 25), [dropTimes, pts])
+
   // Display aggregation only: the quantum controls how many actual bytes one
   // visible dot represents. Its timing comes from measured cumulative link
   // counters below, not from cwnd, RTT, or a browser-side service model.
@@ -243,7 +290,7 @@ export const Pipe3b = memo(function Pipe3b({
       }
       const s = w / 640
       ctx.setTransform(s, 0, 0, s, 0, 0)
-      ctx.clearRect(0, 0, 640, 292)
+      ctx.clearRect(0, 0, 640, 376)
       const t = tr.tRef.current
       const p = ptAt(pts, t)
       if (!p) return
@@ -329,25 +376,16 @@ export const Pipe3b = memo(function Pipe3b({
       }
       ctx.globalAlpha = 1
 
-      // Each ✕ is an actual dropped packet. Sparse losses render one-for-one;
-      // persistent overload is evenly sampled to 25 visible glyphs per
-      // window. A glyph bounces off the limit line and falls away, fanning so
-      // a burst reads as several packets rather than one smear.
+      // Each ✕ is an actual dropped packet, decimated once (visDrops) so
+      // dense overload stays readable. Like the wire dots, every glyph has
+      // permanent identity: its arc and fan lane depend only on its own drop
+      // time and index, so it flies its full ballistic path — never
+      // reshuffled or re-sampled as neighbors enter and leave the window.
       ctx.strokeStyle = COLORS.loss
       ctx.lineWidth = 1.4
-      let fan = 0
-      const firstDrop = lb(dropTimes, t - 0.9)
-      const afterDrop = lb(dropTimes, t + 1e-6)
-      // Dense overload can produce thousands of drops in this window. Draw
-      // an even sample across the ballistic lifetime so the cap does not
-      // select only the oldest, almost-transparent crosses.
-      const dropStride = Math.max(1, Math.ceil((afterDrop - firstDrop) / 25))
-      for (let i = firstDrop; i < afterDrop; i += dropStride) {
-        const age = t - dropTimes[i]
-        if (age < 0) continue
-        if (age >= 0.9) continue
-        const f = age / 0.9
-        const fx = 290 + f * (110 + (fan % 5) * 12)
+      for (let k = lb(visDrops, t - 0.9); k < visDrops.length && visDrops[k] <= t; k++) {
+        const f = (t - visDrops[k]) / 0.9
+        const fx = 290 + f * (110 + (k % 5) * 12)
         const fy = LIMIT_Y - 2 - f * 80 + f * f * 150
         ctx.globalAlpha = 1 - f
         ctx.beginPath()
@@ -356,7 +394,6 @@ export const Pipe3b = memo(function Pipe3b({
         ctx.moveTo(fx - 3, fy + 3)
         ctx.lineTo(fx + 3, fy - 3)
         ctx.stroke()
-        fan++
       }
       ctx.globalAlpha = 1
 
@@ -383,11 +420,39 @@ export const Pipe3b = memo(function Pipe3b({
       ctx.font = mono(9)
       ctx.fillStyle = COLORS.stone
       ctx.fillText(`sender srtt ${(p.r * base).toFixed(1)} ms`, 628, 232)
+
+      // Rate strip playhead, marker and readout.
+      if (rate) {
+        ctx.strokeStyle = COLORS.ink
+        ctx.globalAlpha = 0.35
+        ctx.lineWidth = 1
+        ctx.beginPath()
+        ctx.moveTo(tx(t), 320)
+        ctx.lineTo(tx(t), 364)
+        ctx.stroke()
+        ctx.globalAlpha = 1
+        const good = p.y * cfg.rateMbps
+        ctx.fillStyle = col
+        ctx.strokeStyle = '#FFFFFF'
+        ctx.lineWidth = 1.2
+        ctx.beginPath()
+        ctx.arc(tx(t), yR(good), 3.2, 0, Math.PI * 2)
+        ctx.fill()
+        ctx.stroke()
+        ctx.font = mono(10.5, 600)
+        ctx.textAlign = 'right'
+        ctx.fillText(`goodput ${good.toFixed(1)} Mbps`, 628, 306)
+        const gw = ctx.measureText(`goodput ${good.toFixed(1)} Mbps`).width + 8
+        const off = rate.offered[Math.min(rate.offered.length - 1, Math.max(0, Math.round(t / 0.02)))]
+        ctx.font = mono(9)
+        ctx.fillStyle = COLORS.stone
+        ctx.fillText(`offered ${off.toFixed(1)} ·`, 628 - gw, 306)
+      }
     }
     raf = requestAnimationFrame(draw)
     return () => cancelAnimationFrame(raf)
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [pts, sched, dropTimes, cfg, d, col, base, limitDots, pktPerQDot, pitch, qDotR, wireR, tr.tRef])
+  }, [pts, sched, visDrops, rate, cfg, d, col, base, limitDots, pktPerQDot, pitch, qDotR, wireR, tr.tRef])
 
   const t = tr.t
   const nextEv = events.find((e) => e > t + SLOMO_WIN)
@@ -398,14 +463,14 @@ export const Pipe3b = memo(function Pipe3b({
       title="FIG. 3 — THE PIPE"
       aside={
         <div style={{ display: 'flex', gap: 8 }}>
+          <button className={flow === 'naive' ? 'btn-toggle on' : 'btn-toggle'} onClick={() => onFlow('naive')}>
+            NAIVE
+          </button>
           <button className={flow === 'cubic' ? 'btn-toggle on' : 'btn-toggle'} onClick={() => onFlow('cubic')}>
             CUBIC
           </button>
           <button className={flow === 'bbr' ? 'btn-toggle on' : 'btn-toggle'} onClick={() => onFlow('bbr')}>
             BBRV3
-          </button>
-          <button className={flow === 'naive' ? 'btn-toggle on' : 'btn-toggle'} onClick={() => onFlow('naive')}>
-            NAIVE
           </button>
         </div>
       }
@@ -419,7 +484,10 @@ export const Pipe3b = memo(function Pipe3b({
             Note the RTT strip: the pinned-full buffer inflates the real round trip (solid line,
             from the measured queue) while the sender&apos;s own srtt (dashed) barely moves — with
             thousands of packets in flight under sustained loss, TCP&apos;s smoothed estimator is
-            nearly frozen. A sender this aggressive cannot even see the damage it does.
+            nearly frozen. A sender this aggressive cannot even see the damage it does. The
+            delivery strip shows what the blast buys: {NAIVE_RATE_MBPS} Mbps offered, a third
+            dropped, and goodput below the link rate because part of what gets through is
+            retransmission of earlier losses.
           </>
         ) : (
           <>
@@ -434,7 +502,7 @@ export const Pipe3b = memo(function Pipe3b({
       }
     >
       <div style={{ position: 'relative', maxWidth: 640 }}>
-        <svg viewBox="0 0 640 292" width="100%" style={{ display: 'block' }}>
+        <svg viewBox="0 0 640 376" width="100%" style={{ display: 'block' }}>
           <line x1={266} y1={LIMIT_Y} x2={292} y2={LIMIT_Y} stroke={COLORS.loss} strokeWidth={1.2} />
           <text x={260} y={LIMIT_Y + 3} textAnchor="end" fontFamily="JetBrains Mono" fontSize={9} fill={COLORS.loss}>
             buffer limit · {Math.round(cfg.qlimPkts)} pkt
@@ -470,6 +538,22 @@ export const Pipe3b = memo(function Pipe3b({
               <path d={rtt.area} fill={col} fillOpacity={0.1} stroke="none" />
               <path d={rtt.actual} fill="none" stroke={col} strokeWidth={1.3} />
               <path d={rtt.srtt} fill="none" stroke={COLORS.stone} strokeWidth={0.9} strokeDasharray="3 3" />
+            </>
+          )}
+          <text x={52} y={306} fontFamily="JetBrains Mono" fontSize={9} fill={COLORS.stone} letterSpacing="0.08em">
+            DELIVERY RATE
+          </text>
+          <line x1={52} y1={yR(cfg.rateMbps)} x2={628} y2={yR(cfg.rateMbps)} stroke={COLORS.fog} strokeWidth={1} strokeDasharray="4 3" />
+          <text x={52} y={373} fontFamily="JetBrains Mono" fontSize={9} fill={COLORS.stone}>
+            link {cfg.rateMbps} Mbps
+          </text>
+          {rate && (
+            <>
+              <path d={rate.area} fill={col} fillOpacity={0.1} stroke="none" />
+              <path d={rate.good} fill="none" stroke={col} strokeWidth={1.3} />
+              {rate.offeredPath && (
+                <path d={rate.offeredPath} fill="none" stroke={COLORS.stone} strokeWidth={0.9} strokeDasharray="3 3" />
+              )}
             </>
           )}
         </svg>
