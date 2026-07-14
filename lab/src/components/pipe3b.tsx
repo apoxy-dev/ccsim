@@ -169,11 +169,17 @@ export const Pipe3b = memo(function Pipe3b({
     }
     em.sort((a, b2) => a - b2)
     // The bottleneck FIFO: arrivals that find the server busy wait; while
-    // backlogged, departures tick at exactly the serialization pitch.
+    // backlogged, departures tick at exactly the serialization pitch. The
+    // backlog test is the run's measured queue depth, not the visual
+    // integral, so the box only evens spacing out during the windows where
+    // the real buffer actually held packets (cubic: ~99% of the run; bbr:
+    // ~10%) and passes the sender's gaps through everywhere else.
     const dep: number[] = new Array(em.length)
     let prev = -1e9
     for (let k = 0; k < em.length; k++) {
-      prev = Math.max(em[k] + PRE_T, prev + 1 / visCap)
+      const arr = em[k] + PRE_T
+      const backlogged = (ptAt(pts, arr)?.q ?? 0) >= 2
+      prev = Math.max(arr, backlogged ? prev + 1 / visCap : prev)
       dep[k] = prev
     }
     return { em, dep }
