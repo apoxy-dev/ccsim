@@ -26,7 +26,7 @@ COPY wasm/index.html wasm/wasm_exec.js wasm/worker.js public/wasm/
 # the page fetches these at default settings instead of running wasm.
 RUN set -eu; \
     node scripts/gen-scenarios.mjs public/sim/pre; \
-    for s in fig1-cubic fig1-bbr fig1-cubic-lite fig1-bbr-lite fig2-cubic fig2-bbr; do \
+    for s in fig1-cubic fig1-bbr fig1-naive fig1-cubic-lite fig1-bbr-lite fig2-cubic fig2-bbr; do \
         ccsim -scenario "public/sim/pre/${s}.json" -out "public/sim/pre/${s}.bin" -summary=false; \
     done
 RUN set -eu; \

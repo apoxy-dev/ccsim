@@ -49,6 +49,13 @@ const (
 	KindPktDequeue     Kind = 18
 	KindPktDrop        Kind = 19
 	KindWireBurstCV    Kind = 20 // bottleneck arrival-gap CV over the sample window (wire_stats)
+	// Compact cumulative link counters sampled when wire_stats is enabled.
+	// These preserve actual enqueue/dequeue/ACK activity without the size of
+	// the optional per-packet event stream.
+	KindLinkEnqueueBytesCum Kind = 21
+	KindLinkDequeueBytesCum Kind = 22
+	KindLinkEnqueuePktsCum  Kind = 23
+	KindLinkArrivalBytesCum Kind = 24 // bytes presented to qdisc, including rejected arrivals
 )
 
 // Pseudo flow ids for link-level records.

@@ -32,7 +32,7 @@ lab-assets: wasm
 lab-precomp:
 	$(GO) build -o ccsim ./cmd/ccsim
 	node lab/scripts/gen-scenarios.mjs lab/public/sim/pre
-	for s in fig1-cubic fig1-bbr fig1-cubic-lite fig1-bbr-lite fig2-cubic fig2-bbr; do \
+	for s in fig1-cubic fig1-bbr fig1-naive fig1-cubic-lite fig1-bbr-lite fig2-cubic fig2-bbr; do \
 		./ccsim -scenario lab/public/sim/pre/$$s.json -out lab/public/sim/pre/$$s.bin -summary=false || exit 1; \
 	done
 

@@ -86,6 +86,13 @@ type Recorder struct {
 	qDepthSamples  int
 	qDepthMax      int
 	deliveredBytes [2]uint64 // per direction, since last link sample
+	// Cumulative link activity used by the browser's aggregate particle
+	// display. Unlike the old browser-side reconstruction, these counters
+	// come directly from actual link hooks.
+	linkArrivalBytes  [2]uint64
+	linkEnqueuedBytes [2]uint64
+	linkDequeuedBytes [2]uint64
+	linkEnqueuedPkts  [2]uint64
 
 	// Forward-link arrival-gap accumulators for the wire_stats record: the
 	// CV of inter-enqueue gaps over one sample window summarizes the
@@ -177,6 +184,16 @@ func (r *Recorder) OnLinkSample(t time.Duration, qPkts, qBytes int, window time.
 		r.qDepthMax = qPkts
 	}
 	if r.WireStats {
+		for d := 0; d < 2; d++ {
+			fid := stream.LinkFwd
+			if d == 1 {
+				fid = stream.LinkRev
+			}
+			r.write(t, fid, stream.KindLinkEnqueueBytesCum, float64(r.linkEnqueuedBytes[d]))
+			r.write(t, fid, stream.KindLinkDequeueBytesCum, float64(r.linkDequeuedBytes[d]))
+			r.write(t, fid, stream.KindLinkEnqueuePktsCum, float64(r.linkEnqueuedPkts[d]))
+			r.write(t, fid, stream.KindLinkArrivalBytesCum, float64(r.linkArrivalBytes[d]))
+		}
 		// Idle or single-arrival windows emit nothing: a CV needs at least
 		// two gaps, and consumers hold the last value across quiet windows.
 		if r.wireGapN >= 2 && r.wireGapSum > 0 {
@@ -197,9 +214,9 @@ func (r *Recorder) OnLinkSample(t time.Duration, qPkts, qBytes int, window time.
 }
 
 // LinkHooks returns link.Hooks wired into this recorder. The per-packet
-// enqueue/dequeue taps are only installed when the scenario asks for the
-// packet event stream — a nil hook lets the link skip building the event
-// record entirely on the per-packet fast path.
+// enqueue/dequeue taps are installed for either exact packet events or
+// compact wire statistics. A nil hook lets other runs skip building the
+// event record entirely on the per-packet fast path.
 func (r *Recorder) LinkHooks() link.Hooks {
 	h := link.Hooks{
 		OnDrop: func(e link.Event) {
@@ -223,12 +240,10 @@ func (r *Recorder) LinkHooks() link.Hooks {
 			r.deliveredBytes[e.Dir] += uint64(e.Size)
 		},
 	}
-	if r.PacketEvents || r.WireStats {
-		h.OnEnqueue = func(e link.Event) {
-			if r.PacketEvents {
-				r.write(e.T, flowOrLink(e), stream.KindPktEnqueue, float64(e.Size))
-			}
-			if r.WireStats && e.Dir == link.Fwd {
+	if r.WireStats {
+		h.OnArrival = func(e link.Event) {
+			r.linkArrivalBytes[e.Dir] += uint64(e.Size)
+			if e.Dir == link.Fwd {
 				if r.wireSeen {
 					g := (e.T - r.wireLastT).Seconds()
 					r.wireGapSum += g
@@ -243,9 +258,25 @@ func (r *Recorder) LinkHooks() link.Hooks {
 			}
 		}
 	}
-	if r.PacketEvents {
+	if r.PacketEvents || r.WireStats {
+		h.OnEnqueue = func(e link.Event) {
+			if r.PacketEvents {
+				r.write(e.T, flowOrLink(e), stream.KindPktEnqueue, float64(e.Size))
+			}
+			if r.WireStats {
+				r.linkEnqueuedBytes[e.Dir] += uint64(e.Size)
+				r.linkEnqueuedPkts[e.Dir]++
+			}
+		}
+	}
+	if r.PacketEvents || r.WireStats {
 		h.OnDequeue = func(e link.Event) {
-			r.write(e.T, flowOrLink(e), stream.KindPktDequeue, float64(e.Size))
+			if r.PacketEvents {
+				r.write(e.T, flowOrLink(e), stream.KindPktDequeue, float64(e.Size))
+			}
+			if r.WireStats {
+				r.linkDequeuedBytes[e.Dir] += uint64(e.Size)
+			}
 		}
 	}
 	return h
