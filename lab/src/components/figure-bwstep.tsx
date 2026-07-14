@@ -31,26 +31,42 @@ const STEPS = [
 
 const flowPath = (pts: Pt[]) => {
   if (pts.length < 2) return null
-  const path = (fn: (p: Pt) => number) =>
-    pts
-      .filter((_, i) => i % 3 === 0)
-      .map((p, i) => (i ? 'L' : 'M') + tx(p.t).toFixed(1) + ' ' + fn(p).toFixed(1))
-      .join(' ')
+  const path = (fn: (p: Pt, i: number) => number) => {
+    let s = ''
+    for (let i = 0; i < pts.length; i += 3)
+      s += (s ? 'L' : 'M') + tx(pts[i].t).toFixed(1) + ' ' + fn(pts[i], i).toFixed(1)
+    return s
+  }
+  // True goodput: receiver-side app bytes differentiated over a ±160 ms
+  // window. The sender's delivery-rate estimate (p.y) is drawn alongside;
+  // the two split exactly when retransmissions eat the wire (crank loss or
+  // jitter), which is the point of overlaying them.
+  const hasGood = pts.some((p) => p.goodB != null)
+  const W = 8
+  const good = pts.map((p, i) => {
+    if (!hasGood) return p.y * BWSTEP_CFG.rateMbps
+    const a = pts[Math.max(0, i - W)]
+    const b = pts[Math.min(pts.length - 1, i + W)]
+    const dt = b.t - a.t
+    return dt > 0 ? (((b.goodB ?? 0) - (a.goodB ?? 0)) * 8) / 1e6 / dt : 0
+  })
   return {
     del: path((p) => yDel(p.y * BWSTEP_CFG.rateMbps)),
+    good: path((_, i) => yDel(good[i])),
+    goodV: good,
     inf: path((p) => yInf((p.x * d.bdpBytes) / 1000)),
     rtt: path((p) => yRtt(p.r * d.baseMs)),
   }
 }
 
-function ReadoutRow({ label, p, color }: { label: string; p?: Pt; color: string }) {
+function ReadoutRow({ label, p, good, color }: { label: string; p?: Pt; good?: number; color: string }) {
   return (
     <div className="fig-readout" style={{ color }}>
       <span className="ro" style={{ minWidth: 52 }}>
         {label}
       </span>
       <span className="ro" style={{ minWidth: 96 }}>
-        {p ? `${(p.y * BWSTEP_CFG.rateMbps).toFixed(1)} Mbps` : '—'}
+        {p && good != null ? `${good.toFixed(1)} Mbps` : '—'}
       </span>
       <span className="ro" style={{ minWidth: 72 }}>
         {p ? `${((p.x * d.bdpBytes) / 1000).toFixed(0)} kB` : ''}
@@ -131,12 +147,18 @@ export function FigureBwStep({
           figure 3, plus cubic: bbr converges on the up-step within a probe cycle (max-filter
           admits the new rate immediately) and drains the down-step spike once the old BtlBw
           estimate ages out; cubic grows into new bandwidth one RTT at a time and notices the
-          down-step only when the buffer overflows.
+          down-step only when the buffer overflows. The top lane draws true goodput (receiver
+          app bytes) solid with the sender&apos;s own delivery-rate estimate dashed — on a clean
+          path they coincide, and they split when loss or jitter makes the wire carry
+          retransmissions that deliver nothing new.
         </>
       }
     >
       <svg viewBox="0 0 640 360" style={{ display: 'block', width: '100%', height: 'auto' }}>
-        {lane(20, 110, 'DELIVERY RATE (MBPS)', [
+        <text x={628} y={14} textAnchor="end" fontFamily="JetBrains Mono" fontSize={8.5} fill={COLORS.stone}>
+          solid goodput · dashed sender delivery estimate
+        </text>
+        {lane(20, 110, 'GOODPUT (MBPS)', [
           [yDel(10), '10'],
           [yDel(20), '20'],
         ])}
@@ -177,14 +199,16 @@ export function FigureBwStep({
             </defs>
             {cubicPaths && (
               <>
-                <path d={cubicPaths.del} fill="none" stroke={COLORS.cubic} strokeWidth={1.3} />
+                <path d={cubicPaths.del} fill="none" stroke={COLORS.cubic} strokeWidth={0.9} strokeDasharray="3 3" strokeOpacity={0.8} />
+                <path d={cubicPaths.good} fill="none" stroke={COLORS.cubic} strokeWidth={1.3} />
                 <path d={cubicPaths.inf} fill="none" stroke={COLORS.cubic} strokeWidth={1.3} />
                 <path d={cubicPaths.rtt} fill="none" stroke={COLORS.cubic} strokeWidth={1.3} />
               </>
             )}
             {bbrPaths && (
               <>
-                <path d={bbrPaths.del} fill="none" stroke={COLORS.bbr} strokeWidth={1.3} />
+                <path d={bbrPaths.del} fill="none" stroke={COLORS.bbr} strokeWidth={0.9} strokeDasharray="3 3" strokeOpacity={0.8} />
+                <path d={bbrPaths.good} fill="none" stroke={COLORS.bbr} strokeWidth={1.3} />
                 <path d={bbrPaths.inf} fill="none" stroke={COLORS.bbr} strokeWidth={1.3} />
                 <path d={bbrPaths.rtt} fill="none" stroke={COLORS.bbr} strokeWidth={1.3} />
               </>
@@ -196,8 +220,8 @@ export function FigureBwStep({
       <Transport tr={tr} T={BWSTEP_DUR_S} />
       {/* Fixed-width cells so live values don't reflow the rows. */}
       <div style={{ marginTop: 8, display: 'flex', flexDirection: 'column', gap: 4 }}>
-        <ReadoutRow label="cubic" p={pc} color={COLORS.cubic} />
-        <ReadoutRow label="bbrv3" p={pb} color={COLORS.bbr} />
+        <ReadoutRow label="cubic" p={pc} good={cubicPaths?.goodV[Math.min(cubicPaths.goodV.length - 1, Math.max(0, Math.round(t / 0.02)))]} color={COLORS.cubic} />
+        <ReadoutRow label="bbrv3" p={pb} good={bbrPaths?.goodV[Math.min(bbrPaths.goodV.length - 1, Math.max(0, Math.round(t / 0.02)))]} color={COLORS.bbr} />
       </div>
     </FigureCard>
   )
