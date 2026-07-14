@@ -138,10 +138,22 @@ func bbrOperatingPointCell(t *testing.T, seed int64, rateMbps, rttMs float64) (i
 func TestLateJoinerConvergence(t *testing.T) {
 	var rows []string
 	for _, cc := range []string{"cubic", "bbr"} {
-		cfg := vCfg(34, 100, 100, 15, bdpPkts(100, 30), vBulk(cc, 0), vBulk(cc, 60))
+		// bbr reallocates through probe cycles only: with the draft's
+		// BBRSetCwnd (cwnd grows by at most newly-acked data per ACK; no
+		// jump-to-target), the joiner gains share a probe at a time, which
+		// takes many 2-3 s cycles and varies widely with seed (0-132 s over
+		// seeds 34-37; this seed measures 60.0 s). Characterized in
+		// docs/validation.md ("late-joiner convergence"); the
+		// pre-conformance <15 s came from the old assignment-law cwnd
+		// leaping to the model target.
+		dur, bound := 100.0, 15.0
+		if cc == "bbr" {
+			dur, bound = 160.0, 90.0
+		}
+		cfg := vCfg(34, dur, 100, 15, bdpPkts(100, 30), vBulk(cc, 0), vBulk(cc, 60))
 		recs, _ := runCfg(t, cfg)
 		conv := math.NaN()
-		for start := 60.0; start+5 <= 100; start += 0.5 {
+		for start := 60.0; start+5 <= dur; start += 0.5 {
 			g0 := probe.GoodputMbps(recs, 0, start, start+5)
 			g1 := probe.GoodputMbps(recs, 1, start, start+5)
 			if g0+g1 > 0 && g1/(g0+g1) >= 0.35 {
@@ -149,12 +161,12 @@ func TestLateJoinerConvergence(t *testing.T) {
 				break
 			}
 		}
-		gEnd0 := probe.GoodputMbps(recs, 0, 90, 100)
-		gEnd1 := probe.GoodputMbps(recs, 1, 90, 100)
+		gEnd0 := probe.GoodputMbps(recs, 0, dur-10, dur)
+		gEnd1 := probe.GoodputMbps(recs, 1, dur-10, dur)
 		t.Logf("%s@1xBDP: joiner reached 35%% share %.1f s after joining; final split %.1f/%.1f Mbps",
 			cc, conv, gEnd0, gEnd1)
-		if math.IsNaN(conv) || conv >= 15 {
-			t.Errorf("%s late joiner took %.1f s to reach 35%% share, want < 15 s", cc, conv)
+		if math.IsNaN(conv) || conv >= bound {
+			t.Errorf("%s late joiner took %.1f s to reach 35%% share, want < %.0f s", cc, conv, bound)
 		}
 		rows = append(rows, fmt.Sprintf("| %s | %.1f s | %.1f / %.1f Mbps |", cc, conv, gEnd0, gEnd1))
 	}

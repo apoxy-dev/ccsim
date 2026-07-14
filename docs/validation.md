@@ -35,7 +35,7 @@ go test -tags slow ./sim -run TestSlow -update          # rewrite tables below
 | 4–10 | BBRv3 filter windows, ProbeBW cycle, loss/ECN arithmetic, startup exit, ProbeRTT, app-limited | `bbr/conformance_test.go` |
 | 11 | BBR operating point: ~1×BDP inflight, low delay, ≥92% util over 9 rate×RTT cells | `sim.TestBBROperatingPoint` (+`TestSlowBBROperatingPointGrid`) |
 | 12–13 | intra-protocol convergence (Jain) | `sim.TestSlowIntraProtocolFairness` |
-| 14 | late-joiner convergence < 15 s | `sim.TestLateJoinerConvergence` |
+| 14 | late-joiner convergence: cubic < 15 s, bbr < 90 s (characterized) | `sim.TestLateJoinerConvergence` |
 | 15 | cubic/bbr coexistence vs buffer depth | `sim.TestSlowCoexistenceSurface` |
 | 16–19 | CoDel target + √n control law, FQ-CoDel isolation, RED ramp (χ²), ECN≈drop | `link/aqm_test.go`, `link/aqm_e2e_test.go` |
 | 20–22 | scenario fuzz invariants; live-mutation determinism; inject≡declared events | `sim/property_test.go` |
@@ -145,13 +145,28 @@ Single bbr flow, 4×BDP tail-drop, measured over [15,60] s.
 
 ### Late-joiner convergence (test 14)
 
-1×BDP buffer, second flow joins at t=60 s; sliding 5 s windows.
+1×BDP buffer, second flow joins at t=60 s; sliding 5 s windows (cubic
+observed to t=100 s, bbr to t=160 s).
+
+**Finding (2026-07-14):** adopting the draft's cwnd control law
+(`BBRSetCwnd`: cwnd grows by at most the newly-acked data per ACK; the
+model target is a cap, applied only once the pipe is full) slowed bbr
+late-joiner reallocation from 4 s to 60 s at this seed. The old <15 s
+figure was an artifact of the non-conformant assignment law, which leaped
+cwnd straight to 2×BDP of the joiner's optimistic in-probe model. Under
+the draft law the joiner gains share one 2–3 s probe cycle at a time —
+the slow-reallocation behavior documented for real BBRv2/v3. First
+crossing of 35% share varies widely with seed (0 s, 0 s, 60 s, 132 s over
+seeds 34–37; share then oscillates 30–70% with probe-cycle beats), so the
+bound is pinned at 90 s for the deterministic test seed (measured 60.0 s)
+rather than tightened to the mean. Steady-state fairness (tests 12–13) is
+unaffected.
 
 <!-- begin:late-joiner -->
 | cc | time to 35% share | final split (old/new) |
 |---|---|---|
 | cubic | 12.0 s | 47.9 / 48.5 Mbps |
-| bbr | 4.0 s | 28.7 / 57.0 Mbps |
+| bbr | 60.0 s | 54.8 / 35.6 Mbps |
 <!-- end:late-joiner -->
 
 ### Coexistence surface (test 15)

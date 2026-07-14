@@ -252,3 +252,36 @@ exports the rate actually in force. Regression pinned by
 `TestStartupSingleLossKeepsRamping` (fails pre-fix at the first round
 after the loss). Goldens regenerated for the three bbr presets whose
 startup bytes shifted.
+
+## 13. cwnd is grown by acked data, not assigned from the model
+
+The old `setCwnd` recomputed gain*BDP(+2 MSS) and assigned it on every
+ACK. The draft's `BBRSetCwnd` is a different control law: cwnd is a
+persistent variable that grows by at most `rs.newly_acked` per ACK, the
+model target (`BBR.max_inflight`) acts only as a cap, and the snap-down
+arm is gated on `full_bw_reached`. Before the pipe is full, cwnd never
+decreases — otherwise the first ACK's cold model (tiny bw x min_rtt) cuts
+the window it is still trying to measure. Measured on 100 Kbps / 200 ms:
+first ACK cut cwnd 10 -> 5 pre-fix; post-fix cwnd holds >= 10 through
+Startup (growing to 19 while delivered < InitialCwnd, per the draft's
+`C.delivered < C.InitialCwnd` arm) and snaps to the target only at
+full-pipe detection. Alongside it, the rest of audit finding 2:
+`BBRInitPacingRate` (pace the IW over the handshake SRTT, 1 ms fallback,
+instead of an unpaced first flight), cwnd_gain 2.25 in ProbeBW:UP (draft
+raises it from the default 2), DOWN's cwnd cap is inflight_hi rather than
+0.85-headroom (draft `BBRBoundCwndForModel` reserves headroom for
+CRUISE/ProbeRTT), and BBRSaveCwnd/BBRRestoreCwnd around loss recovery,
+RTO and ProbeRTT so exits restore the last good window instead of
+regrowing from the clamp. BDP truncation (sub-MSS, dominated by the
+2-MSS allowance) and the extra_acked filter (receiver never aggregates
+beyond delayed ACKs; fixed 2-MSS allowance, decisions §7) stay as
+documented deviations.
+
+Consequence, characterized in docs/validation.md ("late-joiner
+convergence"): without the non-conformant jump-to-target, a bbr late
+joiner reallocates share one probe cycle at a time — 60 s to 35% share at
+the test seed (was 4 s), matching BBRv2/v3's documented slow-reallocation
+trade-off; the bound is pinned at 90 s. Steady-state fairness and the
+operating-point surface are unchanged. Regression pinned by
+`TestCwndGrowByAckedControlLaw`; goldens regenerated (all seven
+bbr-involving presets shift; cubic presets byte-identical).

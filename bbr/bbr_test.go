@@ -217,6 +217,16 @@ func TestPacingGainsPerState(t *testing.T) {
 	if g := b.cwndGain(); g != probeRTTCwndGain {
 		t.Errorf("ProbeRTT cwnd gain %v, want %v", g, probeRTTCwndGain)
 	}
+	// The draft raises cwnd_gain to 2.25 in ProbeBW:UP (2.0 elsewhere in
+	// ProbeBW).
+	b.state = StateProbeBWUp
+	if g := b.cwndGain(); g != probeUpCwndGain {
+		t.Errorf("ProbeBW:UP cwnd gain %v, want %v", g, probeUpCwndGain)
+	}
+	b.state = StateProbeBWCruise
+	if g := b.cwndGain(); g != probeBWCwndGain {
+		t.Errorf("ProbeBW:CRUISE cwnd gain %v, want %v", g, probeBWCwndGain)
+	}
 }
 
 func TestInflightTooHighAbortsProbe(t *testing.T) {

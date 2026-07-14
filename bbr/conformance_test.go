@@ -417,9 +417,14 @@ func TestStartupGainsAndDrain(t *testing.T) {
 	if f.pacing != wantPacing {
 		t.Errorf("startup pacing %d, want %d (2.77 * bw * 0.99)", f.pacing, wantPacing)
 	}
-	wantCwnd := int((b.bdpBytes(startupCwndGain) + 2*int64(mss)) / int64(mss))
-	if f.cwnd != wantCwnd {
-		t.Errorf("startup cwnd %d, want %d (2.0 * BDP + 2 MSS)", f.cwnd, wantCwnd)
+	// Pre-full-pipe cwnd grows by at most the acked data per ACK and is
+	// not snapped down to the model target (draft BBRSetCwnd), so it lands
+	// in [max_inflight, max_inflight + one ACK's worth).
+	target := int((b.bdpBytes(startupCwndGain) + 2*int64(mss)) / int64(mss))
+	ackPkts := int(rate/8*int64(10*time.Millisecond)/int64(time.Second))/mss + 1
+	if f.cwnd < target || f.cwnd > target+ackPkts {
+		t.Errorf("startup cwnd %d, want in [%d, %d] (2.0*BDP+2MSS, +1 ACK overshoot)",
+			f.cwnd, target, target+ackPkts)
 	}
 	// Force the plateau exit; in Drain the pacing gain must be 1/2.77.
 	for i := 0; i < 12 && b.state == StateStartup; i++ {
@@ -514,6 +519,54 @@ func TestStartupSingleLossKeepsRamping(t *testing.T) {
 		StateName(b.state), float64(b.maxBw())/1e6, float64(maxPacing)/1e6)
 }
 
+// The draft's BBRSetCwnd grows cwnd by at most the newly-acked data per
+// ACK and snaps it down to the model target only once the pipe is full.
+// Regression: the old setCwnd assigned the target on every ACK, so on a
+// low-BDP path the first ACK's cold model (tiny bw * min_rtt) cut cwnd
+// from the initial window straight to the 4-packet floor.
+func TestCwndGrowByAckedControlLaw(t *testing.T) {
+	b, f := newTestBBR()
+	rate := int64(100e3) // 100 Kbps, 200 ms: BDP ~1.7 packets, far below IW
+	rtt := 200 * time.Millisecond
+
+	b.OnAck(steadySample(b, f, rate, rtt, 10*time.Millisecond))
+	if f.cwnd < 10 {
+		t.Fatalf("first ACK cut cwnd to %d pkts (initial window 10): pre-full-pipe snap-down", f.cwnd)
+	}
+	t.Logf("first cold-model ACK: cwnd %d pkts (target would be %d pkts)",
+		f.cwnd, int(b.maxInflightBytes()/int64(mss)))
+
+	// Before the pipe is full, cwnd must never decrease.
+	prev := f.cwnd
+	steps := 0
+	for i := 0; i < 500 && !b.filledPipe; i++ {
+		b.OnAck(steadySample(b, f, rate, rtt, 10*time.Millisecond))
+		if b.filledPipe {
+			break // this ACK declared full pipe; snap-down is legal now
+		}
+		if f.cwnd < prev {
+			t.Fatalf("step %d: cwnd decreased %d -> %d pkts before full pipe", i, prev, f.cwnd)
+		}
+		prev = f.cwnd
+		steps++
+	}
+	if !b.filledPipe {
+		t.Fatal("100 Kbps plateau never declared the pipe full")
+	}
+	t.Logf("pipe full after %d steps with cwnd held at %d pkts (never below 10)", steps, prev)
+
+	// Once full, the model target caps and snaps the window down.
+	b.OnAck(steadySample(b, f, rate, rtt, 10*time.Millisecond))
+	want := int(b.maxInflightBytes() / int64(mss))
+	if want < 4 {
+		want = 4
+	}
+	if f.cwnd != want {
+		t.Errorf("post-full-pipe cwnd %d pkts, want snap to max_inflight %d", f.cwnd, want)
+	}
+	t.Logf("post-full-pipe snap: cwnd %d pkts (max_inflight %d pkts)", f.cwnd, want)
+}
+
 func TestStartupNoExitWhileGrowing(t *testing.T) {
 	b, f := newTestBBR()
 	rtt := 40 * time.Millisecond
@@ -596,6 +649,12 @@ func TestProbeRTTClampDurationAndRefresh(t *testing.T) {
 	exitAt = f.now
 	if b.state == StateProbeRTT {
 		t.Fatal("never exited ProbeRTT")
+	}
+	// Exit restores the pre-ProbeRTT window (draft BBRRestoreCwnd) rather
+	// than regrowing from the clamp.
+	clampPkts := int(b.probeRTTCwndBytes() / int64(mss))
+	if f.cwnd < 2*clampPkts {
+		t.Errorf("cwnd %d pkts after ProbeRTT exit, want restored well above the %d-pkt clamp", f.cwnd, clampPkts)
 	}
 	if holdStart == 0 {
 		t.Fatal("hold never started (inflight below cap not detected)")

@@ -110,7 +110,10 @@ const (
 	probeDownGain     = 0.9
 	cruiseGain        = 1.0
 	probeBWCwndGain   = 2.0
-	probeRTTCwndGain  = 0.5
+	// probeUpCwndGain: the draft raises cwnd_gain to 2.25 in ProbeBW:UP so
+	// the cwnd does not cap the inflight the pacing probe is trying to grow.
+	probeUpCwndGain  = 2.25
+	probeRTTCwndGain = 0.5
 
 	beta         = 0.7  // loss response multiplier
 	headroom     = 0.85 // fraction of inflight_hi usable while cruising
@@ -176,6 +179,16 @@ type BBR struct {
 	// pacingBps is the last rate handed to the sender: before the pipe is
 	// full the pacing rate only ratchets upward (see setPacing).
 	pacingBps int64
+
+	// cwnd is the persistent congestion window (bytes), per the draft's
+	// BBRSetCwnd: it grows by at most the newly-acked data per ACK and is
+	// snapped down to the model target only once the pipe is full; the
+	// model bounds apply as caps, never as assignments. priorCwnd is the
+	// last known good window (BBRSaveCwnd/BBRRestoreCwnd), restored on
+	// loss-recovery and ProbeRTT exit.
+	cwnd        int64
+	priorCwnd   int64
+	initialCwnd int64
 
 	// Model: RTT. minRTT is a windowed minimum: rttBuckets holds per-2.5s
 	// sub-window minima so stale low samples expire after ~10s (a pinned
@@ -246,7 +259,25 @@ func New(s Sender) *BBR {
 		ecnAlpha:   1, // draft: alpha starts at 1
 	}
 	b.stateTime = s.Now()
+	b.initialCwnd = int64(s.CwndPkts()) * int64(s.MSS())
+	b.cwnd = b.initialCwnd
+	b.initPacingRate()
 	return b
+}
+
+// initPacingRate implements the draft's BBRInitPacingRate: with no
+// delivery samples yet, pace the initial window over the handshake SRTT
+// (1 ms fallback when none exists) at the startup gain, so even the very
+// first flight is not an unpaced line-rate burst.
+func (b *BBR) initPacingRate() {
+	srtt := b.s.SRTT()
+	if srtt <= 0 {
+		srtt = time.Millisecond
+	}
+	nominalBps := float64(8*b.initialCwnd) / srtt.Seconds()
+	rate := int64(startupPacingGain * nominalBps)
+	b.pacingBps = rate
+	b.s.SetPacingRateBps(rate)
 }
 
 // Register wires BBR into the patched netstack under the name "bbr".
@@ -263,21 +294,43 @@ func (b *BBR) Update(packetsAcked int, rtt time.Duration) {}
 // out of the way: netstack recovery sets cwnd from ssthresh, and BBR wants
 // cwnd mostly preserved (its loss response happens through bw_lo).
 func (b *BBR) HandleLossDetected() {
+	b.saveCwnd()
 	b.s.SetSsthresh(b.s.CwndPkts())
 }
 
 // HandleRTOExpired resets the model conservatively.
 func (b *BBR) HandleRTOExpired() {
-	// Draft: on RTO, save cwnd and restart from a conservative state; the
-	// netstack sender already collapses cwnd. Reset short-term bounds so
-	// the model can rebuild.
+	// Draft BBROnEnterRTO: save the last good cwnd and restart the window
+	// from what is actually in flight; the normal grow-by-acked mechanism
+	// rebuilds it. Reset short-term bounds so the model can rebuild too.
+	b.saveCwnd()
+	b.cwnd = b.s.InflightBytes() + int64(b.s.MSS())
 	b.bwLo = math.MaxInt64
 	b.inflightLo = math.MaxInt64
 }
 
-// PostRecovery restores BBR's cwnd after netstack recovery ends.
+// PostRecovery restores BBR's cwnd after netstack recovery ends
+// (draft BBRRestoreCwnd on loss-recovery exit).
 func (b *BBR) PostRecovery() {
-	b.setCwnd()
+	b.restoreCwnd()
+	b.applyCwnd()
+}
+
+// saveCwnd and restoreCwnd implement the draft's BBRSaveCwnd and
+// BBRRestoreCwnd: remember the latest cwnd unmodulated by loss recovery
+// or ProbeRTT, and restore it on exit from either.
+func (b *BBR) saveCwnd() {
+	if !b.s.InRecovery() && b.state != StateProbeRTT {
+		b.priorCwnd = b.cwnd
+	} else if b.cwnd > b.priorCwnd {
+		b.priorCwnd = b.cwnd
+	}
+}
+
+func (b *BBR) restoreCwnd() {
+	if b.priorCwnd > b.cwnd {
+		b.cwnd = b.priorCwnd
+	}
 }
 
 // dbgSamples bounds the number of per-sample debug lines printed when
@@ -492,6 +545,7 @@ func (b *BBR) updateStateMachine(rs tcp.SimRateSample) {
 	// (and not before we have a min_rtt sample).
 	if b.state != StateProbeRTT && b.minRTT != 0 &&
 		now-b.minRTTStamp > probeRTTInterval && !b.idleRestart {
+		b.saveCwnd()
 		b.enter(StateProbeRTT, now)
 		b.probeRTTDone = 0
 		b.probeRTTRoundDone = false
@@ -624,6 +678,7 @@ func (b *BBR) startProbeBWDown(now time.Duration) {
 }
 
 func (b *BBR) exitProbeRTT(now time.Duration) {
+	b.restoreCwnd()
 	b.bwLo = math.MaxInt64
 	b.inflightLo = math.MaxInt64
 	if b.filledPipe {
@@ -816,6 +871,8 @@ func (b *BBR) cwndGain() float64 {
 		return startupCwndGain
 	case StateProbeRTT:
 		return probeRTTCwndGain
+	case StateProbeBWUp:
+		return probeUpCwndGain
 	default:
 		return probeBWCwndGain
 	}
@@ -856,32 +913,64 @@ func (b *BBR) probeRTTCwndBytes() int64 {
 	return c
 }
 
+// maxInflightBytes is the draft's BBR.max_inflight: cwnd_gain * BDP plus
+// the fixed 2-MSS ack-aggregation allowance (see package comment).
+func (b *BBR) maxInflightBytes() int64 {
+	return b.bdpBytes(b.cwndGain()) + 2*int64(b.s.MSS())
+}
+
+// setCwnd implements the draft's BBRSetCwnd: the persistent cwnd grows by
+// at most the newly-acked data per ACK, and the model target only acts as
+// a cap — and only once the pipe is full. Before that, cwnd never
+// decreases (a cold or transiently low model must not cut the window it
+// is still trying to measure), except through the explicit bounds applied
+// in applyCwnd.
 func (b *BBR) setCwnd() {
+	acked := b.lastSample.AckedBytes
+	maxInflight := b.maxInflightBytes()
+	if b.filledPipe {
+		b.cwnd += acked
+		if b.cwnd > maxInflight {
+			b.cwnd = maxInflight
+		}
+	} else if b.cwnd < maxInflight || b.lastSample.Delivered < b.initialCwnd {
+		b.cwnd += acked
+	}
+	b.applyCwnd()
+}
+
+// applyCwnd applies the draft's floors and caps to the persistent cwnd
+// (BBRBoundCwndForProbeRTT + BBRBoundCwndForModel) and pushes the result
+// to the sender.
+func (b *BBR) applyCwnd() {
 	mss := int64(b.s.MSS())
-	var target int64
+	minPipe := 4 * mss
+	if b.cwnd < minPipe {
+		b.cwnd = minPipe
+	}
 	if b.state == StateProbeRTT {
-		target = b.probeRTTCwndBytes()
-	} else {
-		target = b.bdpBytes(b.cwndGain())
-		// Fixed ack-aggregation allowance (see package comment).
-		target += 2 * mss
-		// Apply bounds: inflight_lo (short-term, loss) and inflight_hi
-		// (long-term, probing), with headroom while cruising.
-		if b.inflightLo != math.MaxInt64 && target > b.inflightLo &&
-			b.state != StateProbeBWRefill && b.state != StateProbeBWUp {
-			target = b.inflightLo
-		}
-		hi := b.inflightHi
-		if b.state == StateProbeBWCruise || b.state == StateProbeBWDown {
-			hi = b.inflightWithHeadroom()
-		}
-		if hi != math.MaxInt64 && target > hi {
-			target = hi
+		if c := b.probeRTTCwndBytes(); b.cwnd > c {
+			b.cwnd = c
 		}
 	}
-	pkts := int(target / mss)
-	if pkts < 4 {
-		pkts = 4
+	// Volume caps: inflight_hi while probing (DOWN/REFILL/UP), headroom
+	// under it while cruising or in ProbeRTT, and inflight_lo always (it
+	// is released to infinity on REFILL entry and exempt while probing).
+	bound := int64(math.MaxInt64)
+	switch b.state {
+	case StateProbeBWDown, StateProbeBWRefill, StateProbeBWUp:
+		bound = b.inflightHi
+	case StateProbeBWCruise, StateProbeRTT:
+		bound = b.inflightWithHeadroom()
 	}
-	b.s.SetCwndPkts(pkts)
+	if b.inflightLo < bound {
+		bound = b.inflightLo
+	}
+	if bound < minPipe {
+		bound = minPipe
+	}
+	if b.cwnd > bound {
+		b.cwnd = bound
+	}
+	b.s.SetCwndPkts(int(b.cwnd / mss))
 }
