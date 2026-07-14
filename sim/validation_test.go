@@ -140,11 +140,12 @@ func TestLateJoinerConvergence(t *testing.T) {
 	for _, cc := range []string{"cubic", "bbr"} {
 		// bbr reallocates through probe cycles (draft BBRSetCwnd: cwnd
 		// grows by at most newly-acked data per ACK, no jump-to-target),
-		// so it converges slower than cubic and with seed variance:
-		// 8-13 s over seeds 34-37 with mark-time loss signals (this seed
-		// 8.0 s). See docs/validation.md ("late-joiner convergence") for
-		// the history — the pre-conformance assignment-law cwnd made this
-		// look like 4 s, and retransmit-time loss counting made it 60+ s.
+		// with seed variance: 5-9 s over seeds 34-37 with the draft
+		// ProbeBW feedback machine (this seed 4.0 s). See
+		// docs/validation.md ("late-joiner convergence") for the history —
+		// the pre-conformance assignment-law cwnd made this look like
+		// 4 s for the wrong reason, retransmit-time loss counting made it
+		// 60+ s, and mark-time signals alone gave 8-13 s.
 		dur, bound := 100.0, 15.0
 		if cc == "bbr" {
 			bound = 30.0
@@ -190,15 +191,16 @@ func TestSubBDPBuffer(t *testing.T) {
 		}
 		if cc == "bbr" {
 			// FINDING (documented in docs/validation.md): the <5 RTOs/min
-			// target is not met (~36/min measured). Mechanism: ccsim does
-			// not pace retransmissions (decisions.md section 2), so
-			// recovery bursts overrun the 25-packet queue and lose the
-			// retransmits themselves, escalating to RTO. Goodput still
-			// holds 82%. The bound below characterizes the current
-			// behavior so a regression (or a fix) is visible; tightening
-			// it to <5 requires paced retransmissions.
-			if perMin >= 60 {
-				t.Errorf("bbr steady-state RTO rate %.1f/min, above the characterized ~36/min", perMin)
+			// target is not met (~13/min measured; ~36/min before
+			// mark-time loss signals). Mechanism: ccsim does not pace
+			// retransmissions (decisions.md section 2), so recovery
+			// bursts overrun the 25-packet queue and lose the retransmits
+			// themselves, escalating to RTO. The bound below
+			// characterizes the current behavior so a regression (or a
+			// fix) is visible; tightening it to <5 requires paced
+			// retransmissions.
+			if perMin >= 30 {
+				t.Errorf("bbr steady-state RTO rate %.1f/min, above the characterized ~13/min", perMin)
 			}
 		}
 	}

@@ -351,3 +351,65 @@ short-term bounds now floor at demonstrated delivered volume. Goldens
 regenerated (four presets shift: bbr-single, coexist-1bdp, determinism,
 fairness; the lossless/ECN-only bbr presets and all cubic presets are
 byte-identical).
+
+## 15. ProbeBW's feedback machine: adapt-on-every-ACK, ack phases, exponential inflight_hi
+
+Audit finding 4: the upper-bound feedback machinery around ProbeBW was a
+skeleton — loss/ECN gates checked only while the state was UP, feedback
+arriving in DOWN silently dropped, `inflight_hi` growing linearly and
+without preconditions, UP ending on an invented fixed schedule (2 rounds
+at 1.25×BDP or an 8-round cap), and a never-read `ackPhaseIsUp` where the
+draft's four-value ack-phase tracker belonged. Replaced with the draft's
+structure:
+
+- **`BBRAdaptLongTermModel` runs on every ACK once the pipe is full**, in
+  every state: a too-high sample cuts `inflight_hi` (once per probe, via
+  `bw_probe_samples` + the REFILL delivered mark from §14) in whatever
+  state its ACKs arrive — probe-caused loss usually surfaces after the
+  state machine has already flipped to DOWN. Safe samples adapt upward:
+  `inflight_hi = max(inflight_hi, RS.tx_in_flight)` in any ProbeBW state.
+- **Ack phases time the max-bw filter advance.** The filter now advances
+  at `ACKS_PROBE_STOPPING && round_start` — one round *into* DOWN, when
+  the probe's last samples have landed — instead of at DOWN entry, so the
+  probe's peak delivery rate is fully credited to the closing window
+  before turnover.
+- **Exponential `inflight_hi` growth** (`BBRRaiseInflightLongtermSlope`):
+  the growth rate doubles each UP round (1 MSS << round per cwnd acked)
+  instead of a flat ~1 MSS/round, still gated on `is_cwnd_limited` with
+  cwnd pressing the bound. Long probes escalate like slow start; after a
+  deep cut the bound recovers in rounds, not probe cycles.
+- **UP ends when it stops learning** (`BBRIsTimeToGoDown`): the full-bw
+  plateau estimator is reset and reseeded at UP entry and runs during the
+  probe; UP exits on `full_bw_now` (3 rounds of <25% max-bw growth). While
+  the flow is cwnd-limited pressing `inflight_hi`, the estimator resets
+  instead — an artificial plateau imposed by the bound must not read as
+  "pipe full". This required splitting the draft's `full_bw_now` (per-probe
+  verdict) from `full_bw_reached` (lifetime latch, our `filledPipe`);
+  startup exit uses the same estimator unchanged.
+
+Not adopted: `prev_probe_too_high` and `stopped_risky_probe` are
+tcp_bbr.c internals absent from draft-03, and per-lost-packet
+`BBRHandleLostPacket` lost-prefix interpolation stays approximated at
+rate-sample granularity (§14).
+
+Validation deltas (tables regenerated in docs/validation.md): the
+mid-buffer coexistence starvation is gone — bbr share vs cubic at
+2×/4×BDP went 23%/19% → 51%/48% (the linear growth could never rebuild
+`inflight_hi` against cubic between cuts), and at sub-BDP buffers bbr now
+takes the larger share (68-71%), consistent with published BBR behavior
+in small buffers. The 16×BDP starvation (1% share) stands — that is the
+windowed min_rtt under cubic's permanent standing queue, not the probe
+machine. Intra-bbr aggregates recovered (N=2 81.5 → 92.0 Mbps, the §14
+dip; pin raised 80 → 85), late-joiner convergence tightened to 5-9 s
+over seeds 34-37, and the RTT-fairness exponent moved 0.24 → -0.69:
+long-RTT flows now hold the larger share, which is BBR's documented
+inverse-RTT bias (probe magnitude scales with BDP), not a defect — the
+draft-faithful machine restored a known trait. Random-loss gives back a
+little (89.5 → 87.5 Mbps): safe samples raising `inflight_hi` to
+`tx_in_flight` keep the operating point nearer the loss gate under
+random loss. The one cell that ran hotter is the operating-point grid's
+smallest BDP (10 Mbps × 10 ms, ~17 packets): 1.23 → 1.39×BDP inflight —
+MSS-granular `inflight_hi` growth and the 4-packet MinPipeCwnd floor are
+large fractions of a BDP that small; characterized in validation.md
+finding 6. Goldens regenerated: every bbr-carrying preset shifts (probe
+cadence changed), cubic-only presets are byte-identical.

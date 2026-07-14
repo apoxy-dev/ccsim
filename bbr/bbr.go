@@ -57,8 +57,8 @@ import (
 //	|      |   +------------------------------> | REFILL |     |
 //	|      |                                    +--------+     |
 //	|      | loss/ECN gate (> 2%)                   |          |
-//	|      | or probe done                          | 1 round  |
-//	|      |                                        |          |
+//	|      | or bw growth plateaued                 | 1 round  |
+//	|      | (full_bw_now)                          |          |
 //	|     +----+                                    |          |
 //	|     | UP | <----------------------------------+          |
 //	|     +----+                                               |
@@ -67,8 +67,9 @@ import (
 // ProbeRTT is entered from any state when min_rtt has not been refreshed
 // for probeRTTInterval (5 s); it caps cwnd at 0.5*BDP, holds for 200 ms
 // once inflight is under the cap, then exits to ProbeBW:CRUISE (pipe
-// full) or back to Startup (pipe not yet full). Entering DOWN advances
-// the max-bw filter; entering REFILL releases bw_lo/inflight_lo.
+// full) or back to Startup (pipe not yet full). The max-bw filter
+// advances one round after DOWN starts (ACKS_PROBE_STOPPING); entering
+// REFILL releases bw_lo/inflight_lo.
 //
 // State codes exported through the probe layer.
 const (
@@ -140,6 +141,16 @@ const (
 	fullLossCount = 6
 
 	maxBwFilterLen = 2 // max-bw filter window, in probe cycles
+)
+
+// ACK phases (draft BBR.ack_phase): which ProbeBW phase the data being
+// acknowledged right now was sent in.
+const (
+	acksInit = iota
+	acksRefilling
+	acksProbeStarting
+	acksProbeFeedback
+	acksProbeStopping
 )
 
 // Sender is the sender-side surface BBR needs. tcp.SimSender implements it;
@@ -226,9 +237,24 @@ type BBR struct {
 	probeWait     time.Duration // wall time to wait in CRUISE before probing
 	cycleStamp    time.Duration // when current cycle started (DOWN entry)
 	roundsInPhase int64
+	// probeUpRounds/probeUpAcks/probeUpCnt implement the draft's
+	// exponential inflight_hi growth (BBRRaiseInflightLongtermSlope):
+	// inflight_hi grows by one MSS per probeUpCnt bytes acked, and the
+	// slope doubles each UP round.
 	probeUpRounds int64
 	probeUpAcks   int64
-	ackPhaseIsUp  bool
+	probeUpCnt    int64
+	// fullBwNow is the draft's BBR.full_bw_now: the per-probe plateau
+	// verdict of the full-bw estimator. filledPipe (full_bw_reached)
+	// latches for the connection's lifetime; fullBwNow is reset and re-run
+	// during every ProbeBW UP so the probe ends when it stops discovering
+	// bandwidth (BBRIsTimeToGoDown).
+	fullBwNow bool
+	// ackPhase tracks which phase the currently arriving ACKs' data was
+	// sent in (draft BBR.ack_phase); its job is timing the max-bw filter
+	// advance one round after DOWN starts, when the probe's last samples
+	// have all landed.
+	ackPhase int
 	// bwProbeSamples is the draft's BBR.bw_probe_samples: loss feedback
 	// aborts a bandwidth probe at most once per probe. Set on REFILL
 	// entry, cleared by handleInflightTooHigh and on CRUISE entry.
@@ -266,6 +292,7 @@ func New(s Sender) *BBR {
 		bwLo:       math.MaxInt64,
 		inflightHi: math.MaxInt64,
 		inflightLo: math.MaxInt64,
+		probeUpCnt: math.MaxInt64,
 		minRTT:     0,
 		ecnAlpha:   1, // draft: alpha starts at 1
 	}
@@ -579,6 +606,16 @@ func (b *BBR) updateStateMachine(rs tcp.SimRateSample) {
 		b.forceAdvanceMaxBwFilter(now)
 	}
 
+	// Long-term model adaptation runs on every ACK once the pipe has been
+	// filled, in every state (draft BBRUpdateProbeBWCyclePhase calls
+	// BBRAdaptLongTermModel before the ProbeBW-state check): probe-caused
+	// loss must be reacted to in whatever state its ACKs arrive, and the
+	// full-bw estimator must keep running during UP so the probe can end.
+	if b.filledPipe {
+		b.checkFullBwReached(rs)
+		b.adaptLongTermModel(rs, now)
+	}
+
 	switch b.state {
 	case StateProbeBWDown:
 		// Leave DOWN once inflight is at/below the target with headroom.
@@ -592,8 +629,6 @@ func (b *BBR) updateStateMachine(rs tcp.SimRateSample) {
 			b.enterRefill(now)
 		}
 	case StateProbeBWCruise:
-		// Feedback from the last probe is over; stop reacting to it.
-		b.bwProbeSamples = false
 		// Excess-queue drain: if the bandwidth model dropped (e.g. after a
 		// rate step) the inflight built at the old rate must be depleted;
 		// DOWN's 0.9 gain does that. DOWN cannot deadlock here: it exits
@@ -606,26 +641,13 @@ func (b *BBR) updateStateMachine(rs tcp.SimRateSample) {
 			b.enterRefill(now)
 		}
 	case StateProbeBWRefill:
+		// After one round of REFILL, start UP.
 		if b.roundStart && b.roundsInPhase >= 1 {
-			b.enter(StateProbeBWUp, now)
-			b.probeUpRounds = 0
-			b.ackPhaseIsUp = true
+			b.startProbeBWUp(now)
 		}
 	case StateProbeBWUp:
-		b.probeInflightHiUpward(rs)
-		if b.isInflightTooHigh(rs) {
-			b.handleInflightTooHigh(rs)
+		if b.isTimeToGoDown(rs) {
 			b.startProbeBWDown(now)
-		} else if b.roundStart {
-			b.probeUpRounds++
-			// Keep probing until the loss/ECN gate trips or the probe has
-			// clearly run its course: inflight held at the 1.25x target
-			// for a round, or a bounded number of rounds elapsed.
-			if b.probeUpRounds >= 2 && rs.InflightBytes >= b.bdpBytes(probeUpGain) {
-				b.startProbeBWDown(now)
-			} else if b.probeUpRounds >= 8 {
-				b.startProbeBWDown(now)
-			}
 		}
 	case StateProbeRTT:
 		cap := b.probeRTTCwndBytes()
@@ -685,19 +707,35 @@ func (b *BBR) enterRefill(now time.Duration) {
 	b.enter(StateProbeBWRefill, now)
 	b.bwLo = math.MaxInt64
 	b.inflightLo = math.MaxInt64
+	b.probeUpRounds = 0
 	b.probeUpAcks = 0
+	b.ackPhase = acksRefilling
 	b.bwProbeSamples = true
 	b.probeStartDelivered = b.lastSample.Delivered
 }
 
+// startProbeBWUp begins the accelerating phase (draft BBRStartProbeBW_UP):
+// the full-bw estimator is reset and reseeded from the latest delivery
+// rate so it can detect, fresh, when *this* probe stops finding bandwidth.
+func (b *BBR) startProbeBWUp(now time.Duration) {
+	b.ackPhase = acksProbeStarting
+	b.enter(StateProbeBWUp, now)
+	b.resetFullBW()
+	b.fullBw = b.lastSample.DeliveryRateBps
+	b.raiseInflightHiSlope()
+}
+
 func (b *BBR) startProbeBWDown(now time.Duration) {
-	b.advanceMaxBwFilter()
 	b.enter(StateProbeBWDown, now)
 	b.cycleStamp = now
 	// Elapsed virtual-time probe interval: 2-3 s, jittered from the
 	// deterministic per-flow sub-stream (time-based, not round-based).
 	b.probeWait = 2*time.Second + time.Duration(b.rng.Int64N(int64(time.Second)))
-	b.ackPhaseIsUp = false
+	// Not growing inflight_hi outside UP (draft: probe_up_cnt = Infinity).
+	b.probeUpCnt = math.MaxInt64
+	// The max-bw filter advances one round from now, when the last probe
+	// samples have landed (ACKS_PROBE_STOPPING in adaptLongTermModel).
+	b.ackPhase = acksProbeStopping
 }
 
 func (b *BBR) exitProbeRTT(now time.Duration) {
@@ -736,13 +774,34 @@ func (b *BBR) checkFullPipe(rs tcp.SimRateSample) {
 	} else {
 		b.startupEcnRounds = 0
 	}
+	b.checkFullBwReached(rs)
+}
+
+// resetFullBW is the draft's BBRResetFullBW: restart the bandwidth
+// plateau estimator.
+func (b *BBR) resetFullBW() {
+	b.fullBw = 0
+	b.fullBwCount = 0
+	b.fullBwNow = false
+}
+
+// checkFullBwReached is the draft's BBRCheckFullBWReached: once per round
+// of non-app-limited samples, declare bandwidth growth plateaued
+// (full_bw_now) after fullBwCount rounds of <25% max-bw filter growth.
+// filledPipe (full_bw_reached) latches for the connection's lifetime.
+func (b *BBR) checkFullBwReached(rs tcp.SimRateSample) {
+	if b.fullBwNow || !b.roundStart || rs.IsAppLimited {
+		return
+	}
 	if b.maxBw() >= int64(float64(b.fullBw)*fullBwThresh) {
+		// Bandwidth is still growing: reset and re-anchor.
+		b.resetFullBW()
 		b.fullBw = b.maxBw()
-		b.fullBwCount = 0
 		return
 	}
 	b.fullBwCount++
-	if b.fullBwCount >= fullBwCount {
+	b.fullBwNow = b.fullBwCount >= fullBwCount
+	if b.fullBwNow {
 		b.filledPipe = true
 	}
 }
@@ -769,27 +828,39 @@ func (b *BBR) lossRateTooHigh(rs tcp.SimRateSample) bool {
 		rs.LostBytes > int64(lossThresh*float64(rs.TxInflight))
 }
 
-// isInflightTooHigh implements the draft's loss/ECN gate for probing.
-// The loss arm only reacts to samples the probe itself transmitted
-// (REFILL/UP onward), at most once per probe: residual loss marks from
-// data sent while cruising must not abort a probe that has produced no
-// feedback yet.
-func (b *BBR) isInflightTooHigh(rs tcp.SimRateSample) bool {
-	if rs.IsAppLimited {
-		return false
-	}
-	if b.bwProbeSamples && rs.PriorDelivered >= b.probeStartDelivered &&
-		b.lossRateTooHigh(rs) {
-		return true
-	}
-	if b.ackedBytesRound > 0 &&
-		float64(b.ceBytesRound)/float64(b.ackedBytesRound) > ecnThresh {
-		return true
-	}
-	return false
+// ecnTooHigh is the ECN arm of the draft's IsInflightTooHigh, evaluated
+// at round granularity (per-sample delivered_ce is not plumbed; the
+// round CE fraction is the same signal one round late at worst).
+func (b *BBR) ecnTooHigh() bool {
+	return b.ackedBytesRound > 0 &&
+		float64(b.ceBytesRound)/float64(b.ackedBytesRound) > ecnThresh
 }
 
-func (b *BBR) handleInflightTooHigh(rs tcp.SimRateSample) {
+// inflightTooHigh is the draft's IsInflightTooHigh: is the loss or ECN
+// rate of this sample beyond what steady-state operation should see?
+// Ungated by probe attribution — a too-high sample must also block the
+// safe-sample upward adaptation even when no probe owns it.
+func (b *BBR) inflightTooHigh(rs tcp.SimRateSample) bool {
+	return b.lossRateTooHigh(rs) || b.ecnTooHigh()
+}
+
+// probeTooHigh decides whether a too-high sample belongs to the current
+// bandwidth probe and should cut inflight_hi (draft BBRHandleLostPacket:
+// only packets sent while bw_probe_samples, at most once per probe; our
+// loss attribution additionally requires the sample's data to have been
+// transmitted at or after REFILL entry, so residual loss from data sent
+// while cruising cannot abort a probe that has produced no feedback).
+func (b *BBR) probeTooHigh(rs tcp.SimRateSample) bool {
+	if rs.IsAppLimited || !b.bwProbeSamples {
+		return false
+	}
+	if b.ecnTooHigh() {
+		return true
+	}
+	return rs.PriorDelivered >= b.probeStartDelivered && b.lossRateTooHigh(rs)
+}
+
+func (b *BBR) handleInflightTooHigh(rs tcp.SimRateSample, now time.Duration) {
 	b.bwProbeSamples = false // react once per bandwidth probe
 	// Draft: inflight_longterm = max(RS.tx_in_flight, beta * target) —
 	// the operating point when the losing data was sent, not the pipe
@@ -803,30 +874,105 @@ func (b *BBR) handleInflightTooHigh(rs tcp.SimRateSample) {
 	if hi < b.inflightHi {
 		b.inflightHi = hi
 	}
+	if b.state == StateProbeBWUp {
+		b.startProbeBWDown(now)
+	}
 }
 
-// probeInflightHiUpward raises inflight_hi while probing without loss.
-func (b *BBR) probeInflightHiUpward(rs tcp.SimRateSample) {
+func (b *BBR) inProbeBW() bool {
+	switch b.state {
+	case StateProbeBWDown, StateProbeBWCruise, StateProbeBWRefill, StateProbeBWUp:
+		return true
+	}
+	return false
+}
+
+// adaptLongTermModel is the draft's BBRAdaptLongTermModel, run on every
+// ACK once the pipe is full: track ACK phases to advance the max-bw
+// filter one round after DOWN starts (when the probe's samples have all
+// landed), cut inflight_hi on probe-attributed loss/ECN in whatever
+// state the feedback arrives, and adapt it upward from safe samples.
+func (b *BBR) adaptLongTermModel(rs tcp.SimRateSample, now time.Duration) {
+	if b.ackPhase == acksProbeStarting && b.roundStart {
+		// Data sent while probing is now being acknowledged.
+		b.ackPhase = acksProbeFeedback
+	}
+	if b.ackPhase == acksProbeStopping && b.roundStart {
+		// End of samples from the bandwidth probe.
+		b.ackPhase = acksInit
+		b.bwProbeSamples = false
+		if b.inProbeBW() && !rs.IsAppLimited {
+			b.advanceMaxBwFilter()
+		}
+	}
+	if b.inflightTooHigh(rs) {
+		if b.probeTooHigh(rs) {
+			b.handleInflightTooHigh(rs, now)
+		}
+		return
+	}
+	// Loss/ECN rate is safe: adjust the upper bound upward.
 	if b.inflightHi == math.MaxInt64 {
 		return
 	}
-	if b.inflightHi <= 0 {
+	if rs.TxInflight > b.inflightHi {
+		b.inflightHi = rs.TxInflight
+	}
+	if b.state == StateProbeBWUp {
+		b.probeInflightHiUpward(rs)
+	}
+}
+
+// isTimeToGoDown is the draft's BBRIsTimeToGoDown: while inflight_hi is
+// the binding limit, keep probing and restart the plateau estimator;
+// otherwise end UP as soon as bandwidth growth has plateaued.
+func (b *BBR) isTimeToGoDown(rs tcp.SimRateSample) bool {
+	if rs.IsCwndLimited && b.cwnd >= b.inflightHi {
+		// Bandwidth is limited by inflight_hi, not the path; the estimator
+		// must not read that artificial plateau as "pipe full".
+		b.resetFullBW()
+		b.fullBw = rs.DeliveryRateBps
+		return false
+	}
+	return b.fullBwNow
+}
+
+// raiseInflightHiSlope is the draft's BBRRaiseInflightLongtermSlope: the
+// growth rate doubles every UP round — inflight_hi grows by
+// (1 MSS << round) per cwnd of acked data, so long probes escalate from
+// cautious to aggressive like slow start.
+func (b *BBR) raiseInflightHiSlope() {
+	growth := int64(1) << b.probeUpRounds // packets per cwnd of acks
+	if b.probeUpRounds < 30 {
+		b.probeUpRounds++
+	}
+	cnt := b.cwnd / growth
+	if cnt < int64(b.s.MSS()) {
+		cnt = int64(b.s.MSS())
+	}
+	b.probeUpCnt = cnt
+}
+
+// probeInflightHiUpward raises inflight_hi while probing without loss
+// (draft BBRProbeInflightLongtermUpward): one MSS per probeUpCnt bytes
+// acked, but only while the window is fully utilized and pressing
+// against the bound; otherwise inflight_hi inflates past anything the
+// flow has demonstrated.
+func (b *BBR) probeInflightHiUpward(rs tcp.SimRateSample) {
+	if b.inflightHi == math.MaxInt64 || b.inflightHi <= 0 {
 		return
 	}
-	// Draft BBRProbeInflightLongtermUpward: only grow the bound while the
-	// window is fully utilized and already pressing against it; otherwise
-	// inflight_hi inflates past anything the flow has demonstrated.
 	if !rs.IsCwndLimited || b.cwnd < b.inflightHi {
 		return
 	}
 	b.probeUpAcks += rs.AckedBytes
-	// Grow inflight_hi by one MSS per inflight_hi bytes acked (draft's
-	// slow-then-fast growth simplified to linear per-round growth), keeping
-	// the remainder like the reference's bw_probe_up_acks accounting.
-	if b.probeUpAcks >= b.inflightHi {
-		delta := b.probeUpAcks / b.inflightHi
-		b.probeUpAcks -= delta * b.inflightHi
+	if b.probeUpAcks >= b.probeUpCnt {
+		delta := b.probeUpAcks / b.probeUpCnt
+		b.probeUpAcks -= delta * b.probeUpCnt
 		b.inflightHi += delta * int64(b.s.MSS())
+	}
+	if b.roundStart {
+		b.raiseInflightHiSlope()
 	}
 }
 
