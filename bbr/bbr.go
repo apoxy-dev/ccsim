@@ -173,6 +173,9 @@ type BBR struct {
 	// exceeded ecnThresh; reset by any low round.
 	startupEcnRounds int
 	filledPipe       bool
+	// pacingBps is the last rate handed to the sender: before the pipe is
+	// full the pacing rate only ratchets upward (see setPacing).
+	pacingBps int64
 
 	// Model: RTT. minRTT is a windowed minimum: rttBuckets holds per-2.5s
 	// sub-window minima so stale low samples expire after ~10s (a pinned
@@ -302,9 +305,15 @@ func (b *BBR) OnAck(rs tcp.SimRateSample) {
 
 // SimProbe exports internal state for instrumentation.
 func (b *BBR) SimProbe() tcp.SimCCProbe {
+	// PacingBps is the rate actually in force: pre-full-pipe it can exceed
+	// the instantaneous gain*bw formula because setPacing only ratchets up.
+	pacing := b.pacingBps
+	if pacing == 0 {
+		pacing = int64(b.pacingGain() * float64(b.bw()) * (1 - pacingMargin))
+	}
 	p := tcp.SimCCProbe{
 		State:       b.state,
-		PacingBps:   int64(b.pacingGain() * float64(b.bw()) * (1 - pacingMargin)),
+		PacingBps:   pacing,
 		BwBps:       b.bw(),
 		DeliveryBps: b.lastSample.DeliveryRateBps,
 		MinRTT:      b.minRTT,
@@ -718,9 +727,15 @@ func (b *BBR) probeInflightHiUpward(rs tcp.SimRateSample) {
 }
 
 // adaptLowerBounds applies the once-per-round loss/ECN cuts to the
-// short-term model bounds (never while probing).
+// short-term model bounds (never while probing for bandwidth).
 func (b *BBR) adaptLowerBounds() {
-	if b.state == StateProbeBWRefill || b.state == StateProbeBWUp {
+	// Startup is a bandwidth probe: both the draft's BBRAdaptLowerBounds
+	// pseudocode and the reference's bbr_is_probing_bandwidth() exempt it
+	// alongside ProbeBW REFILL/UP. Without the exemption a single startup
+	// loss pins bw_lo to a still-ramping round sample, pacing collapses
+	// with it, and the resulting artificial delivery plateau trips the
+	// full-bw startup exit at a fraction of the real bandwidth.
+	if b.state == StateStartup || b.state == StateProbeBWRefill || b.state == StateProbeBWUp {
 		return
 	}
 	ceFrac := 0.0
@@ -815,6 +830,14 @@ func (b *BBR) setPacing() {
 	if rate < 8000 {
 		rate = 8000
 	}
+	// Before the pipe is full the pacing rate only ratchets upward
+	// (reference bbr_set_pacing_rate: a lower rate applies only once
+	// bbr_full_bw_reached). A transient dip in the still-growing model
+	// must not throttle the ramp it is trying to measure.
+	if !b.filledPipe && rate < b.pacingBps {
+		return
+	}
+	b.pacingBps = rate
 	b.s.SetPacingRateBps(rate)
 }
 

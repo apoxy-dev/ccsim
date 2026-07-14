@@ -70,10 +70,10 @@
       ]
     },
     "bbr-single": {
-      "sha256": "7410c40e6b7b3c1c435a8c14e6fd58ebaa175c811710f3d1aabe5d76ee8b78bb",
+      "sha256": "13bb5e723409174ff19765e6087e14e47998f1a4257698de3cc778f98110cde1",
       "records": 390041,
       "seconds": [
-        "1c52eed033097bd1",
+        "3d1b82f4a7606cc9",
         "644852a387fd7542",
         "e8d5823400c12f90",
         "024a903d9a699654",
@@ -211,7 +211,7 @@
       ]
     },
     "coexist-1bdp": {
-      "sha256": "49c4e70668640572ef96c24409499844384984bdc791fde9e6201c06214fe5b6",
+      "sha256": "adc4aae42d28010a09be6777086066674ea41b5b2ccb0501d5d2b88e953a4a6e",
       "records": 1320330,
       "seconds": [
         "1a61597ba2710e48",
@@ -229,7 +229,7 @@
         "47b9bbe108abdffa",
         "c34980c5e0606bb0",
         "f480066e4d37e36c",
-        "a87a8ebe6eecf7a5",
+        "1d78b3f052a161e3",
         "7217c1b6b7576b20",
         "da997a0fc7537024",
         "7f4e6c9f109e576c",
@@ -244,7 +244,7 @@
         "5a7da9598550b2fc",
         "f4adf0aa74b2ec75",
         "52d20a492e2d070c",
-        "247fbd1754bac447",
+        "eb923f2050b385eb",
         "7f47ad29a93b1f41",
         "6e4c1c49f4bf37da",
         "dd13467461868285",
@@ -315,20 +315,20 @@
       ]
     },
     "determinism": {
-      "sha256": "7d6533c239507b389e52c830ca7cb61cd8660659c349b53f1fc74efaa1b92181",
-      "records": 221222,
+      "sha256": "b020a3d14cabfd45fdd8d3ab8833a659c6920f38ccd46b29b0c0ba8c63c52847",
+      "records": 221308,
       "seconds": [
-        "143fbbca84e9d97c",
-        "06ae5eb1ae487bc3",
-        "76ac911224876590",
-        "5636378805199ac6",
-        "5cc1b471056fe980",
-        "d2a49e15ad35f243",
-        "9b339826e2580632",
-        "2402f5c88461db15",
-        "35a814f02a069281",
-        "b52484e9ebe7fec1",
-        "f12f3831dcd5a2ef"
+        "73203fde0ffb7afb",
+        "7eeaaf12bc931aed",
+        "a2f6542a3a33175d",
+        "af7b5cbc95fafdf2",
+        "dfc18c910a536f0e",
+        "a9fd6c0589a5d118",
+        "1c432fb15a1b8b04",
+        "975a90228e65c5b1",
+        "e38747ebdaec22a8",
+        "432679ed16e511d9",
+        "7b3c210acf3b1508"
       ]
     },
     "ecn-codel": {

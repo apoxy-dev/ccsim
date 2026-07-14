@@ -222,3 +222,33 @@ DOWN occupancy 84% -> 39% (CRUISE 50%), mean queue 253 -> 128 pkt, srtt
 now govern from cruise instead of being masked by a permanently full
 pipe. Clean-path presets shift within noise; goldens regenerated (see
 golden_changelog.md), conformance suite unchanged.
+
+## 12. Startup is a bandwidth probe: no lower-bound cuts, pacing only ratchets up
+
+Two coupled omissions let a single packet loss during Startup collapse
+the ramp. First, `adaptLowerBounds` exempted only ProbeBW REFILL/UP, but
+both the draft's `BBRAdaptLowerBounds` pseudocode ("if (BBR.state ==
+Startup) return") and the reference's `bbr_is_probing_bandwidth()` exempt
+Startup too. Second, `setPacing` applied the gain*bw rate unconditionally,
+while the reference (`bbr_set_pacing_rate`) refuses to lower the pacing
+rate until `bbr_full_bw_reached()`.
+
+The failure chain: one loss in a startup round set bw_lo =
+max(bw_latest, 0.7*bw_lo), and early in startup bw_latest is a
+still-ramping round sample far below the path capacity, so bw_lo pinned
+low; bw() = min(max_bw, bw_lo) dragged pacing (and via inflight_lo, cwnd)
+down with it; the throttled delivery plateaued max_bw, tripping the
+three-round full-bw startup exit at a fraction of the real bandwidth —
+and bw_lo persists until the next REFILL, seconds away. Measured on
+100 Mbps / 40 ms / 10k-pkt buffer with exactly one drop at 0.2 s
+(link.drop_next): goodput over 5 s was 28.2 Mbps pre-fix vs 90.4 post-fix
+— identical to the clean run. The intended loss reaction in Startup is
+the separate six-loss-event exit rule (`checkFullPipe`), which one loss
+correctly does not satisfy.
+
+Fixes: Startup added to the `adaptLowerBounds` exemption, and `setPacing`
+now ratchets — a lower rate is ignored until `filledPipe`. `SimProbe`
+exports the rate actually in force. Regression pinned by
+`TestStartupSingleLossKeepsRamping` (fails pre-fix at the first round
+after the loss). Goldens regenerated for the three bbr presets whose
+startup bytes shifted.

@@ -459,6 +459,61 @@ func TestStartupExitOnLoss(t *testing.T) {
 	t.Logf("loss-based startup exit -> %s", StateName(b.state))
 }
 
+// A single loss during Startup must neither engage the short-term model
+// bounds nor throttle pacing: Startup is a bandwidth probe (reference
+// bbr_is_probing_bandwidth includes it, and the draft's
+// BBRAdaptLowerBounds returns immediately in Startup), and before the
+// pipe is full the pacing rate only ratchets upward
+// (bbr_set_pacing_rate). Regression: pre-fix, one early loss pinned
+// bw_lo/inflight_lo to a still-ramping round sample, pacing and cwnd
+// collapsed with them, and the artificial delivery plateau tripped the
+// full-bw startup exit at a fraction of the real bandwidth.
+func TestStartupSingleLossKeepsRamping(t *testing.T) {
+	b, f := newTestBBR()
+	rtt := 40 * time.Millisecond
+	rate := int64(10e6)
+	var maxPacing int64
+	for round := 0; round < 24 && b.state == StateStartup; round++ {
+		trace(b, f, rate, rtt, rtt)
+		if !b.filledPipe && f.pacing < maxPacing {
+			t.Fatalf("round %d: pacing dropped %.2f -> %.2f Mbps before full pipe",
+				round, float64(maxPacing)/1e6, float64(f.pacing)/1e6)
+		}
+		if f.pacing > maxPacing {
+			maxPacing = f.pacing
+		}
+		if round == 2 {
+			// One loss event mid-ramp: a fresh retransmit appears in the
+			// per-round accounting just before the round closes.
+			b.lossInRound = true
+			b.lossEventsRound = 1
+			b.lostBytesRound = int64(mss)
+		}
+		if round >= 3 && b.state == StateStartup {
+			if b.bwLo != math.MaxInt64 {
+				t.Fatalf("round %d: bw_lo engaged at %.2f Mbps by a single startup loss", round, float64(b.bwLo)/1e6)
+			}
+			if b.inflightLo != math.MaxInt64 {
+				t.Fatalf("round %d: inflight_lo engaged (%d bytes) by a single startup loss", round, b.inflightLo)
+			}
+		}
+		if rate < 100e6 {
+			rate = rate * 13 / 10
+			if rate > 100e6 {
+				rate = 100e6
+			}
+		}
+	}
+	if b.state == StateStartup {
+		t.Fatal("never exited startup on the 100 Mbps plateau")
+	}
+	if got := b.maxBw(); got < 90e6 {
+		t.Errorf("startup exited with maxBw %.2f Mbps, want >= 90 (premature exit)", float64(got)/1e6)
+	}
+	t.Logf("startup exit -> %s at maxBw %.2f Mbps, peak pacing %.2f Mbps (loss at round 2 ignored)",
+		StateName(b.state), float64(b.maxBw())/1e6, float64(maxPacing)/1e6)
+}
+
 func TestStartupNoExitWhileGrowing(t *testing.T) {
 	b, f := newTestBBR()
 	rtt := 40 * time.Millisecond
