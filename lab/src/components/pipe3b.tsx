@@ -207,7 +207,11 @@ export const Pipe3b = memo(function Pipe3b({
   // reads near wire rate even when most carried bytes are duplicate
   // retransmissions. The offered/goodput gap IS congestion: permanent
   // collapse for naive, a flash per overshoot for cubic, nothing for bbr.
-  const rateMax = cfg.rateMbps * 1.6
+  // The naive control needs headroom for its fixed 150 Mbps offered load.
+  // Reusing that domain for feedback-controlled senders compresses Cubic's
+  // loss-limited throughput into a few pixels, so give Cubic and BBR a
+  // link-relative domain with a small amount of headroom instead.
+  const rateMax = cfg.rateMbps * (flow === 'naive' ? 1.6 : 1.1)
   const yR = (v: number) => 364 - 44 * Math.min(v / rateMax, 1)
   const rate = useMemo(() => {
     if (pts.length < 2) return null

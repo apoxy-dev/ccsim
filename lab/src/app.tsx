@@ -48,6 +48,47 @@ function Slider({
   )
 }
 
+// Zero is a useful control, but every non-zero point is logarithmic. At a
+// 100 Mbps / 40 ms path, the old first step of 0.05% already drives Cubic
+// down near 15 Mbps; the 1-3 decade sequence exposes the transition instead
+// of jumping over it while retaining the deliberately harsh upper range.
+const LOSS_PCT_STEPS = [0, 0.001, 0.003, 0.01, 0.03, 0.1, 0.3, 1, 3] as const
+
+function lossStepIndex(value: number): number {
+  let best = 0
+  for (let i = 1; i < LOSS_PCT_STEPS.length; i++) {
+    if (Math.abs(LOSS_PCT_STEPS[i] - value) < Math.abs(LOSS_PCT_STEPS[best] - value)) best = i
+  }
+  return best
+}
+
+function formatLossPct(value: number): string {
+  if (value === 0) return '0 %'
+  if (value < 0.01) return `${value.toFixed(3)} %`
+  if (value < 0.1) return `${value.toFixed(2)} %`
+  if (value < 1) return `${value.toFixed(1)} %`
+  return `${value.toFixed(0)} %`
+}
+
+function LossSlider({ value, onChange }: { value: number; onChange: (v: number) => void }) {
+  return (
+    <label className="ctl">
+      <span className="ctl-label">
+        loss <b>{formatLossPct(value)}</b>
+      </span>
+      <input
+        type="range"
+        min={0}
+        max={LOSS_PCT_STEPS.length - 1}
+        step={1}
+        value={lossStepIndex(value)}
+        aria-valuetext={formatLossPct(value)}
+        onChange={(e) => onChange(LOSS_PCT_STEPS[+e.target.value])}
+      />
+    </label>
+  )
+}
+
 // Precomputed streams cover the defaults; leaving them means simulating
 // live, which few-core devices pay for in wall-clock minutes. Warn before
 // the first slider move, not after.
@@ -220,7 +261,7 @@ export function App() {
         controls={
           <>
             <div className="ctl-row">
-              <Slider label="loss" value={pipeCfg.lossPct} min={0} max={3} step={0.05} fmt={(v) => `${v.toFixed(2)} %`} onChange={pipeSet('lossPct')} />
+              <LossSlider value={pipeCfg.lossPct} onChange={pipeSet('lossPct')} />
               <Slider label="jitter" value={pipeCfg.jitterMs} min={0} max={100} step={1} fmt={(v) => `${v} ms`} onChange={pipeSet('jitterMs')} />
             </div>
             <StatusLine
@@ -254,7 +295,7 @@ export function App() {
             <div className="ctl-row">
               <Slider label="owd" value={cfg.owdMs} min={5} max={50} step={1} fmt={(v) => `${v} ms`} onChange={set('owdMs')} />
               <Slider label="jitter" value={cfg.jitterMs} min={0} max={100} step={1} fmt={(v) => `${v} ms`} onChange={set('jitterMs')} />
-              <Slider label="loss" value={cfg.lossPct} min={0} max={3} step={0.05} fmt={(v) => `${v.toFixed(2)} %`} onChange={set('lossPct')} />
+              <LossSlider value={cfg.lossPct} onChange={set('lossPct')} />
               <Slider label="buffer" value={cfg.qlimPkts} min={20} max={2000} step={10} fmt={(v) => `${v} pkt`} onChange={set('qlimPkts')} />
             </div>
             <StatusLine
@@ -279,7 +320,7 @@ export function App() {
         controls={
           <>
             <div className="ctl-row">
-              <Slider label="loss" value={bwLossPct} min={0} max={3} step={0.05} fmt={(v) => `${v.toFixed(2)} %`} onChange={setBwLossPct} />
+              <LossSlider value={bwLossPct} onChange={setBwLossPct} />
               <Slider label="jitter" value={bwJitterMs} min={0} max={100} step={1} fmt={(v) => `${v} ms`} onChange={setBwJitterMs} />
             </div>
             <StatusLine
