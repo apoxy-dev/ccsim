@@ -193,7 +193,8 @@ export function App() {
     () => toPts(pipe.data, pipeD, pipeCfg.rateMbps, pipeFlow === 'bbr'),
     [pipe.data, pipe.version, pipeD, pipeCfg.rateMbps, pipeFlow],
   )
-  const losses = useMemo(() => lossMarks(runs.cubic, cubicPts, d), [cubicPts])
+  const cubicLosses = useMemo(() => lossMarks(runs.cubic, cubicPts, d), [cubicPts])
+  const bbrLosses = useMemo(() => lossMarks(runs.bbr, bbrPts, d), [bbrPts])
   const bwD = derive(BWSTEP_CFG)
   const bwCubicPts = useMemo(
     () => toPts(bw.cubic, bwD, BWSTEP_CFG.rateMbps, false),
@@ -284,7 +285,8 @@ export function App() {
       <Figure2a
         cubic={cubicPts}
         bbr={bbrPts}
-        losses={losses}
+        cubicLosses={cubicLosses}
+        bbrLosses={bbrLosses}
         d={d}
         tr={tr}
         T={RUN_DUR_S}

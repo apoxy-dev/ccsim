@@ -46,7 +46,7 @@ export class RunData {
   fwdEnqueueBytes = newTrack() // cumulative accepted bytes, actual link hook
   fwdDequeueBytes = newTrack() // cumulative transmitted bytes, actual link hook
   revEnqueuePkts = newTrack() // cumulative actual reverse packets (mostly ACKs)
-  lossEvents: number[] = [] // cwnd-cut times
+  lossEvents: number[] = [] // sender loss-recovery entry times
   dropEvents: number[] = [] // forward queue/AQM/forced-drop times
   wireDropEvents: number[] = [] // forward random-loss times after serialization
   maxT = 0
@@ -156,9 +156,10 @@ export interface Pt {
 
 export interface LossMark {
   t: number
+  kind: 'queue' | 'wire'
   x: number
   y: number
-  r: number // srtt ratio at the loss — buffer-overflow losses sit at the cliff, random losses do not
+  r: number // srtt ratio when the forward packet was dropped
 }
 
 // Walks a time-ordered track alongside the resample grid; O(n) overall.
@@ -242,11 +243,27 @@ export function toPts(run: RunData, d: Derived, rateMbps: number, bbrPhases: boo
   return pts
 }
 
-export function lossMarks(run: RunData, pts: Pt[], d: Derived, dt = 0.02): LossMark[] {
-  return run.lossEvents.map((t) => {
+// Converts actual forward-link packet drops into readable figure markers.
+// Queue and wire events are coalesced separately so a dense tail-drop burst
+// does not flood the SVG, while nearby drops at the two distinct stages are
+// both retained. Reverse-path ACK drops were excluded when RunData decoded
+// the stream and therefore never masquerade as forward data loss here.
+export function lossMarks(
+  run: RunData,
+  pts: Pt[],
+  d: Derived,
+  dt = 0.02,
+  episodeS = 0.25,
+): LossMark[] {
+  const events: Pick<LossMark, 't' | 'kind'>[] = [
+    ...coalesce(run.dropEvents, episodeS).map((t) => ({ t, kind: 'queue' as const })),
+    ...coalesce(run.wireDropEvents, episodeS).map((t) => ({ t, kind: 'wire' as const })),
+  ].sort((a, b) => a.t - b.t)
+  return events.map(({ t, kind }) => {
     const p = ptAt(pts, t, dt)
     return {
       t,
+      kind,
       x: Math.min(p?.x ?? d.cliff, d.cliff),
       y: Math.min(p?.y ?? 1, 1),
       r: p?.r ?? Math.min(d.cliff, 2.3),

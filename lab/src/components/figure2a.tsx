@@ -18,7 +18,8 @@ const syD: Scale = (v) => 560 - v * 208
 export function Figure2a({
   cubic: cubicRaw,
   bbr: bbrRaw,
-  losses,
+  cubicLosses,
+  bbrLosses,
   d,
   tr,
   T,
@@ -26,7 +27,8 @@ export function Figure2a({
 }: {
   cubic: Pt[]
   bbr: Pt[]
-  losses: LossMark[]
+  cubicLosses: LossMark[]
+  bbrLosses: LossMark[]
   d: Derived
   tr: TransportState
   T: number
@@ -60,15 +62,26 @@ export function Figure2a({
   const xC = sxRaw(cliff)
   const rCliff = Math.min(d.cliff, 2.3)
 
-  const lossEls = losses.flatMap((ev, i) => {
-    if (ev.t > t || ev.t < t - 6) return []
-    // The top-panel cross sits at the flow's actual RTT ratio: buffer
-    // overflows land on the cliff, random wire losses wherever the flow was.
-    return [
-      cross(sxA(ev.x), syD(ev.y), COLORS.loss, 0.9, 'd' + i, 3.2),
-      cross(sxA(ev.x), syR(ev.r), COLORS.loss, 0.9, 'r' + i, 3.2),
-    ]
-  })
+  const lossElsFor = (losses: LossMark[], run: 'cubic' | 'bbr') =>
+    losses.flatMap((ev, i) => {
+      if (ev.t > t || ev.t < t - 6) return []
+      // Apply the same feasible-envelope projection as the owning trail so
+      // each actual drop timestamp lands on that run's displayed path.
+      const y = Math.min(ev.y, ev.x)
+      const r = Math.max(ev.r, Math.min(ev.x, d.cliff))
+      const color = run === 'bbr' ? COLORS.bbr : COLORS.cubic
+      return [
+        <g key={`${run}-${ev.kind}-${i}`} data-drop-run={run} data-drop-kind={ev.kind}>
+          <title>{`${run === 'bbr' ? 'BBRv3' : 'CUBIC'} ${ev.kind} packet-drop episode`}</title>
+          {cross(sxA(ev.x), syD(y), color, 0.95, 'd', 3.2)}
+          {cross(sxA(ev.x), syR(r), color, 0.95, 'r', 3.2)}
+        </g>,
+      ]
+    })
+  const lossEls = [
+    ...lossElsFor(cubicLosses, 'cubic'),
+    ...lossElsFor(bbrLosses, 'bbr'),
+  ]
 
   const pc = ptAt(cubic, t)
   const pb = ptAt(bbr, t)
@@ -80,7 +93,8 @@ export function Figure2a({
         <div className="fig-legend">
           <span style={{ color: COLORS.cubic }}>— cubic</span>
           <span style={{ color: COLORS.bbr }}>— bbrv3</span>
-          <span style={{ color: COLORS.loss }}>× loss</span>
+          <span style={{ color: COLORS.cubic }}>× cubic drop</span>
+          <span style={{ color: COLORS.bbr }}>× bbrv3 drop</span>
         </div>
       }
       controls={controls}
