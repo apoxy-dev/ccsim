@@ -35,10 +35,11 @@ func TestNaiveFixedRateOverloadsBottleneck(t *testing.T) {
 	dequeue := cumulativeRate(stream.KindLinkDequeueBytesCum, 1)
 	t.Logf("naive offered %.1f Mbps into 100 Mbps link; dequeued %.1f Mbps; drops=%d qmax=%d",
 		arrival, dequeue, sum.Drops, sum.QDepthMaxPkt)
-	// The pacer is 150 Mbps. TCP recovery and packet/header accounting make
-	// qdisc arrival throughput slightly lower, but it must remain a sustained
-	// overload rather than ACK-clock back down to the bottleneck rate.
-	if arrival < 135 || arrival > 155 {
+	// The pacer accounts TCP payload bytes; the link hook accounts complete IP
+	// packets, so headers put the measured wire arrival rate about 3.7% above
+	// 150 Mbps. It must remain a sustained overload rather than ACK-clock back
+	// down to the bottleneck rate.
+	if arrival < 150 || arrival > 160 {
 		t.Errorf("naive arrival rate %.1f Mbps, want near the 150 Mbps pacer", arrival)
 	}
 	if dequeue < 90 || dequeue > 101 {

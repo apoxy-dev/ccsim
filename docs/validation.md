@@ -67,22 +67,22 @@ go test -tags slow ./sim -run TestSlow -update          # rewrite tables below
 
 ## Findings (expected-fail policy: analysis, never silent tolerance bumps)
 
-1. **BBR RTO rate at 0.1×BDP buffers is resolved** (test 23): classic-SACK
-   retransmissions now use the same virtual-clock pacing gate as ordinary
-   sends, and the pacing timer resumes the RFC 6675 repair walk. The measured
-   BBR result is 0 RTOs/min, 931 retransmissions, and 88.5 Mbps through the
+1. **BBR RTO rate at 0.1×BDP buffers is resolved** (test 23): RACK repairs and
+   TLP probes now use the same virtual-clock pacing gate as ordinary sends,
+   and the timer resumes the exact suspended recovery walk. The measured BBR
+   result is 0 RTOs/min, 826 retransmissions, and 79.7 Mbps through the
    25-packet queue, versus ~13 RTOs/min and ~70 Mbps after the mark-time-loss
    fix alone (~36 RTOs/min originally). The original <5 RTOs/min target is
    restored as a hard assertion.
-2. **BBR intra-protocol Jain vs the 0.90 target** (test 13): shares
-   wander with probe-cycle phasing; the draft ProbeBW feedback machine
-   (audit finding 4) lifted Jain to 0.906–0.965 across N (from 0.83 at
-   N=4 with linear inflight_hi growth) with min share 55% of fair at
-   worst — far above the 10% line that marks BBRv1's bw-filter capture
-   failure, which is the v3-specific claim and is asserted (Jain pinned
-   at 0.85). The small-N aggregate dip from the mark-time loss change
-   recovered (N=2 81.5 → 93.2, N=4 89.5 → 92.9, N=8 92.9 → 91.9
-   Mbps vs the 90% target); pinned at 85 for N≤4.
+2. **BBR intra-protocol Jain vs the 0.90 target** (test 13): shares wander
+   with probe-cycle phasing, so the sustained-allocation test averages the
+   final minute rather than one 30-second phase snapshot. With measured ACK
+   aggregation and the reference quantization budget, Jain is
+   0.996/0.928/0.869 for 2/4/8 flows, aggregate goodput is
+   94.5/95.1/95.0 Mbps, and the worst flow still gets 66% of fair share.
+   That remains far above the 10% line marking BBRv1's bandwidth-filter
+   capture failure, the v3-specific claim asserted here (Jain characterized
+   at 0.85; aggregate at 85 Mbps for N≤4).
 3. **Coexistence vs buffer depth** (test 15): originally 73/79 Mbps
    aggregate at 0.25/0.5×BDP vs the 85% target; mark-time loss signals
    (audit finding 3) resolved the idle-link half — retransmit-time loss
@@ -93,9 +93,9 @@ go test -tags slow ./sim -run TestSlow -update          # rewrite tables below
    cuts; the draft's exponential slope can). At sub-BDP buffers bbr now
    takes the larger share (71–78%), consistent with published BBR
    behavior in small buffers. Deep buffers still favor Cubic, but the
-   source-faithful risky-probe/loss-round/recovery pass removes capture:
-   BBR retains 17% at 16×BDP and 14% at 64×BDP, with 91–96% aggregate
-   utilization.
+   source-faithful risky-probe/loss-round/recovery pass removes capture.
+   With RFC 8985 recovery BBR retains 26% at 16×BDP and 13% at 64×BDP;
+   aggregate goodput is 94–97 Mbps across the surface.
 4. **Qdisc hot path allocated 1.0/packet** (test 29, fixed in this change):
    the fifo's slide-forward slice reallocated per packet whenever a queue
    oscillated around empty. Replaced with a ring buffer; golden streams
@@ -108,21 +108,23 @@ go test -tags slow ./sim -run TestSlow -update          # rewrite tables below
    20; the absolute high-water mark reflects the current 14.9 MB stream and
    Go/WASM allocator, while the no-growth property is the leak assertion.
 6. **BBR operating point at tiny BDPs** (test 11): the 10 Mbps × 10 ms
-   cell (BDP ≈ 9 MSS) measures 1.48×BDP inflight with 39% queue delay
-   (1.39×/29% before the source-faithful ProbeBW timing fixes). One MSS
-   of `inflight_hi`/cwnd granularity is ~12% of this BDP and the 4-packet
-   MinPipeCwnd floor is ~46% of it, so probe overshoot quantizes to a
-   visible standing queue; utilization is unaffected (93.8%). The other
-   8 cells hold 0.98–1.11×BDP and ≤17% queue delay. Characterized bounds
-   (1.5×, 45%) apply only below 25 packets of BDP.
-7. **Extreme-BDP recovery is a separate scalability workload** (test 24):
-   the original 1×BDP tail-drop setup entered RFC 6675 recovery with a
-   ~25,000-packet flight and spent more than 15 minutes repeatedly scanning
-   `SetPipe`; that measures simulator scoreboard complexity, not the test's
-   stated window/autosizing goal. Test 24 now uses a 4×BDP deep buffer and
-   completes in 21 s: BBR reaches 903 Mbps with 43.8 MB mean inflight and
-   zero retransmissions/RTOs (Cubic 965 Mbps). Loss recovery remains covered
-   at practical flight sizes by test 23 and the random-loss scenario.
+   cell (BDP ≈ 8 MSS) measures 1.61×BDP inflight with 51% queue delay.
+   Google's quantization budget reserves three send quanta; the simulator's
+   minimum two-packet quantum therefore contributes six packets, about 72%
+   of this path's BDP. Probe overshoot consequently becomes a visible
+   standing queue while utilization remains 94.2%. The other eight cells
+   hold 0.98–1.11×BDP and ≤17.4% queue delay. Characterized bounds (1.7×,
+   55%) apply only below 25 packets of BDP.
+7. **RACK recovery scalability is fixed, not avoided** (tests 23–24 plus the
+   bufferbloat regression): the original 1×BDP extreme run spent more than 15
+   minutes repeatedly scanning RFC 6675 `SetPipe` over a ~25,000-packet
+   flight. The enabled RACK path now maintains Linux-style incremental pipe
+   counters and transmit-time/pending-loss queues, so work is proportional to
+   actual candidates and repairs. The 60 s sparse buffer recovery fell from
+   53 s wall to 2.8 s while retaining exact drop/retransmission accounting
+   (1,387/1,387, zero RTO). Test 24 still uses its 4×BDP buffer to isolate the
+   stated window/autosizing claim; recovery correctness and scaling are hard
+   assertions in the bufferbloat and high-cwnd RACK tests.
 
 ## Measured results
 
@@ -146,19 +148,19 @@ log-log slope: -0.565 (R² 1.00)
 
 Shared 100 Mbps, 2×BDP buffer, RTTs 20 ms vs 120 ms, goodput over [30,120] s.
 
-BBR's exponent has tracked the audit fixes: −1.17 with retransmit-time
-loss signals (pathological long-RTT dominance driven by the short-RTT
-flow's spurious loss feedback), 0.24 with mark-time signals, and −0.69 after
-the first ProbeBW feedback port. The complete source pass lands at −0.46
-(28.6/65.4 Mbps): the artifact is reduced, but this deterministic case still
-shows BBR's known long-RTT advantage. This is a measured result, not a claim
-that the exponent is universal.
+BBR's exponent has tracked the audit fixes: −1.17 with retransmit-time loss
+signals (pathological long-RTT dominance driven by the short-RTT flow's
+spurious loss feedback), 0.24 with mark-time signals, and −0.69 after the
+first ProbeBW feedback port. The high-severity source pass landed at −0.46;
+measured ACK aggregation/quantization moved this deterministic case to −0.13,
+and RFC 8985 recovery with complete loss evidence lands at 0.03
+(47.9/45.4 Mbps). This is a measured seed, not a universal RTT-fairness claim.
 
 <!-- begin:rtt-fairness -->
 | cc | 20 ms flow | 120 ms flow | exponent e |
 |---|---|---|---|
-| cubic | 70.9 Mbps | 25.5 Mbps | 0.57 |
-| bbr | 28.6 Mbps | 65.4 Mbps | -0.46 |
+| cubic | 65.7 Mbps | 30.8 Mbps | 0.42 |
+| bbr | 47.9 Mbps | 45.4 Mbps | 0.03 |
 <!-- end:rtt-fairness -->
 
 ### BBR operating-point surface (test 11)
@@ -168,15 +170,15 @@ Single bbr flow, 4×BDP tail-drop, measured over [15,60] s.
 <!-- begin:bbr-op-point -->
 | rate Mbps | RTT ms | inflight ×BDP | queue delay / RTT | utilization |
 |---|---|---|---|---|
-| 10 | 10 | 1.48 | 38.6% | 93.8% |
-| 10 | 40 | 1.06 | 9.3% | 93.2% |
-| 10 | 150 | 1.11 | 16.7% | 93.3% |
-| 100 | 10 | 1.02 | 6.9% | 93.6% |
-| 100 | 40 | 0.98 | 4.3% | 93.3% |
-| 100 | 150 | 1.09 | 16.1% | 93.3% |
-| 500 | 10 | 1.01 | 7.3% | 93.7% |
-| 500 | 40 | 0.98 | 5.1% | 93.3% |
-| 500 | 150 | 1.08 | 15.6% | 93.0% |
+| 10 | 10 | 1.60 | 50.5% | 94.2% |
+| 10 | 40 | 1.07 | 9.5% | 93.4% |
+| 10 | 150 | 1.11 | 17.4% | 93.4% |
+| 100 | 10 | 1.02 | 7.1% | 93.6% |
+| 100 | 40 | 0.98 | 4.5% | 93.3% |
+| 100 | 150 | 1.10 | 16.8% | 93.3% |
+| 500 | 10 | 1.01 | 7.6% | 93.7% |
+| 500 | 40 | 0.99 | 5.3% | 93.4% |
+| 500 | 150 | 1.09 | 16.2% | 93.0% |
 <!-- end:bbr-op-point -->
 
 ### Late-joiner convergence (test 14)
@@ -191,7 +193,7 @@ convergence was an artifact of the non-conformant assignment-law cwnd
 adopting the draft's `BBRSetCwnd` (audit finding 2) slowed it to 60 s at
 this seed with huge seed variance (0–132 s), and the bound was
 provisionally pinned at 90 s. Fixing the rate-sample signals (audit
-finding 3: loss counted at RFC 6675 mark time instead of retransmit
+finding 3: loss counted at transport mark time instead of retransmit
 time, tx_in_flight-based probe gates scoped to probe-sent samples)
 restored fast reallocation: 8–13 s over seeds 34–37. The draft ProbeBW
 feedback machine (audit finding 4: exponential inflight_hi growth,
@@ -212,16 +214,17 @@ bandwidth sample, a known BBR trait.
 
 ### Coexistence surface (test 15)
 
-cubic vs bbr, 100 Mbps / 30 ms RTT, 60 s × 3 seeds, goodput over [20,60] s.
+cubic vs bbr, 100 Mbps / 30 ms RTT, one deterministic seed per depth,
+goodput over [20,60] s.
 
 <!-- begin:coexistence -->
 | buffer ×BDP | cubic Mbps | bbr Mbps | bbr share | aggregate |
 |---|---|---|---|---|
-| 0.25 | 27.1 | 67.6 | 71% | 94.7 |
-| 0.50 | 21.0 | 73.4 | 78% | 94.4 |
-| 1.00 | 21.0 | 74.4 | 78% | 95.4 |
-| 2.00 | 36.1 | 60.2 | 63% | 96.3 |
-| 4.00 | 41.6 | 54.9 | 57% | 96.5 |
-| 16.00 | 79.6 | 16.7 | 17% | 96.3 |
-| 64.00 | 78.2 | 13.1 | 14% | 91.2 |
+| 0.25 | 27.4 | 67.1 | 71% | 94.5 |
+| 0.50 | 23.0 | 72.0 | 76% | 95.0 |
+| 1.00 | 20.7 | 74.0 | 78% | 94.8 |
+| 2.00 | 36.1 | 60.3 | 63% | 96.4 |
+| 4.00 | 41.1 | 55.4 | 57% | 96.5 |
+| 16.00 | 71.9 | 24.6 | 26% | 96.5 |
+| 64.00 | 83.9 | 12.6 | 13% | 96.5 |
 <!-- end:coexistence -->

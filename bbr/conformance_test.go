@@ -59,7 +59,7 @@ func TestMaxBwFilterDecayTiming(t *testing.T) {
 	b.cycleStamp = f.now
 	b.probeWait = time.Hour
 	b.roundsSinceProbe = -1 << 30 // suppress the independent Reno-rounds trigger
-	b.minRTTStamp = f.now         // suppress an unrelated ProbeRTT interruption
+	b.probeRTTMinStamp = f.now    // suppress an unrelated ProbeRTT interruption
 
 	stepStart := f.now
 	for elapsed := time.Duration(0); elapsed < 1500*time.Millisecond; elapsed += 10 * time.Millisecond {
@@ -76,28 +76,36 @@ func TestMaxBwFilterDecayTiming(t *testing.T) {
 		f.now-stepStart, float64(b.maxBw())/1e6)
 }
 
-// The min_rtt filter is a windowed minimum over 4 x 2.5 s buckets: a stale
-// low sample must expire between 7.5 s and 10 s (bucket granularity) after
-// it stops recurring, and its expiry schedules ProbeRTT via minRTTStamp.
-func TestMinRTTWindowExpiryTiming(t *testing.T) {
+// Google keeps separate RTT filters: a five-second minimum schedules ProbeRTT,
+// while a ten-second minimum feeds the path model. Expiring the short filter
+// must not evict the longer-lived model early.
+func TestSeparateProbeRTTAndMinRTTWindows(t *testing.T) {
 	b, f := newTestBBR()
-	trace(b, f, 50e6, 20*time.Millisecond, 300*time.Millisecond)
+	f.now = 10 * time.Millisecond
+	b.updateMinRTT(tcp.SimRateSample{Now: f.now, RTT: 20 * time.Millisecond})
 	if b.minRTT != 20*time.Millisecond {
-		t.Fatalf("minRTT %v after low phase, want 20ms", b.minRTT)
+		t.Fatalf("minRTT %v after low sample, want 20ms", b.minRTT)
 	}
-	riseStart := f.now
-	var expiredAt time.Duration
-	for elapsed := time.Duration(0); elapsed < 12*time.Second; elapsed += 10 * time.Millisecond {
-		b.OnAck(steadySample(b, f, 50e6, 80*time.Millisecond, 10*time.Millisecond))
-		if expiredAt == 0 && b.minRTT >= 70*time.Millisecond {
-			expiredAt = f.now - riseStart
-			break
-		}
+	lowStamp := b.minRTTStamp
+
+	f.now = lowStamp + probeRTTInterval + time.Millisecond
+	b.updateMinRTT(tcp.SimRateSample{Now: f.now, RTT: 80 * time.Millisecond})
+	if !b.probeRTTExpired {
+		t.Fatal("five-second probe_rtt_min window did not expire")
 	}
-	t.Logf("20ms sample expired at +%v (bucketed window: expect (7.5s, 10s])", expiredAt)
-	if expiredAt < 7500*time.Millisecond || expiredAt > 10*time.Second+100*time.Millisecond {
-		t.Errorf("min_rtt expiry at +%v outside the 4x2.5s bucketed 10s window", expiredAt)
+	if b.probeRTTMin != 80*time.Millisecond {
+		t.Fatalf("probeRTTMin=%v after refresh, want 80ms", b.probeRTTMin)
 	}
+	if b.minRTT != 20*time.Millisecond {
+		t.Fatalf("five-second scheduler expiry replaced ten-second minRTT with %v", b.minRTT)
+	}
+
+	f.now = lowStamp + minRTTFilterLen + time.Millisecond
+	b.updateMinRTT(tcp.SimRateSample{Now: f.now, RTT: 80 * time.Millisecond})
+	if b.minRTT != 80*time.Millisecond {
+		t.Fatalf("expired ten-second minRTT=%v, want current probeRTTMin 80ms", b.minRTT)
+	}
+	t.Logf("probe scheduler refreshed at 5s; path-model minimum held for 10s")
 }
 
 // --- Test 5: ProbeBW cycle sequence and timing -------------------------------
@@ -188,7 +196,7 @@ func TestPacingRatePerPhaseExact(t *testing.T) {
 	rtt := 20 * time.Millisecond
 	trace(b, f, 100e6, rtt, 3*time.Second)
 	gains := map[int]float64{
-		StateProbeBWDown:   0.9,
+		StateProbeBWDown:   probeDownGain,
 		StateProbeBWCruise: 1.0,
 		StateProbeBWRefill: 1.0,
 		StateProbeBWUp:     1.25,
@@ -207,21 +215,23 @@ func TestPacingRatePerPhaseExact(t *testing.T) {
 		t.Logf("%s: pacing %.2f Mbps = %.2f * bw(%.2f Mbps) * 0.99", StateName(state),
 			float64(f.pacing)/1e6, gain, float64(b.bw())/1e6)
 	}
-	// cwnd gain in ProbeBW is 2.0: cwnd = 2*BDP + 2 MSS aggregation allowance.
+	// The ProbeBW target includes measured ACK aggregation and the reference
+	// quantization budget.
 	b.state = StateProbeBWCruise
 	b.inflightHi, b.inflightLo = math.MaxInt64, math.MaxInt64
+	wantCwnd := int(b.maxInflightBytes() / int64(mss))
 	b.setCwnd()
-	wantCwnd := int((b.bdpBytes(2.0) + 2*int64(mss)) / int64(mss))
 	if f.cwnd != wantCwnd {
-		t.Errorf("ProbeBW cwnd %d pkts, want %d (2*BDP + 2 MSS)", f.cwnd, wantCwnd)
+		t.Errorf("ProbeBW cwnd %d pkts, want max_inflight %d", f.cwnd, wantCwnd)
 	}
 }
 
 // --- Test 6: loss response arithmetic ----------------------------------------
 
-// betaCut applies the beta multiplier with runtime float semantics (a
-// constant expression would round differently than the code under test).
-func betaCut(v int64) int64 { return int64(beta * float64(v)) }
+// betaCut applies Google's BBR_UNIT-scaled loss remainder.
+func betaCut(v int64) int64 { return fixedMulFloor(v, betaNumerator) }
+
+func ecnCut(v int64) int64 { return int64((1 - ecnFactor) * float64(v)) }
 
 func TestLossResponseTable(t *testing.T) {
 	const maxI = int64(math.MaxInt64)
@@ -238,12 +248,13 @@ func TestLossResponseTable(t *testing.T) {
 	}{
 		{
 			// First loss: bw_lo initialized from max_bw then cut to
-			// max(latest, beta*bw_lo) = max(40, 0.7*100) = 70. inflight_lo
+			// max(latest, beta*bw_lo), using Google's rounded 180/256
+			// loss multiplier. inflight_lo
 			// initializes from the live 10-packet cwnd, exactly like
 			// bbr_init_lower_bounds, then is beta-cut.
 			name: "first-loss-beta-cut", state: StateProbeBWCruise,
 			bwLo: maxI, inflLo: maxI, latest: 40e6, latestI: 1_000, loss: true,
-			wantBw: 70e6, wantIn: betaCut(10 * int64(mss)),
+			wantBw: betaCut(100e6), wantIn: betaCut(10 * int64(mss)),
 		},
 		{
 			// Latest above the beta floor: bw_lo tracks latest, no deeper cut.
@@ -255,7 +266,7 @@ func TestLossResponseTable(t *testing.T) {
 			// Already-latched bounds cut again by beta (compounding rounds).
 			name: "latched-compounds", state: StateProbeBWCruise,
 			bwLo: 50e6, inflLo: 150_000, latest: 10e6, latestI: 10_000, loss: true,
-			wantBw: 35e6, wantIn: 105_000,
+			wantBw: betaCut(50e6), wantIn: betaCut(150_000),
 		},
 		{
 			// No cut while probing (REFILL): bounds untouched.
@@ -313,12 +324,16 @@ func TestProbeAbortSetsInflightHi(t *testing.T) {
 	if b.state != StateProbeBWDown {
 		t.Errorf("probe abort entered %s, want ProbeBW:DOWN", StateName(b.state))
 	}
-	target := float64(b.bdpBytes(1.0))
-	wantHi := int64(math.Max(float64(f.inflight), beta*target))
+	target := b.targetInflightBytes()
+	wantHi := fixedMulFloor(target, betaNumerator)
+	if f.inflight > wantHi {
+		wantHi = f.inflight
+	}
 	if b.inflightHi != wantHi {
 		t.Errorf("inflight_hi = %d, want %d (max(inflight, beta*BDP))", b.inflightHi, wantHi)
 	}
-	t.Logf("inflight_hi latched at %d (inflight=%d, beta*BDP=%.0f)", b.inflightHi, f.inflight, beta*target)
+	t.Logf("inflight_hi latched at %d (inflight=%d, beta*BDP=%d)",
+		b.inflightHi, f.inflight, fixedMulFloor(target, betaNumerator))
 }
 
 // An app-limited high-loss sample is not robust enough to lower inflight_hi,
@@ -473,7 +488,7 @@ func TestECNAndLossIndependentLowerBounds(t *testing.T) {
 	b.bwLo, b.inflightLo = 100e6, 300_000
 	b.adaptLowerBounds()
 	wantBw := betaCut(100e6)
-	wantIn := int64(float64(300_000) * (1 - ecnFactor))
+	wantIn := ecnCut(300_000)
 	if b.bwLo != wantBw {
 		t.Errorf("bw_lo = %d, want loss-only cut %d", b.bwLo, wantBw)
 	}
@@ -551,30 +566,31 @@ func TestStartupGainsAndDrain(t *testing.T) {
 	if b.state != StateStartup {
 		t.Fatalf("left startup too early")
 	}
-	// Pacing gain 2.77 and cwnd gain 2.0 while in startup.
+	// Google fixed-point Startup gain (710/256) and cwnd gain 2.0.
 	wantPacing := int64(startupPacingGain * float64(b.bw()) * (1 - pacingMargin))
 	if f.pacing != wantPacing {
-		t.Errorf("startup pacing %d, want %d (2.77 * bw * 0.99)", f.pacing, wantPacing)
+		t.Errorf("startup pacing %d, want %d (710/256 * bw * 0.99)", f.pacing, wantPacing)
 	}
 	// Pre-full-pipe cwnd grows by at most the acked data per ACK and is
-	// not snapped down to the model target (draft BBRSetCwnd), so it lands
-	// in [max_inflight, max_inflight + one ACK's worth).
-	target := int((b.bdpBytes(startupCwndGain) + 2*int64(mss)) / int64(mss))
+	// not snapped down to the model target (draft BBRSetCwnd). Since measured
+	// extra_acked can move that target on the same ACK, cwnd stays within one
+	// ACK of max_inflight rather than being assigned to it.
+	target := int(b.maxInflightBytes() / int64(mss))
 	ackPkts := int(rate/8*int64(10*time.Millisecond)/int64(time.Second))/mss + 1
-	if f.cwnd < target || f.cwnd > target+ackPkts {
-		t.Errorf("startup cwnd %d, want in [%d, %d] (2.0*BDP+2MSS, +1 ACK overshoot)",
-			f.cwnd, target, target+ackPkts)
+	if f.cwnd < target-ackPkts || f.cwnd > target+ackPkts {
+		t.Errorf("startup cwnd %d, want within one ACK of max_inflight [%d, %d]",
+			f.cwnd, target-ackPkts, target+ackPkts)
 	}
-	// Force the plateau exit; in Drain the pacing gain must be 1/2.77.
+	// Force the plateau exit; Drain uses Google's rounded 88/256 gain.
 	for i := 0; i < 12 && b.state == StateStartup; i++ {
 		trace(b, f, rate, rtt, rtt)
 	}
 	if b.state == StateDrain {
 		wantDrain := int64(drainPacingGain * float64(b.bw()) * (1 - pacingMargin))
 		if f.pacing != wantDrain {
-			t.Errorf("drain pacing %d, want %d (bw/2.77 * 0.99)", f.pacing, wantDrain)
+			t.Errorf("drain pacing %d, want %d (88/256 * bw * 0.99)", f.pacing, wantDrain)
 		}
-		t.Logf("drain pacing %.2f Mbps = bw(%.2f)/2.77 * 0.99", float64(f.pacing)/1e6, float64(b.bw())/1e6)
+		t.Logf("drain pacing %.2f Mbps = 88/256 * bw(%.2f) * 0.99", float64(f.pacing)/1e6, float64(b.bw())/1e6)
 	} else {
 		// Drain can complete within one OnAck when inflight is already at
 		// 1xBDP (trace holds it there); reaching ProbeBW is the accepted
@@ -605,7 +621,7 @@ func TestStartupExitOnLoss(t *testing.T) {
 	if b.inflightHi == math.MaxInt64 {
 		t.Fatal("loss-based startup exit did not initialize inflight_hi")
 	}
-	wantFloor := b.bdpBytesAt(1.0, b.maxBw()) + 2*int64(mss)
+	wantFloor := b.inflightBytesAt(1.0, b.maxBw())
 	if b.inflightHi < wantFloor || b.inflightHi < b.inflightLatest {
 		t.Fatalf("startup inflight_hi=%d below model/latest floors %d/%d",
 			b.inflightHi, wantFloor, b.inflightLatest)
@@ -741,7 +757,8 @@ func TestProbeRTTClampDurationAndRefresh(t *testing.T) {
 	rtt := 30 * time.Millisecond
 	trace(b, f, 50e6, rtt, 2*time.Second)
 
-	// Walk forward until ProbeRTT entry (min_rtt goes stale after 5s).
+	// Walk forward until the independent ProbeRTT scheduler goes stale.
+	scheduleStamp := b.probeRTTMinStamp
 	entered := time.Duration(0)
 	for elapsed := time.Duration(0); elapsed < 8*time.Second && entered == 0; elapsed += 10 * time.Millisecond {
 		b.OnAck(steadySample(b, f, 50e6, rtt, 10*time.Millisecond))
@@ -752,8 +769,8 @@ func TestProbeRTTClampDurationAndRefresh(t *testing.T) {
 	if entered == 0 {
 		t.Fatal("no ProbeRTT entry within 8s of steady min_rtt")
 	}
-	staleness := entered - b.minRTTStamp
-	t.Logf("ProbeRTT entered with min_rtt staleness %v (interval %v)", staleness, probeRTTInterval)
+	staleness := entered - scheduleStamp
+	t.Logf("ProbeRTT entered with probe_rtt_min staleness %v (interval %v)", staleness, probeRTTInterval)
 	if staleness < probeRTTInterval {
 		t.Errorf("entered ProbeRTT at staleness %v, before the %v interval", staleness, probeRTTInterval)
 	}
@@ -816,9 +833,13 @@ func TestProbeRTTClampDurationAndRefresh(t *testing.T) {
 	if b.minRTT != lowRTT {
 		t.Errorf("lower RTT sample during ProbeRTT not absorbed: min_rtt %v, want %v", b.minRTT, lowRTT)
 	}
-	// Exit reschedules the next probe: stamp refreshed at exit.
-	if exitAt-b.minRTTStamp > 50*time.Millisecond {
-		t.Errorf("minRTTStamp not refreshed at ProbeRTT exit (age %v)", exitAt-b.minRTTStamp)
+	if f.appLimitedMarks == 0 {
+		t.Fatal("ProbeRTT did not mark its low-rate samples application-limited")
+	}
+	// Exit reschedules the next probe without overwriting the independent
+	// ten-second min_rtt sample timestamp.
+	if exitAt-b.probeRTTMinStamp > 50*time.Millisecond {
+		t.Errorf("probeRTTMinStamp not refreshed at ProbeRTT exit (age %v)", exitAt-b.probeRTTMinStamp)
 	}
 }
 

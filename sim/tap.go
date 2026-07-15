@@ -20,6 +20,7 @@ func (s *Sim) fillSenderTap(f *flow, m *probe.FlowMetrics) {
 	m.Retransmits = info.RetransSegs
 	m.RTOs = info.RTOs
 	m.LossEvents = info.LossEvents
+	m.IdleRestarts = info.IdleRestarts
 	if info.HasCCProbe {
 		p := info.CCProbe
 		m.CCState = p.State

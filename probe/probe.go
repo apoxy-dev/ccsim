@@ -24,24 +24,26 @@ type FlowMetrics struct {
 	Retransmits   uint64
 	RTOs          uint64
 	LossEvents    uint64
+	IdleRestarts  uint64
 	CCState       int
 }
 
 // FlowSummary aggregates one flow over the whole run.
 type FlowSummary struct {
-	ID          int     `json:"id"`
-	CC          string  `json:"cc"`
-	GoodputMbps float64 `json:"goodput_mbps"`
-	SRTTMeanMs  float64 `json:"srtt_mean_ms"`
-	SRTTP95Ms   float64 `json:"srtt_p95_ms"`
-	SRTTMaxMs   float64 `json:"srtt_max_ms"`
-	Retransmits uint64  `json:"retransmits"`
-	RTOs        uint64  `json:"rtos"`
-	CwndCuts    int     `json:"cwnd_cuts"`
-	FCTCount    int     `json:"fct_count,omitempty"`
-	FCTP50Ms    float64 `json:"fct_p50_ms,omitempty"`
-	FCTP95Ms    float64 `json:"fct_p95_ms,omitempty"`
-	FCTP99Ms    float64 `json:"fct_p99_ms,omitempty"`
+	ID           int     `json:"id"`
+	CC           string  `json:"cc"`
+	GoodputMbps  float64 `json:"goodput_mbps"`
+	SRTTMeanMs   float64 `json:"srtt_mean_ms"`
+	SRTTP95Ms    float64 `json:"srtt_p95_ms"`
+	SRTTMaxMs    float64 `json:"srtt_max_ms"`
+	Retransmits  uint64  `json:"retransmits"`
+	RTOs         uint64  `json:"rtos"`
+	IdleRestarts uint64  `json:"idle_restarts,omitempty"`
+	CwndCuts     int     `json:"cwnd_cuts"`
+	FCTCount     int     `json:"fct_count,omitempty"`
+	FCTP50Ms     float64 `json:"fct_p50_ms,omitempty"`
+	FCTP95Ms     float64 `json:"fct_p95_ms,omitempty"`
+	FCTP99Ms     float64 `json:"fct_p99_ms,omitempty"`
 }
 
 // RunSummary aggregates a whole run.
@@ -55,22 +57,23 @@ type RunSummary struct {
 }
 
 type flowState struct {
-	cc        string
-	srtts     []float64 // ms
-	fcts      []float64 // ms
-	appBytes  uint64
-	prevCwnd  float64
-	prevRetr  uint64
-	prevRTOs  uint64
-	prevLoss  uint64
-	prevState int
-	cwndCuts  int
-	retrans   uint64
-	rtos      uint64
-	started   bool
-	lastAcked uint64
-	firstTick time.Duration
-	lastTick  time.Duration
+	cc           string
+	srtts        []float64 // ms
+	fcts         []float64 // ms
+	appBytes     uint64
+	prevCwnd     float64
+	prevRetr     uint64
+	prevRTOs     uint64
+	prevLoss     uint64
+	prevState    int
+	cwndCuts     int
+	retrans      uint64
+	rtos         uint64
+	idleRestarts uint64
+	started      bool
+	lastAcked    uint64
+	firstTick    time.Duration
+	lastTick     time.Duration
 }
 
 // Recorder writes the sample stream and maintains run summary accumulators.
@@ -158,6 +161,7 @@ func (r *Recorder) OnFlowSample(t time.Duration, id int, m FlowMetrics) {
 	f.prevState = m.CCState
 	f.retrans = m.Retransmits
 	f.rtos = m.RTOs
+	f.idleRestarts = m.IdleRestarts
 	f.started = true
 	f.lastAcked = m.BytesAcked
 }
@@ -316,7 +320,7 @@ func (r *Recorder) Summary(dur time.Duration) RunSummary {
 	}
 	for i := range r.flows {
 		f := &r.flows[i]
-		fs := FlowSummary{ID: i, CC: f.cc, Retransmits: f.retrans, RTOs: f.rtos, CwndCuts: f.cwndCuts}
+		fs := FlowSummary{ID: i, CC: f.cc, Retransmits: f.retrans, RTOs: f.rtos, IdleRestarts: f.idleRestarts, CwndCuts: f.cwndCuts}
 		active := f.lastTick - f.firstTick
 		if active > 0 {
 			fs.GoodputMbps = float64(f.appBytes) * 8 / active.Seconds() / 1e6

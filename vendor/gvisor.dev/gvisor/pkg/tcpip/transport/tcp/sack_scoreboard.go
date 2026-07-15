@@ -24,11 +24,6 @@ import (
 )
 
 const (
-	// maxSACKBlocks is the maximum number of distinct SACKBlocks the
-	// scoreboard will track. Once there are 100 distinct blocks, new
-	// insertions will fail.
-	maxSACKBlocks = 100
-
 	// defaultBtreeDegree is set to 2 as btree.New(2) results in a 2-3-4
 	// tree.
 	defaultBtreeDegree = 2
@@ -72,12 +67,13 @@ func (s *SACKScoreboard) Reset() {
 	s.sacked = 0
 }
 
-// Insert inserts/merges the provided SACKBlock into the scoreboard.
+// Insert inserts/merges the provided SACKBlock into the scoreboard. Keep the
+// complete set of valid in-flight ranges: RACK uses absence from this
+// scoreboard as evidence that a segment was not delivered. The simulator's
+// send/receive windows already bound the number of ranges, while silently
+// dropping new ranges at the old gVisor limit of 100 creates false RACK losses
+// in large, sparse recovery flights.
 func (s *SACKScoreboard) Insert(r header.SACKBlock) {
-	if s.ranges.Len() >= maxSACKBlocks {
-		return
-	}
-
 	// Check if we can merge the new range with a range before or after it.
 	var toDelete []header.SACKBlock
 	if s.maxSACKED.LessThan(r.End - 1) {

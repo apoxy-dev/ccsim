@@ -10,15 +10,16 @@ import (
 
 // fakeSender drives BBR without netstack.
 type fakeSender struct {
-	now      time.Duration
-	mss      int
-	cwnd     int
-	ssthresh int
-	pacing   int64
-	inflight int64
-	srtt     time.Duration
-	ecnLow   bool
-	recovery bool
+	now             time.Duration
+	mss             int
+	cwnd            int
+	ssthresh        int
+	pacing          int64
+	inflight        int64
+	srtt            time.Duration
+	ecnLow          bool
+	recovery        bool
+	appLimitedMarks int
 }
 
 func (f *fakeSender) MSS() int                 { return f.mss }
@@ -33,6 +34,7 @@ func (f *fakeSender) LocalPort() uint16        { return 40001 }
 func (f *fakeSender) SetSsthresh(v int)        { f.ssthresh = v }
 func (f *fakeSender) Seed() uint64             { return 42 }
 func (f *fakeSender) ECNLowLatency() bool      { return f.ecnLow }
+func (f *fakeSender) MarkAppLimited()          { f.appLimitedMarks++ }
 
 const mss = 1448
 
@@ -91,6 +93,42 @@ func TestStartupExitOnPlateau(t *testing.T) {
 	}
 	if !b.filledPipe {
 		t.Fatal("filledPipe not set")
+	}
+}
+
+func TestInvalidRecoverySamplesDoNotAdvanceRound(t *testing.T) {
+	b, f := newTestBBR()
+	b.nextRoundDelivered = 10_000
+	b.fullBw = 10e6
+	b.fullBwCount = 2
+	b.lastSample.Delivered = 20_000
+
+	// Linux sets interval_us=-1 for an ambiguous retransmission sample whose
+	// interval is shorter than min_rtt. The Go transport represents that as a
+	// zero Interval while retaining the packet's prior-delivered metadata.
+	for i := 0; i < 4; i++ {
+		f.now += time.Millisecond
+		b.OnAck(tcp.SimRateSample{
+			Now:             f.now,
+			AckedBytes:      mss,
+			Delivered:       b.lastSample.Delivered + mss,
+			DeliveredBytes:  mss,
+			PriorDelivered:  20_000 + int64(i*mss),
+			DeliveryRateBps: 0,
+			Interval:        0,
+			IsRetrans:       true,
+		})
+	}
+
+	if b.roundStart {
+		t.Fatal("invalid retransmission sample started a packet-timed round")
+	}
+	if b.roundCount != 0 {
+		t.Fatalf("invalid retransmission samples advanced %d rounds, want 0", b.roundCount)
+	}
+	if b.fullBwCount != 2 || b.filledPipe {
+		t.Fatalf("invalid samples changed full-bw detector: count=%d filled=%v, want 2/false",
+			b.fullBwCount, b.filledPipe)
 	}
 }
 
@@ -248,9 +286,9 @@ func TestPacingGainsPerState(t *testing.T) {
 		state int
 		gain  float64
 	}{
-		{StateStartup, 2.77},
-		{StateDrain, 1.0 / 2.77},
-		{StateProbeBWDown, 0.9},
+		{StateStartup, startupPacingGain},
+		{StateDrain, drainPacingGain},
+		{StateProbeBWDown, probeDownGain},
 		{StateProbeBWCruise, 1.0},
 		{StateProbeBWRefill, 1.0},
 		{StateProbeBWUp, 1.25},
@@ -275,6 +313,170 @@ func TestPacingGainsPerState(t *testing.T) {
 	b.state = StateProbeBWCruise
 	if g := b.cwndGain(); g != probeBWCwndGain {
 		t.Errorf("ProbeBW:CRUISE cwnd gain %v, want %v", g, probeBWCwndGain)
+	}
+}
+
+func TestGoogleFixedPointConstants(t *testing.T) {
+	cases := []struct {
+		name      string
+		got, want float64
+	}{
+		{"startup", startupPacingGain, 710.0 / 256.0},
+		{"drain", drainPacingGain, 88.0 / 256.0},
+		{"down", probeDownGain, 232.0 / 256.0},
+		{"loss multiplier", beta, 180.0 / 256.0},
+		{"loss threshold", lossThresh, 5.0 / 256.0},
+		{"usable headroom", headroom, 218.0 / 256.0},
+		{"ECN factor", ecnFactor, 85.0 / 256.0},
+	}
+	for _, c := range cases {
+		if c.got != c.want {
+			t.Errorf("%s=%v, want exact fixed-point value %v", c.name, c.got, c.want)
+		}
+	}
+
+	// Google subtracts floor(38*v/256) for headroom. At this boundary that
+	// yields 219, while floor(218*v/256) would incorrectly yield 218.
+	b, _ := newTestBBR()
+	b.inflightHi = 257
+	if got := b.inflightWithHeadroom(); got != 219 {
+		t.Errorf("fixed-point headroom(257)=%d, want 219", got)
+	}
+	if got := fixedMulFloor(257, lossThreshNumerator); got != 5 {
+		t.Errorf("fixed-point loss threshold(257)=%d, want 5", got)
+	}
+}
+
+func TestAckAggregationAndQuantizationBudget(t *testing.T) {
+	b, f := newTestBBR()
+	b.filledPipe = true
+	b.state = StateProbeBWCruise
+	b.maxBwFilter[0] = 100e6
+	b.minRTT = 40 * time.Millisecond
+	b.cwnd = 400 * int64(mss)
+	f.cwnd = 400
+
+	// At 100 Mbps, 10 ms accounts for 125000 expected bytes. Starting with
+	// 200000 bytes in the epoch and ACKing another 50000 leaves 125000 bytes
+	// of measured aggregation.
+	b.ackEpochStart = 0
+	b.ackEpochAcked = 200_000
+	f.now = 10 * time.Millisecond
+	b.updateAckAggregation(tcp.SimRateSample{
+		Now: f.now, AckedBytes: 50_000, PriorDelivered: 1, Interval: 10 * time.Millisecond,
+	})
+	if got := b.maxExtraAcked(); got != 125_000 {
+		t.Fatalf("extra_acked=%d, want 125000", got)
+	}
+
+	b.extraAcked = [2]int64{}
+	withoutAggregation := b.maxInflightBytes()
+	b.extraAcked[0] = 10 * int64(mss)
+	withAggregation := b.maxInflightBytes()
+	if got := withAggregation - withoutAggregation; got != 10*int64(mss) {
+		t.Fatalf("ACK aggregation raised max_inflight by %d, want %d", got, 10*mss)
+	}
+
+	base := 100 * int64(mss)
+	b.state = StateProbeBWCruise
+	if got := b.quantizationBudget(base); got != base {
+		t.Fatalf("CRUISE quantization=%d, want unchanged %d", got, base)
+	}
+	b.state = StateProbeBWUp
+	if got := b.quantizationBudget(base); got != base+2*int64(mss) {
+		t.Fatalf("UP quantization=%d, want base+2MSS=%d", got, base+2*int64(mss))
+	}
+
+	b.state = StateProbeBWCruise
+	b.minRTT = 13 * time.Millisecond
+	if got := b.bdpBytesAt(1, 7e6); got != 8*int64(mss) {
+		t.Fatalf("rounded BDP=%d, want 8 packets=%d", got, 8*mss)
+	}
+}
+
+func TestIdleRestartResetsEpochAndUsesCruisePacing(t *testing.T) {
+	b, f := newTestBBR()
+	b.filledPipe = true
+	b.state = StateProbeBWUp
+	b.maxBwFilter[0] = 100e6
+	b.ackEpochStart = time.Second
+	b.ackEpochAcked = 12345
+	f.now = 5 * time.Second
+
+	b.HandleRestartFromIdle()
+	if !b.idleRestart {
+		t.Fatal("idleRestart not latched")
+	}
+	if b.ackEpochStart != f.now || b.ackEpochAcked != 0 {
+		t.Fatalf("ACK epoch not reset: start=%v acked=%d", b.ackEpochStart, b.ackEpochAcked)
+	}
+	wantPacing := int64(float64(100e6) * (1 - pacingMargin))
+	if f.pacing != wantPacing {
+		t.Fatalf("idle restart pacing=%d, want gain-1 pacing %d", f.pacing, wantPacing)
+	}
+
+	// The first delivered sample is processed with idleRestart still set, then
+	// clears the latch for subsequent ACKs.
+	f.now += 10 * time.Millisecond
+	b.OnAck(tcp.SimRateSample{
+		Now: f.now, AckedBytes: mss, Delivered: mss, DeliveredBytes: mss,
+		PriorDelivered: 0, DeliveryRateBps: 100e6, RTT: 40 * time.Millisecond,
+		Interval: 10 * time.Millisecond,
+	})
+	if b.idleRestart {
+		t.Fatal("idleRestart survived the first delivered ACK")
+	}
+}
+
+func TestIdleRestartCanCompleteProbeRTTBeforeTransmit(t *testing.T) {
+	b, f := newTestBBR()
+	b.filledPipe = true
+	b.state = StateProbeRTT
+	b.maxBwFilter[0] = 100e6
+	b.cwnd = 4 * int64(mss)
+	b.priorCwnd = 30 * int64(mss)
+	f.cwnd = 4
+	f.now = time.Second
+	b.probeRTTDone = f.now - time.Millisecond
+
+	b.HandleRestartFromIdle()
+	if b.state != StateProbeBWCruise {
+		t.Fatalf("idle restart left state=%s, want ProbeBW:CRUISE", StateName(b.state))
+	}
+	if f.cwnd != 30 {
+		t.Fatalf("idle ProbeRTT exit restored cwnd=%d, want 30", f.cwnd)
+	}
+}
+
+func TestIdleRestartRefreshesExpiredProbeRTTWindow(t *testing.T) {
+	b, f := newTestBBR()
+	b.filledPipe = true
+	b.state = StateProbeBWCruise
+	b.maxBwFilter[0] = 100e6
+	b.minRTT = 30 * time.Millisecond
+	b.probeRTTMin = 30 * time.Millisecond
+	b.minRTTStamp = 0
+	b.probeRTTMinStamp = 0
+	b.cycleStamp = 6 * time.Second
+	b.probeWait = time.Hour
+	b.roundsSinceProbe = -1 << 30
+	b.idleRestart = true
+	f.now = 6 * time.Second
+
+	b.OnAck(tcp.SimRateSample{
+		Now: f.now, AckedBytes: mss, Delivered: mss, DeliveredBytes: mss,
+		PriorDelivered: 0, DeliveryRateBps: 100e6, RTT: 35 * time.Millisecond,
+		Interval: 10 * time.Millisecond,
+	})
+	if b.state == StateProbeRTT {
+		t.Fatal("idle restart entered ProbeRTT instead of using the naturally drained RTT sample")
+	}
+	if b.probeRTTMin != 35*time.Millisecond || b.probeRTTMinStamp != f.now {
+		t.Fatalf("probe_rtt_min refresh=%v at %v, want 35ms at %v",
+			b.probeRTTMin, b.probeRTTMinStamp, f.now)
+	}
+	if b.idleRestart {
+		t.Fatal("idle restart latch did not clear after delivered ACK")
 	}
 }
 

@@ -61,6 +61,18 @@ type SimRateSample struct {
 	DeliveryRateBps int64
 	// RTT is the sample RTT (ack time - send time of the sample segment).
 	RTT time.Duration
+	// IsAckDelayed reports that this ACK appears to cover a receiver-delayed
+	// multi-segment acknowledgment. BBR avoids using such a sample to restart
+	// an expired ProbeRTT scheduling window.
+	IsAckDelayed bool
+	// IsRetrans is true when the rate sample is anchored at a retransmitted
+	// segment. Linux keeps these delivery samples (they are essential during
+	// prolonged recovery) but does not use them as unambiguous RTT samples.
+	IsRetrans bool
+	// IsAckingTLPRetransmit reports that this ACK covers the sequence repaired
+	// by a tail-loss-probe retransmission. BBR keeps the latest delivery-signal
+	// filter across this boundary so the pre-tail flight remains observable.
+	IsAckingTLPRetransmit bool
 	// Interval is the sample interval used for the rate computation.
 	Interval time.Duration
 	// IsAppLimited marks samples taken while the sender was app-limited.
@@ -80,9 +92,8 @@ type SimRateSample struct {
 	// this ACK (the draft's RS.lost = C.lost - P.lost).
 	LostBytes int64
 	// LostBytesCum is the cumulative marked-lost byte count (C.lost).
-	// Loss is counted when the RFC 6675 scoreboard first implies a
-	// sequence range is lost (mark time), or when an RTO fires, not when
-	// data is retransmitted.
+	// Loss is counted when RACK or the RFC 6675 fallback first marks a
+	// sequence range lost, or when an RTO fires, not when data is retransmitted.
 	LostBytesCum int64
 	// IsCwndLimited reports whether the most recent send attempt ended
 	// with the congestion window fully utilized.
@@ -170,6 +181,15 @@ var SimECNLowLatency bool
 // and the route is explicitly configured for shallow-threshold ECN.
 func (h SimSender) ECNLowLatency() bool { return SimECNLowLatency }
 
+// MarkAppLimited marks packets sent from this ACK onward as application-
+// limited until the current delivery bubble has left the pipe. ProbeRTT uses
+// this to keep its intentionally low-rate samples out of the bandwidth model.
+func (h SimSender) MarkAppLimited() {
+	st := &h.s.ccsim
+	st.appLimited = true
+	st.appLimitedSeq = h.s.SndNxt
+}
+
 // SimCC is the extended congestion control interface for registered CCs.
 // It embeds the four upstream congestionControl methods plus the ccsim
 // extensions.
@@ -204,6 +224,30 @@ type SimCCWithProbe interface {
 // after the transport's Eifel logic proves a recovery episode spurious.
 type SimCCWithUndo interface {
 	UndoRecovery()
+}
+
+// SimCCWithIdleRestart is implemented by controllers that preserve and adapt
+// their model when an application-limited connection starts a new flight from
+// an empty pipe. The sender invokes it before applying generic RFC 5681 idle
+// cwnd restart behavior.
+type SimCCWithIdleRestart interface {
+	HandleRestartFromIdle()
+}
+
+// SimLossProbeRecovery describes a TLP retransmission that repaired a loss.
+// LostBytesCum includes this loss and IsAppLimited describes the original
+// transmission, rather than the probe copy.
+type SimLossProbeRecovery struct {
+	LostBytes    int64
+	LostBytesCum int64
+	IsAppLimited bool
+}
+
+// SimCCWithLossProbeRecovery is implemented by controllers with a dedicated
+// response to loss recovered by a tail-loss probe. Google BBRv3 consumes the
+// equivalent Linux CA_EVENT_TLP_RECOVERY event.
+type SimCCWithLossProbeRecovery interface {
+	HandleLossProbeRecovery(SimLossProbeRecovery)
 }
 
 var simCCRegistry = map[string]func(SimSender) SimCC{}
@@ -249,9 +293,15 @@ type ccsimSenderState struct {
 	firstSent     tcpip.MonotonicTime
 	appLimitedSeq seqnum.Value // app-limited until this sequence is acked
 	appLimited    bool
+	// idleRestartEligible remembers that the application exhausted its send
+	// queue even after the final packet of that limited flight is ACKed.
+	idleRestartEligible bool
+	// idleRestartNotified prevents repeated TX_START notifications when pacing
+	// causes sendData to revisit the same not-yet-acknowledged restart flight.
+	idleRestartNotified bool
 
-	// lostCum is the cumulative marked-lost byte count (the draft's
-	// C.lost), fed by the RFC 6675 scoreboard walk and the RTO path.
+	// lostCum is the cumulative marked-lost byte count (the draft's C.lost),
+	// fed by RACK, the RFC 6675 fallback, TLP recovery, and the RTO path.
 	lostCum int64
 	// cwndLimited records whether the last sendData pass ended with the
 	// window fully used (the draft's C.is_cwnd_limited).
@@ -261,24 +311,48 @@ type ccsimSenderState struct {
 	// byte sums (index i holds the total SACKed bytes in ranges[i:]).
 	pipeRanges   []header.SACKBlock `state:"nosave"`
 	pipeSufBytes []seqnum.Size      `state:"nosave"`
+	// rackPipe is the incrementally maintained number of transmissions that
+	// RACK still considers in flight. Linux maintains the equivalent from its
+	// packets_out/sacked_out/lost_out/retrans_out counters; keeping it here
+	// avoids an O(cwnd) RFC 6675 scoreboard walk on every ACK while a flow is
+	// in prolonged RACK recovery.
+	rackPipe int
+	// rackSent is RACK's transmit-time-ordered queue, equivalent to Linux's
+	// tsorted_sent_queue. rackLost is the sequence-ordered set of marked
+	// repairs awaiting transmission. Both are intrusive so ACK/loss/send
+	// updates are O(1) in the common case and hold no extra segment refs.
+	rackSentHead *segment `state:"nosave"`
+	rackSentTail *segment `state:"nosave"`
+	rackLostHead *segment `state:"nosave"`
+	rackLostTail *segment `state:"nosave"`
 
 	// Scratch captured by ccsimPreAck for ccsimPostAck.
 	scratchAcked     int64
 	scratchHasSample bool
+	scratchAckingTLP bool
 	scratchSeg       struct {
 		delivered     int64
 		deliveredTime tcpip.MonotonicTime
 		firstSent     tcpip.MonotonicTime
 		xmitTime      tcpip.MonotonicTime
 		appLimited    bool
+		isRetrans     bool
 		txInflight    int64
 		lostAtTx      int64
 		deliveredCE   int64
 	}
 
 	// recoveryResendPending remembers an initial fast retransmit deferred by
-	// pacing so the pacing timer can resume the RFC 6675 recovery walk.
+	// pacing so the pacing timer can resume the active recovery walk.
 	recoveryResendPending bool
+	// rackRecoveryPending remembers that RACK's marked-loss walk stopped at
+	// the pacing or cwnd gate. tlpProbePending does the same for a tail-loss
+	// probe stopped at pacing.
+	rackRecoveryPending bool
+	tlpProbePending     bool
+	// tlpOrigAppLimited is the app-limited state of the original tail segment;
+	// retransmitting it stamps the segment with the probe's current state.
+	tlpOrigAppLimited bool
 }
 
 // ccsimSegState is embedded in segment (one added field upstream).
@@ -297,6 +371,16 @@ type ccsimSegState struct {
 	// lostCounted is set once this segment has been tallied into lostCum;
 	// cleared on (re)transmit so a lost retransmission is counted again.
 	lostCounted bool
+	// rackPipeCopies is the number of live transmissions of this sequence
+	// range. It is normally zero or one, and can briefly be two when a TLP
+	// probe retransmits a tail whose original copy is not yet known lost.
+	rackPipeCopies int
+	rackSentPrev   *segment
+	rackSentNext   *segment
+	rackSentQueued bool
+	rackLostPrev   *segment
+	rackLostNext   *segment
+	rackLostQueued bool
 }
 
 // ccsimWrapper wraps the active CC.
@@ -306,10 +390,11 @@ type ccsimWrapper struct {
 	sim       SimCC // non-nil if inner is a registered SimCC
 	pacingBps int64
 
-	lossEvents  uint64
-	rtoCount    uint64
-	lastECECut  tcpip.MonotonicTime
-	deliveryBps int64
+	lossEvents   uint64
+	rtoCount     uint64
+	idleRestarts uint64
+	lastECECut   tcpip.MonotonicTime
+	deliveryBps  int64
 }
 
 var _ congestionControl = (*ccsimWrapper)(nil)
@@ -388,6 +473,171 @@ func (s *sender) ccsimInitTimers(ep *Endpoint) {
 	}))
 }
 
+func rackSegmentEnd(seg *segment) seqnum.Value {
+	return seg.sequenceNumber.Add(seqnum.Size(seg.payloadSize()))
+}
+
+func (s *sender) ccsimRACKUnlinkSent(seg *segment) {
+	if !seg.ccsim.rackSentQueued {
+		return
+	}
+	prev, next := seg.ccsim.rackSentPrev, seg.ccsim.rackSentNext
+	if prev != nil {
+		prev.ccsim.rackSentNext = next
+	} else {
+		s.ccsim.rackSentHead = next
+	}
+	if next != nil {
+		next.ccsim.rackSentPrev = prev
+	} else {
+		s.ccsim.rackSentTail = prev
+	}
+	seg.ccsim.rackSentPrev = nil
+	seg.ccsim.rackSentNext = nil
+	seg.ccsim.rackSentQueued = false
+}
+
+// ccsimRACKInsertSent inserts seg by (last transmit time, ending sequence),
+// the RFC 8985 ordering used to break equal-clock-tick ties.
+func (s *sender) ccsimRACKInsertSent(seg *segment) {
+	if seg.ccsim.rackSentQueued {
+		return
+	}
+	end := rackSegmentEnd(seg)
+	prev := s.ccsim.rackSentTail
+	for prev != nil && (seg.xmitTime.Before(prev.xmitTime) ||
+		(seg.xmitTime == prev.xmitTime && end.LessThan(rackSegmentEnd(prev)))) {
+		prev = prev.ccsim.rackSentPrev
+	}
+	if prev == nil {
+		next := s.ccsim.rackSentHead
+		seg.ccsim.rackSentNext = next
+		if next != nil {
+			next.ccsim.rackSentPrev = seg
+		} else {
+			s.ccsim.rackSentTail = seg
+		}
+		s.ccsim.rackSentHead = seg
+	} else {
+		next := prev.ccsim.rackSentNext
+		seg.ccsim.rackSentPrev = prev
+		seg.ccsim.rackSentNext = next
+		prev.ccsim.rackSentNext = seg
+		if next != nil {
+			next.ccsim.rackSentPrev = seg
+		} else {
+			s.ccsim.rackSentTail = seg
+		}
+	}
+	seg.ccsim.rackSentQueued = true
+}
+
+func (s *sender) ccsimRACKUnlinkLost(seg *segment) {
+	if !seg.ccsim.rackLostQueued {
+		return
+	}
+	prev, next := seg.ccsim.rackLostPrev, seg.ccsim.rackLostNext
+	if prev != nil {
+		prev.ccsim.rackLostNext = next
+	} else {
+		s.ccsim.rackLostHead = next
+	}
+	if next != nil {
+		next.ccsim.rackLostPrev = prev
+	} else {
+		s.ccsim.rackLostTail = prev
+	}
+	seg.ccsim.rackLostPrev = nil
+	seg.ccsim.rackLostNext = nil
+	seg.ccsim.rackLostQueued = false
+}
+
+// ccsimRACKInsertLost keeps marked repairs in TCP sequence order, preserving
+// the ordering of the original writeList recovery walk.
+func (s *sender) ccsimRACKInsertLost(seg *segment) {
+	if seg.ccsim.rackLostQueued {
+		return
+	}
+	prev := s.ccsim.rackLostTail
+	for prev != nil && seg.sequenceNumber.LessThan(prev.sequenceNumber) {
+		prev = prev.ccsim.rackLostPrev
+	}
+	if prev == nil {
+		next := s.ccsim.rackLostHead
+		seg.ccsim.rackLostNext = next
+		if next != nil {
+			next.ccsim.rackLostPrev = seg
+		} else {
+			s.ccsim.rackLostTail = seg
+		}
+		s.ccsim.rackLostHead = seg
+	} else {
+		next := prev.ccsim.rackLostNext
+		seg.ccsim.rackLostPrev = prev
+		seg.ccsim.rackLostNext = next
+		prev.ccsim.rackLostNext = seg
+		if next != nil {
+			next.ccsim.rackLostPrev = seg
+		} else {
+			s.ccsim.rackLostTail = seg
+		}
+	}
+	seg.ccsim.rackLostQueued = true
+}
+
+func (s *sender) ccsimRACKTrackTransmit(seg *segment) {
+	if s.ep.tcpRecovery&tcpip.TCPRACKLossDetection == 0 {
+		return
+	}
+	// A retransmission supersedes the prior RACK timestamp and consumes a
+	// pending repair. Move the segment to the tail of the transmit-time queue.
+	s.ccsimRACKUnlinkLost(seg)
+	s.ccsimRACKUnlinkSent(seg)
+	s.ccsimRACKInsertSent(seg)
+}
+
+// ccsimRACKSplitSegment transfers intrusive queue membership and live packet
+// counts when netstack splits an already-transmitted GSO segment.
+func (s *sender) ccsimRACKSplitSegment(seg, suffix *segment, oldPayload int) {
+	if s.ep.tcpRecovery&tcpip.TCPRACKLossDetection == 0 {
+		return
+	}
+	wasSent := seg.ccsim.rackSentQueued
+	wasLost := seg.ccsim.rackLostQueued
+	if wasSent {
+		s.ccsimRACKUnlinkSent(seg)
+	}
+	if wasLost {
+		s.ccsimRACKUnlinkLost(seg)
+	}
+	// clone copied the intrusive links and membership flags; suffix was never
+	// actually linked, so clear those copies before inserting it.
+	suffix.ccsim.rackSentPrev = nil
+	suffix.ccsim.rackSentNext = nil
+	suffix.ccsim.rackSentQueued = false
+	suffix.ccsim.rackLostPrev = nil
+	suffix.ccsim.rackLostNext = nil
+	suffix.ccsim.rackLostQueued = false
+
+	copies := seg.ccsim.rackPipeCopies
+	suffix.ccsim.rackPipeCopies = 0
+	if copies > 0 && oldPayload > 0 {
+		oldPackets := (oldPayload-1)/s.MaxPayloadSize + 1
+		firstPackets := s.pCount(seg, s.MaxPayloadSize)
+		firstCopies := copies * firstPackets / oldPackets
+		seg.ccsim.rackPipeCopies = firstCopies
+		suffix.ccsim.rackPipeCopies = copies - firstCopies
+	}
+	if wasSent {
+		s.ccsimRACKInsertSent(seg)
+		s.ccsimRACKInsertSent(suffix)
+	}
+	if wasLost {
+		s.ccsimRACKInsertLost(seg)
+		s.ccsimRACKInsertLost(suffix)
+	}
+}
+
 // ccsimStampSegment stamps per-segment delivery-rate state at transmit time.
 // Called from sendSegment after xmitTime is set.
 func (s *sender) ccsimStampSegment(seg *segment) {
@@ -406,15 +656,69 @@ func (s *sender) ccsimStampSegment(seg *segment) {
 	seg.ccsim.firstSent = st.firstSent
 	seg.ccsim.appLimited = st.appLimited
 	seg.ccsim.counted = false
-	// P.tx_in_flight: s.Outstanding does not yet include a first
-	// transmission (sendData increments it after sendSegment) and is the
-	// RFC 6675 pipe during recovery, so add this segment explicitly.
-	seg.ccsim.txInflight = int64(s.Outstanding)*int64(s.MaxPayloadSize) + int64(seg.payloadSize())
+	// P.tx_in_flight: neither counter includes this transmission yet. Under
+	// RACK use the incremental Linux-style pipe counter; classic SACK recovery
+	// continues to use RFC 6675's SetPipe result in s.Outstanding.
+	pipe := s.Outstanding
+	if s.ep.tcpRecovery&tcpip.TCPRACKLossDetection != 0 {
+		pipe = st.rackPipe
+	}
+	seg.ccsim.txInflight = int64(pipe)*int64(s.MaxPayloadSize) + int64(seg.payloadSize())
 	seg.ccsim.lostAtTx = st.lostCum
 	// A fresh (re)transmission supersedes any earlier lost mark; if this
 	// copy is lost too the scoreboard walk counts it again.
 	seg.ccsim.lostCounted = false
+	if s.ep.tcpRecovery&tcpip.TCPRACKLossDetection != 0 {
+		s.ccsimRACKTrackTransmit(seg)
+		packets := s.pCount(seg, s.MaxPayloadSize)
+		seg.ccsim.rackPipeCopies += packets
+		st.rackPipe += packets
+	}
 	st.firstSent = now
+}
+
+// ccsimRACKAcknowledge removes every live copy of a fully acknowledged
+// sequence range from RACK's incremental pipe counter. ccsimPreAck calls this
+// before upstream ACK processing can remove the segment from writeList.
+func (s *sender) ccsimRACKAcknowledge(seg *segment) {
+	if s.ep.tcpRecovery&tcpip.TCPRACKLossDetection == 0 {
+		return
+	}
+	s.ccsimRACKUnlinkSent(seg)
+	s.ccsimRACKUnlinkLost(seg)
+	seg.lost = false
+	if seg.ccsim.rackPipeCopies == 0 {
+		return
+	}
+	s.ccsim.rackPipe -= seg.ccsim.rackPipeCopies
+	seg.ccsim.rackPipeCopies = 0
+	if s.ccsim.rackPipe < 0 {
+		panic("ccsim: negative RACK pipe after ACK")
+	}
+}
+
+// ccsimRACKMarkLost removes the most recent live transmission of seg from
+// RACK's pipe. A later repair is added back by ccsimStampSegment.
+func (s *sender) ccsimRACKMarkLost(seg *segment) {
+	if s.ep.tcpRecovery&tcpip.TCPRACKLossDetection == 0 {
+		return
+	}
+	s.ccsimRACKUnlinkSent(seg)
+	if seg.lost && !seg.ccsim.counted {
+		s.ccsimRACKInsertLost(seg)
+	}
+	if seg.ccsim.rackPipeCopies == 0 {
+		return
+	}
+	packets := s.pCount(seg, s.MaxPayloadSize)
+	if packets > seg.ccsim.rackPipeCopies {
+		packets = seg.ccsim.rackPipeCopies
+	}
+	seg.ccsim.rackPipeCopies -= packets
+	s.ccsim.rackPipe -= packets
+	if s.ccsim.rackPipe < 0 {
+		panic("ccsim: negative RACK pipe after loss")
+	}
 }
 
 // ccsimMarkAppLimited is called at the end of sendData: if the sender ran
@@ -424,8 +728,35 @@ func (s *sender) ccsimMarkAppLimited() {
 	if s.writeNext == nil && s.Outstanding < s.SndCwnd && s.SndUna != s.SndNxt {
 		st.appLimited = true
 		st.appLimitedSeq = s.SndNxt
+		st.idleRestartEligible = true
 	}
 	st.cwndLimited = s.Outstanding >= s.SndCwnd
+}
+
+// ccsimMaybeHandleRestartFromIdle detects the reference's CA_EVENT_TX_START:
+// new data is ready, the prior application-limited flight has drained, and the
+// registered controller owns idle-restart behavior. It returns true while the
+// restart flight is pending so generic TCP does not collapse cwnd to IW.
+func (s *sender) ccsimMaybeHandleRestartFromIdle() bool {
+	st := &s.ccsim
+	w := st.wrap
+	if w == nil || w.sim == nil || s.writeNext == nil || s.Outstanding != 0 || !st.idleRestartEligible {
+		return false
+	}
+	h, ok := w.sim.(SimCCWithIdleRestart)
+	if !ok {
+		return false
+	}
+	if !st.idleRestartNotified {
+		st.idleRestartNotified = true
+		// Mark the restarted flight itself app-limited, as Linux does by
+		// retaining tp->app_limited until data beyond the old marker is ACKed.
+		st.appLimited = true
+		st.appLimitedSeq = s.SndNxt
+		w.idleRestarts++
+		h.HandleRestartFromIdle()
+	}
+	return true
 }
 
 // ccsimPreAck captures delivery information for segments about to be acked
@@ -435,6 +766,7 @@ func (s *sender) ccsimPreAck(rcvdSeg *segment) {
 	st := &s.ccsim
 	st.scratchAcked = 0
 	st.scratchHasSample = false
+	st.scratchAckingTLP = s.rc.tlpRxtOut && s.rc.tlpHighRxt.LessThanEq(rcvdSeg.ackNumber)
 	if s.ccsim.wrap == nil {
 		return
 	}
@@ -452,7 +784,7 @@ func (s *sender) ccsimPreAck(rcvdSeg *segment) {
 		if !seg.sequenceNumber.LessThan(upper) {
 			break
 		}
-		if seg.ccsim.counted || seg.payloadSize() == 0 {
+		if seg.ccsim.counted {
 			continue
 		}
 		endSeq := seg.sequenceNumber.Add(seqnum.Size(seg.logicalLen()))
@@ -468,17 +800,23 @@ func (s *sender) ccsimPreAck(rcvdSeg *segment) {
 		if !covered {
 			continue
 		}
+		s.ccsimRACKAcknowledge(seg)
 		seg.ccsim.counted = true
+		if seg.payloadSize() == 0 {
+			continue
+		}
 		st.scratchAcked += int64(seg.payloadSize())
-		// Prefer the most recently transmitted, never-retransmitted
-		// segment as the rate sample source.
-		if seg.xmitCount == 1 && (!st.scratchHasSample || st.scratchSeg.xmitTime.Before(seg.xmitTime)) {
+		// Prefer the most recently transmitted segment as the rate sample
+		// source, including retransmissions. For equal transmit timestamps the
+		// later sequence wins, matching Linux tcp_rate_skb_delivered.
+		if !st.scratchHasSample || !seg.xmitTime.Before(st.scratchSeg.xmitTime) {
 			st.scratchHasSample = true
 			st.scratchSeg.delivered = seg.ccsim.delivered
 			st.scratchSeg.deliveredTime = seg.ccsim.deliveredTime
 			st.scratchSeg.firstSent = seg.ccsim.firstSent
 			st.scratchSeg.xmitTime = seg.xmitTime
 			st.scratchSeg.appLimited = seg.ccsim.appLimited
+			st.scratchSeg.isRetrans = seg.xmitCount > 1
 			st.scratchSeg.txInflight = seg.ccsim.txInflight
 			st.scratchSeg.lostAtTx = seg.ccsim.lostAtTx
 			st.scratchSeg.deliveredCE = seg.ccsim.deliveredCE
@@ -500,6 +838,10 @@ func (s *sender) ccsimPostAck(rcvdSeg *segment) {
 
 	if st.scratchAcked > 0 {
 		st.delivered += st.scratchAcked
+		if st.idleRestartNotified {
+			st.idleRestartEligible = false
+		}
+		st.idleRestartNotified = false
 		if ece {
 			st.deliveredCE += st.scratchAcked
 		}
@@ -523,11 +865,13 @@ func (s *sender) ccsimPostAck(rcvdSeg *segment) {
 		// SND.UNA inflates it by the SACK-hole width, so BBR's
 		// ProbeBW:DOWN drain condition never satisfies and the flow
 		// wedges in DOWN holding a cwnd-limited standing queue.
-		InflightBytes:  int64(s.Outstanding) * int64(s.MaxPayloadSize),
-		ECE:            ece,
-		RetransSegsCum: s.ep.stats.SendErrors.Retransmits.Value(),
-		LostBytesCum:   st.lostCum,
-		IsCwndLimited:  st.cwndLimited,
+		InflightBytes:         int64(s.Outstanding) * int64(s.MaxPayloadSize),
+		ECE:                   ece,
+		RetransSegsCum:        s.ep.stats.SendErrors.Retransmits.Value(),
+		LostBytesCum:          st.lostCum,
+		IsCwndLimited:         st.cwndLimited,
+		IsAckDelayed:          st.scratchAcked >= 2*int64(s.MaxPayloadSize),
+		IsAckingTLPRetransmit: st.scratchAckingTLP,
 	}
 	if st.scratchHasSample {
 		sc := &st.scratchSeg
@@ -542,10 +886,19 @@ func (s *sender) ccsimPostAck(rcvdSeg *segment) {
 		if sendElapsed > interval {
 			interval = sendElapsed
 		}
-		sample.RTT = nowMT.Sub(sc.xmitTime)
-		sample.Interval = interval
 		sample.IsAppLimited = sc.appLimited
-		if interval > 0 {
+		sample.IsRetrans = sc.isRetrans
+		if !sc.isRetrans {
+			sample.RTT = nowMT.Sub(sc.xmitTime)
+		}
+		// Linux rejects rate intervals shorter than tcp_min_rtt because a
+		// spurious retransmission can otherwise manufacture a high sample.
+		validInterval := interval > 0
+		if s.rc.minRTT > 0 && interval < s.rc.minRTT {
+			validInterval = false
+		}
+		if validInterval {
+			sample.Interval = interval
 			sample.DeliveryRateBps = (st.delivered - sc.delivered) * 8 *
 				int64(time.Second) / int64(interval)
 		}
@@ -599,13 +952,43 @@ func (s *sender) ccsimUndoRecovery() {
 	}
 }
 
+// ccsimHandleLossProbeRecovery records the single loss repaired by a TLP and
+// forwards the transport event to controllers that model it explicitly. The
+// retransmitted segment is still on writeList here, before ACK processing
+// removes it.
+func (s *sender) ccsimHandleLossProbeRecovery() {
+	lost := s.ccsimMarkTLPLost()
+	if lost == 0 {
+		// A FIN-only probe carries no payload. Congestion control still needs a
+		// one-packet signal, expressed in the sender's byte units.
+		lost = int64(s.MaxPayloadSize)
+	}
+	w := s.ccsim.wrap
+	if w == nil || w.sim == nil {
+		return
+	}
+	if h, ok := w.sim.(SimCCWithLossProbeRecovery); ok {
+		h.HandleLossProbeRecovery(SimLossProbeRecovery{
+			LostBytes:    lost,
+			LostBytesCum: s.ccsim.lostCum,
+			IsAppLimited: s.ccsim.tlpOrigAppLimited,
+		})
+	}
+}
+
 // ccsimPacingTimerExpired resumes whichever send walk pacing suspended.
-// Ordinary and RTO transmission uses sendData; classic SACK recovery selects
-// lost ranges through RFC 6675 NextSeg and must resume that walk instead.
+// Ordinary and RTO transmission uses sendData; RACK, TLP, and classic SACK
+// recovery each have their own cursor/selection rules and must resume those
+// walks instead.
 func (s *sender) ccsimPacingTimerExpired() {
+	if s.ccsim.tlpProbePending {
+		s.ccsimSendTLPProbe()
+		return
+	}
 	if s.ccsim.recoveryResendPending {
 		if !s.FastRecovery.Active {
 			s.ccsim.recoveryResendPending = false
+			s.ccsim.rackRecoveryPending = false
 			s.sendData()
 			return
 		}
@@ -613,6 +996,21 @@ func (s *sender) ccsimPacingTimerExpired() {
 		if s.ccsim.recoveryResendPending {
 			return
 		}
+	}
+	if s.ccsim.rackRecoveryPending {
+		if !s.FastRecovery.Active || s.ep.tcpRecovery&tcpip.TCPRACKLossDetection == 0 {
+			s.ccsim.rackRecoveryPending = false
+			s.sendData()
+			return
+		}
+		s.rc.DoRecovery(nil, false /* fastRetransmit */)
+		if s.ccsim.rackRecoveryPending {
+			return
+		}
+		// DoRecovery only walks marked repairs. Revisit ordinary sending so
+		// available cwnd can carry new data and arm the next pacing deadline.
+		s.sendData()
+		return
 	}
 	if s.FastRecovery.Active && s.ep.SACKPermitted &&
 		s.ep.tcpRecovery&tcpip.TCPRACKLossDetection == 0 {
@@ -705,6 +1103,7 @@ type SimInfo struct {
 	RetransSegs   uint64
 	RTOs          uint64
 	LossEvents    uint64
+	IdleRestarts  uint64
 	HasCCProbe    bool
 	CCProbe       SimCCProbe
 }
@@ -733,6 +1132,7 @@ func SimSenderInfo(tep tcpip.Endpoint) (SimInfo, bool) {
 		info.PacingBps = w.pacingBps
 		info.DeliveryBps = w.deliveryBps
 		info.LossEvents = w.lossEvents
+		info.IdleRestarts = w.idleRestarts
 		if w.rtoCount > info.RTOs {
 			info.RTOs = w.rtoCount
 		}
@@ -749,9 +1149,9 @@ func SimSenderInfo(tep tcpip.Endpoint) (SimInfo, bool) {
 //
 // The upstream loop issued two btree range queries (IsSACKED, IsRangeLost)
 // per SMSS-sized chunk of outstanding data — O(cwnd * log ranges) per ACK,
-// with IsRangeLost additionally counting up to maxSACKBlocks ranges per
-// chunk. During SACK recovery with a large window this dominated runtime
-// (87% of a bufferbloat run's CPU). Because the chunk walk ascends in
+// with IsRangeLost additionally counting scoreboard ranges above every
+// chunk. During classic SACK recovery with a large window this dominated
+// runtime (87% of a bufferbloat run's CPU). Because the chunk walk ascends in
 // sequence space and the scoreboard ranges are disjoint and sorted, one
 // snapshot plus a monotonically advancing cursor answers both queries:
 //
@@ -765,6 +1165,14 @@ func SimSenderInfo(tep tcpip.Endpoint) (SimInfo, bool) {
 //
 // +checklocks:s.ep.mu
 func (s *sender) ccsimSetPipe() int {
+	if s.ep.tcpRecovery&tcpip.TCPRACKLossDetection != 0 {
+		// RFC 8985 RACK has explicit per-transmission delivered/lost state.
+		// Linux derives packets_in_flight from incrementally maintained packet
+		// counters rather than re-running RFC 6675 SetPipe over the entire
+		// retransmit queue for each ACK.
+		return s.ccsim.rackPipe
+	}
+
 	board := s.ep.scoreboard
 	ranges := s.ccsim.pipeRanges[:0]
 	board.ranges.Ascend(func(r header.SACKBlock) bool {
@@ -809,6 +1217,14 @@ func (s *sender) ccsimSetPipe() int {
 			if i < n && ranges[i].Contains(r) {
 				continue
 			}
+			// RFC 8985 RACK marks the most recent transmission of a
+			// segment lost independently of RFC 6675's SACK-block-count
+			// heuristic. A marked transmission is no longer in flight; when
+			// it is retransmitted sendSegment clears lost and HighRxt below
+			// accounts for the replacement copy.
+			if s1.lost {
+				continue
+			}
 			// SetPipe(): (a) if IsLost(S1) returns false, Pipe++.
 			if !ccsimRangeLost(ranges, suf, i, r, lostBytes) {
 				pipe++
@@ -848,6 +1264,60 @@ func (s *sender) ccsimMarkAllLost() {
 		seg.ccsim.lostCounted = true
 		s.ccsim.lostCum += int64(seg.payloadSize())
 	}
+	if s.ep.tcpRecovery&tcpip.TCPRACKLossDetection != 0 {
+		// An RTO declares every live transmission no longer in flight. The
+		// retransmit walk will add each replacement copy back as it is sent.
+		for seg := s.writeList.Front(); seg != nil && seg.xmitCount != 0; seg = seg.Next() {
+			seg.ccsim.rackPipeCopies = 0
+			seg.ccsim.rackSentPrev = nil
+			seg.ccsim.rackSentNext = nil
+			seg.ccsim.rackSentQueued = false
+			seg.ccsim.rackLostPrev = nil
+			seg.ccsim.rackLostNext = nil
+			seg.ccsim.rackLostQueued = false
+		}
+		s.ccsim.rackPipe = 0
+		s.ccsim.rackSentHead = nil
+		s.ccsim.rackSentTail = nil
+		s.ccsim.rackLostHead = nil
+		s.ccsim.rackLostTail = nil
+	}
+}
+
+// ccsimMarkSegmentLost tallies one RACK loss at inference time. Unlike the
+// RFC 6675 scoreboard, RACK can also infer that a retransmission was lost, so
+// ccsimStampSegment clears lostCounted on every transmission and this helper
+// deliberately has no xmit-count restriction.
+func (s *sender) ccsimMarkSegmentLost(seg *segment) {
+	if seg == nil {
+		return
+	}
+	s.ccsimRACKMarkLost(seg)
+	if seg.payloadSize() == 0 || seg.ccsim.lostCounted {
+		return
+	}
+	seg.ccsim.lostCounted = true
+	s.ccsim.lostCum += int64(seg.payloadSize())
+}
+
+// ccsimMarkTLPLost tallies the tail segment whose retransmission repaired the
+// current TLP episode. RACK cannot know whether the original or probe copy was
+// lost, but RFC 8985 requires a congestion response for one lost packet.
+//
+// +checklocks:s.ep.mu
+func (s *sender) ccsimMarkTLPLost() int64 {
+	for seg := s.writeList.Front(); seg != nil && seg.xmitCount != 0; seg = seg.Next() {
+		end := seg.sequenceNumber.Add(seqnum.Size(seg.logicalLen()))
+		if end != s.rc.tlpHighRxt || seg.payloadSize() == 0 {
+			continue
+		}
+		lost := int64(seg.payloadSize())
+		if !seg.ccsim.lostCounted {
+			s.ccsimMarkSegmentLost(seg)
+		}
+		return lost
+	}
+	return 0
 }
 
 // ccsimRangeLost mirrors SACKScoreboard.IsRangeLost for a chunk r that is

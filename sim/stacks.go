@@ -95,9 +95,10 @@ func newStack(clk *vclock.Clock, seed int64, ep stack.LinkEndpoint, addr tcpip.A
 	if err := s.SetTransportProtocolOption(tcp.ProtocolNumber, &rcvBuf); err != nil {
 		return nil, fmt.Errorf("sim: receive buffer option: %s", err)
 	}
-	// Disable RACK: its per-ACK segment scan dominates CPU at large cwnd
-	// and classic SACK recovery is sufficient (and deterministic) here.
-	recovery := tcpip.TCPRecovery(0)
+	// RACK/TLP repairs tail loss and lost retransmissions before the RTO. The
+	// simulator patches its repair and probe walks through the same virtual-
+	// clock pacing gate as ordinary transmissions.
+	recovery := tcpip.TCPRACKLossDetection
 	if err := s.SetTransportProtocolOption(tcp.ProtocolNumber, &recovery); err != nil {
 		return nil, fmt.Errorf("sim: recovery option: %s", err)
 	}

@@ -68,6 +68,13 @@ type rackControl struct {
 	snd *sender
 }
 
+// rackSentAfter reports whether the first transmission is chronologically
+// after the second. TCP sequence space breaks ties when the clock gives
+// multiple segments the same transmit timestamp (RFC 8985, Section 6.2).
+func rackSentAfter(t1 tcpip.MonotonicTime, end1 seqnum.Value, t2 tcpip.MonotonicTime, end2 seqnum.Value) bool {
+	return t2.Before(t1) || (t1 == t2 && end2.LessThan(end1))
+}
+
 // init initializes RACK specific fields.
 func (rc *rackControl) init(snd *sender, iss seqnum.Value) {
 	rc.FACK = iss
@@ -113,7 +120,7 @@ func (rc *rackControl) update(seg *segment, ackSeg *segment) {
 	// ending sequence number of the packet which has been acknowledged
 	// most recently.
 	endSeq := seg.sequenceNumber.Add(seqnum.Size(seg.payloadSize()))
-	if rc.XmitTime.Before(seg.xmitTime) || (seg.xmitTime == rc.XmitTime && rc.EndSequence.LessThan(endSeq)) {
+	if rackSentAfter(seg.xmitTime, endSeq, rc.XmitTime, rc.EndSequence) {
 		rc.XmitTime = seg.xmitTime
 		rc.EndSequence = endSeq
 	}
@@ -193,11 +200,24 @@ func (s *sender) probeTimerExpired() tcpip.Error {
 	if s.probeTimer.isUninitialized() || !s.probeTimer.checkExpiration() {
 		return nil
 	}
+	s.ccsim.tlpProbePending = true
+	s.ccsimSendTLPProbe()
+	return nil
+}
 
+// ccsimSendTLPProbe sends or resumes one tail-loss probe through the same
+// pacing gate used by ordinary data and recovery retransmissions.
+//
+// +checklocks:s.ep.mu
+func (s *sender) ccsimSendTLPProbe() {
 	var dataSent bool
 	if s.writeNext != nil && s.writeNext.xmitCount == 0 && s.Outstanding < s.SndCwnd {
+		if !s.ccsimPacingAllows() {
+			return
+		}
 		dataSent = s.maybeSendSegment(s.writeNext, int(s.ep.scoreboard.SMSS()), s.SndUna.Add(s.SndWnd))
 		if dataSent {
+			s.ccsimPacingCharge(s.writeNext.payloadSize())
 			s.Outstanding += s.pCount(s.writeNext, s.MaxPayloadSize)
 			s.updateWriteNext(s.writeNext.Next())
 		}
@@ -220,19 +240,25 @@ func (s *sender) probeTimerExpired() tcpip.Error {
 		}
 
 		if highestSeqXmit != nil {
+			if !s.ccsimPacingAllows() {
+				return
+			}
+			origAppLimited := highestSeqXmit.ccsim.appLimited
 			dataSent = s.maybeSendSegment(highestSeqXmit, int(s.ep.scoreboard.SMSS()), s.SndUna.Add(s.SndWnd))
 			if dataSent {
+				s.ccsimPacingCharge(highestSeqXmit.payloadSize())
 				s.rc.tlpRxtOut = true
 				s.rc.tlpHighRxt = s.SndNxt
+				s.ccsim.tlpOrigAppLimited = origAppLimited
 			}
 		}
 	}
 
+	s.ccsim.tlpProbePending = false
 	// Whether or not the probe was sent, the sender must arm the resend timer,
 	// not the probe timer. This ensures that the sender does not send repeated,
 	// back-to-back tail loss probes.
 	s.postXmit(dataSent, false /* shouldScheduleProbe */)
-	return nil
 }
 
 // detectTLPRecovery detects if recovery was accomplished by the loss probes
@@ -268,6 +294,7 @@ func (s *sender) detectTLPRecovery(ack seqnum.Value, rcvdSeg *segment) {
 			// form of a probe) was lost. Invoke a congestion control response
 			// equivalent to fast recovery.
 			s.cc.HandleLossDetected()
+			s.ccsimHandleLossProbeRecovery()
 			s.enterRecovery()
 			s.leaveRecovery()
 		}
@@ -363,26 +390,32 @@ func (rc *rackControl) exitRecovery() {
 func (rc *rackControl) detectLoss(rcvTime tcpip.MonotonicTime) int {
 	var timeout time.Duration
 	numLost := 0
-	for seg := rc.snd.writeList.Front(); seg != nil && seg.xmitCount != 0; seg = seg.Next() {
+	for seg := rc.snd.ccsim.rackSentHead; seg != nil; {
+		next := seg.ccsim.rackSentNext
 		if rc.snd.ep.scoreboard.IsSACKED(seg.sackBlock()) {
-			continue
-		}
-
-		if seg.lost && seg.xmitCount == 1 {
-			numLost++
+			rc.snd.ccsimRACKAcknowledge(seg)
+			seg = next
 			continue
 		}
 
 		endSeq := seg.sequenceNumber.Add(seqnum.Size(seg.payloadSize()))
-		if seg.xmitTime.Before(rc.XmitTime) || (seg.xmitTime == rc.XmitTime && rc.EndSequence.LessThan(endSeq)) {
-			timeRemaining := seg.xmitTime.Sub(rcvTime) + rc.RTT + rc.ReoWnd
-			if timeRemaining <= 0 {
-				seg.lost = true
-				numLost++
-			} else if timeRemaining > timeout {
-				timeout = timeRemaining
-			}
+		// The intrusive queue is sorted by this exact RFC 8985 ordering;
+		// once one transmission is not older than the latest delivered
+		// packet, no later entry can be a loss candidate.
+		if !rackSentAfter(rc.XmitTime, rc.EndSequence, seg.xmitTime, endSeq) {
+			break
 		}
+		timeRemaining := seg.xmitTime.Sub(rcvTime) + rc.RTT + rc.ReoWnd
+		if timeRemaining <= 0 {
+			seg.lost = true
+			rc.snd.ccsimMarkSegmentLost(seg)
+			numLost++
+		} else if timeRemaining > timeout {
+			// Match Linux tcp_rack_detect_loss: wait for the maximum
+			// remaining settling time among the eligible prefix.
+			timeout = timeRemaining
+		}
+		seg = next
 	}
 
 	if timeout != 0 && !rc.snd.reorderTimer.enabled() {
@@ -422,38 +455,64 @@ func (rc *rackControl) reorderTimerExpired() tcpip.Error {
 func (rc *rackControl) DoRecovery(_ *segment, fastRetransmit bool) {
 	snd := rc.snd
 	if fastRetransmit {
+		snd.ccsim.rackRecoveryPending = true
 		snd.resendSegment()
+		if snd.ccsim.recoveryResendPending {
+			return
+		}
+	} else if snd.ccsim.recoveryResendPending {
+		// The initial repair has already been deferred. Do not walk around it
+		// if another ACK arrives before the pacing timer.
+		snd.ccsim.rackRecoveryPending = true
+		return
 	}
 
 	var dataSent bool
-	// Iterate the writeList and retransmit the segments which are marked
-	// as lost by RACK.
-	for seg := snd.writeList.Front(); seg != nil && seg.xmitCount > 0; seg = seg.Next() {
+	needsRetry := false
+	// Walk only the sequence-ordered segments marked lost by RACK.
+	for seg := snd.ccsim.rackLostHead; seg != nil; {
+		next := seg.ccsim.rackLostNext
 		if seg == snd.writeNext {
+			needsRetry = true
 			break
-		}
-
-		if !seg.lost {
-			continue
 		}
 
 		// Reset seg.lost as it is already SACKed.
 		if snd.ep.scoreboard.IsSACKED(seg.sackBlock()) {
 			seg.lost = false
+			snd.ccsimRACKAcknowledge(seg)
+			seg = next
 			continue
 		}
 
 		// Check the congestion window after entering recovery.
 		if snd.Outstanding >= snd.SndCwnd {
+			// A later ACK that drains pipe must resume this repair walk.
+			needsRetry = true
 			break
 		}
 
+		if !snd.ccsimPacingAllows() {
+			snd.ccsim.rackRecoveryPending = true
+			snd.postXmit(dataSent, true /* shouldScheduleProbe */)
+			return
+		}
 		if sent := snd.maybeSendSegment(seg, int(snd.ep.scoreboard.SMSS()), snd.SndUna.Add(snd.SndWnd)); !sent {
+			needsRetry = true
 			break
 		}
 		dataSent = true
+		// RACK repairs are selected outside RFC 6675 NextSeg, so advance its
+		// recovery marker explicitly for the transport's shared recovery state.
+		end := seg.sequenceNumber.Add(seqnum.Size(seg.payloadSize())) - 1
+		if snd.FastRecovery.HighRxt.LessThan(end) {
+			snd.FastRecovery.HighRxt = end
+		}
+		snd.ccsimPacingCharge(seg.payloadSize())
 		snd.Outstanding += snd.pCount(seg, snd.MaxPayloadSize)
+		seg = next
 	}
 
+	snd.ccsim.rackRecoveryPending = needsRetry
 	snd.postXmit(dataSent, true /* shouldScheduleProbe */)
 }

@@ -190,14 +190,52 @@ func TestSubBDPBuffer(t *testing.T) {
 			t.Errorf("%s goodput %.1f Mbps < 30%% of link through a 0.1xBDP buffer", cc, gp)
 		}
 		if cc == "bbr" {
-			// Classic-SACK repairs use the same pacing gate as ordinary BBR
-			// traffic. This closes the earlier recovery-burst failure mode
+			// RACK repairs and TLP probes use the same pacing gate as ordinary
+			// BBR traffic. This closes the earlier recovery-burst failure mode
 			// (~13 RTOs/min after mark-time loss accounting; ~36/min before)
 			// and restores the original reliability target.
 			if perMin >= 5 {
 				t.Errorf("bbr steady-state RTO rate %.1f/min, want <5/min", perMin)
 			}
 		}
+	}
+}
+
+// RACK recovery must share BBR's pacing clock. Without that integration the
+// marked-loss walk emits a high-cwnd repair flight at one virtual timestamp,
+// overflows this one-BDP queue, and feeds the resulting tail losses into an
+// RTO/retransmission storm.
+func TestRACKRecoveryIsPacedAtHighCwnd(t *testing.T) {
+	cfg := vCfg(7, 30, 100, 20, 350, vBulk("bbr", 0))
+	cfg.Link.Loss = 0.01
+	recs, sum := runCfg(t, cfg)
+	gp := probe.GoodputMbps(recs, 0, 5, 30)
+
+	_, retrans := probe.Series(recs, 0, stream.KindRetransCum, 0, 30)
+	var maxRetransPerMS float64
+	for i := 1; i < len(retrans); i++ {
+		if d := retrans[i] - retrans[i-1]; d > maxRetransPerMS {
+			maxRetransPerMS = d
+		}
+	}
+
+	f := sum.Flows[0]
+	t.Logf("bbr+RACK @ 1%% loss: goodput %.1f Mbps, retrans %d, RTOs %d, max repair burst %.0f packets/ms",
+		gp, f.Retransmits, f.RTOs, maxRetransPerMS)
+	if gp < 70 {
+		t.Errorf("goodput %.1f Mbps, want >= 70", gp)
+	}
+	if f.RTOs > 2 {
+		t.Errorf("RTOs = %d, want <= 2", f.RTOs)
+	}
+	if f.Retransmits > 5000 {
+		t.Errorf("retransmits = %d, want <= 5000", f.Retransmits)
+	}
+	// At 100 Mbps the 64 KiB pacing quantum is about 44 full-size packets;
+	// one additional millisecond of paced traffic keeps the observed bound
+	// below 80. The old unpaced RACK walk exceeded this by orders of magnitude.
+	if maxRetransPerMS > 80 {
+		t.Errorf("max retransmission burst = %.0f packets/ms, want <= 80", maxRetransPerMS)
 	}
 }
 
@@ -212,10 +250,11 @@ func TestIdleRestartPacing(t *testing.T) {
 		CC: "bbr", StartAt: 0,
 		App: scenario.AppConfig{Kind: "rr", ReqBytes: 2 << 20, RespBytes: 1, PoissonRate: 0.2},
 	})
-	recs, _ := runCfg(t, cfg)
+	recs, sum := runCfg(t, cfg)
 
 	utilT, utilV := probe.Series(recs, stream.LinkFwd, stream.KindUtilizationBps, 0, 60)
 	paceT, paceV := probe.Series(recs, 0, stream.KindPacingRateBps, 0, 60)
+	cwndT, cwndV := probe.Series(recs, 0, stream.KindCwndPkts, 0, 60)
 	pacingAt := func(ts float64) float64 {
 		last := 0.0
 		for i, pt := range paceT {
@@ -226,13 +265,33 @@ func TestIdleRestartPacing(t *testing.T) {
 		}
 		return last
 	}
+	cwndAt := func(ts float64) float64 {
+		last := 0.0
+		for i, ct := range cwndT {
+			if ct > ts {
+				break
+			}
+			last = cwndV[i]
+		}
+		return last
+	}
 
 	restarts, violations := 0, 0
 	idleFor := 0.0
+	seenTraffic := false
 	for i := 1; i < len(utilT); i++ {
 		dt := utilT[i] - utilT[i-1]
 		if utilV[i] < 1e6 { // < 1 Mbps: idle-ish bin
-			idleFor += dt
+			if seenTraffic {
+				idleFor += dt
+			}
+			continue
+		}
+		if !seenTraffic {
+			// The first request starts the connection's first data flight; it is
+			// not a restart, no matter how long the application waited to issue it.
+			seenTraffic = true
+			idleFor = 0
 			continue
 		}
 		if idleFor >= 1.0 {
@@ -245,15 +304,35 @@ func TestIdleRestartPacing(t *testing.T) {
 				}
 			}
 			pace := pacingAt(utilT[i])
+			cwnd := cwndAt(utilT[i])
+			if pace <= 0 {
+				violations++
+				t.Errorf("restart at t=%.2fs has no pacing rate", utilT[i])
+				idleFor = 0
+				continue
+			}
+			// Google restarts ProbeBW at gain 1.0, not whatever UP/DOWN gain was
+			// active before the idle period. This path's model should therefore
+			// be near, and never materially above, its 100 Mbps bottleneck.
+			if pace > 110e6 {
+				violations++
+				t.Errorf("restart at t=%.2fs pacing %.1f Mbps, want gain-1 rate <=110 Mbps",
+					utilT[i], pace/1e6)
+			}
+			if cwnd <= 10 {
+				violations++
+				t.Errorf("restart at t=%.2fs collapsed cwnd to %.0f packets (initial window 10)",
+					utilT[i], cwnd)
+			}
 			// Quantum granularity: one pacing quantum released into a 1 ms
 			// bin can double the apparent rate; 2x pacing is the contract.
-			if pace > 0 && peak > 2*pace+2*8*1448*1000 { // + 2 MSS/ms slack
+			if peak > 2*pace+2*8*1448*1000 { // + 2 MSS/ms slack
 				violations++
 				t.Errorf("restart at t=%.2fs: peak %.1f Mbps > 2x pacing %.1f Mbps",
 					utilT[i], peak/1e6, pace/1e6)
 			} else {
-				t.Logf("restart at t=%.2fs after %.1fs idle: peak %.1f Mbps vs pacing %.1f Mbps (ratio %.2f)",
-					utilT[i], idleFor, peak/1e6, pace/1e6, peak/math.Max(pace, 1))
+				t.Logf("restart at t=%.2fs after %.1fs idle: cwnd %.0f, peak %.1f Mbps vs pacing %.1f Mbps (ratio %.2f)",
+					utilT[i], idleFor, cwnd, peak/1e6, pace/1e6, peak/math.Max(pace, 1))
 			}
 		}
 		idleFor = 0
@@ -261,7 +340,15 @@ func TestIdleRestartPacing(t *testing.T) {
 	if restarts < 3 {
 		t.Fatalf("only %d idle restarts observed; the scenario should produce ~8", restarts)
 	}
-	t.Logf("%d idle restarts, %d pacing violations", restarts, violations)
+	idleEvents := sum.Flows[0].IdleRestarts
+	if idleEvents == 0 {
+		t.Fatal("transport emitted no BBR idle-restart events")
+	}
+	if int(idleEvents) < restarts {
+		t.Errorf("transport counted %d idle restarts, fewer than the %d >=1s restarts visible on the link",
+			idleEvents, restarts)
+	}
+	t.Logf("%d idle restarts (%d transport events), %d pacing violations", restarts, idleEvents, violations)
 }
 
 // --- Test 26: asymmetric path ----------------------------------------------------

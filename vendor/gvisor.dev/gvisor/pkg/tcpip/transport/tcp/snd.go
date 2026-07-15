@@ -566,6 +566,9 @@ func (s *sender) retransmitTimerExpired() tcpip.Error {
 	// Set TLPRxtOut to false according to
 	// https://tools.ietf.org/html/draft-ietf-tcpm-rack-08#section-7.6.1.
 	s.rc.tlpRxtOut = false
+	s.ccsim.tlpProbePending = false // ccsim patch
+	s.ccsim.rackRecoveryPending = false
+	s.ccsim.recoveryResendPending = false
 
 	// Give up if we've waited more than a minute since the last resend or
 	// if a user time out is set and we have exceeded the user specified
@@ -700,6 +703,7 @@ func (s *sender) splitSeg(seg *segment, size int) {
 		return
 	}
 	// Split this segment up.
+	oldPayload := seg.payloadSize()
 	nSeg := seg.clone()
 	nSeg.pkt.Data().TrimFront(size)
 	nSeg.sequenceNumber.UpdateForward(seqnum.Size(size))
@@ -718,6 +722,7 @@ func (s *sender) splitSeg(seg *segment, size int) {
 		seg.flags ^= header.TCPFlagPsh
 	}
 	seg.pkt.Data().CapLength(size)
+	s.ccsimRACKSplitSegment(seg, nSeg, oldPayload) // ccsim patch
 }
 
 // NextSeg implements the RFC6675 NextSeg() operation.
@@ -1092,12 +1097,13 @@ func (s *sender) sendData() {
 		limit = int(s.ep.gso.MaxSize - header.TCPTotalHeaderMaximumSize - 1)
 	}
 	end := s.SndUna.Add(s.SndWnd)
+	ccsimIdleRestart := s.ccsimMaybeHandleRestartFromIdle() // ccsim patch
 
 	// Reduce the congestion window to min(IW, cwnd) per RFC 5681, page 10.
 	// "A TCP SHOULD set cwnd to no more than RW before beginning
 	// transmission if the TCP has not sent data in the interval exceeding
 	// the retrasmission timeout."
-	if !s.FastRecovery.Active && s.state != tcpip.RTORecovery && s.ep.stack.Clock().NowMonotonic().Sub(s.LastSendTime) > s.RTO {
+	if !ccsimIdleRestart && !s.FastRecovery.Active && s.state != tcpip.RTORecovery && s.ep.stack.Clock().NowMonotonic().Sub(s.LastSendTime) > s.RTO {
 		if s.SndCwnd > InitialCwnd {
 			s.SndCwnd = InitialCwnd
 		}
@@ -1142,6 +1148,7 @@ func (s *sender) enterRecovery() {
 	s.retransmitTS = 0
 
 	s.FastRecovery.Active = true
+	s.ccsim.tlpProbePending = false // ccsim patch: loss recovery supersedes PTO.
 	// Save state to reflect we're now in fast recovery.
 	//
 	// See : https://tools.ietf.org/html/rfc5681#section-3.2 Step 3.
@@ -1180,6 +1187,7 @@ func (s *sender) enterRecovery() {
 func (s *sender) leaveRecovery() {
 	s.FastRecovery.Active = false
 	s.ccsim.recoveryResendPending = false // ccsim patch
+	s.ccsim.rackRecoveryPending = false   // ccsim patch
 	s.FastRecovery.MaxCwnd = 0
 	s.DupAckCount = 0
 
@@ -1722,6 +1730,7 @@ func (s *sender) handleRcvdSegmentInner(rcvdSeg *segment) { // ccsim patch: rena
 			s.firstRetransmittedSegXmitTime = tcpip.MonotonicTime{}
 			s.resendTimer.disable()
 			s.probeTimer.disable()
+			s.ccsim.tlpProbePending = false // ccsim patch
 		}
 	}
 
@@ -1735,7 +1744,8 @@ func (s *sender) handleRcvdSegmentInner(rcvdSeg *segment) { // ccsim patch: rena
 		// After the reorder window is calculated, detect any loss by checking
 		// if the time elapsed after the segments are sent is greater than the
 		// reorder window.
-		if numLost := s.rc.detectLoss(rcvdSeg.rcvdTime); numLost > 0 && !s.FastRecovery.Active {
+		numLost := s.rc.detectLoss(rcvdSeg.rcvdTime)
+		if numLost > 0 && !s.FastRecovery.Active {
 			// If any segment is marked as lost by
 			// RACK, enter recovery and retransmit
 			// the lost segments.
@@ -1744,7 +1754,12 @@ func (s *sender) handleRcvdSegmentInner(rcvdSeg *segment) { // ccsim patch: rena
 			fastRetransmit = true
 		}
 
-		if s.FastRecovery.Active {
+		// Run the repair walk for a new loss batch, the initial fast
+		// retransmit, or a prior walk that stopped at pacing/cwnd. Calling it
+		// unconditionally rescans the whole retransmit queue on every ACK in
+		// prolonged RACK recovery.
+		if s.FastRecovery.Active && (numLost > 0 || fastRetransmit ||
+			s.ccsim.rackRecoveryPending || s.ccsim.recoveryResendPending) {
 			s.rc.DoRecovery(nil, fastRetransmit)
 		}
 	}

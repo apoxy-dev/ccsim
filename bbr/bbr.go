@@ -1,35 +1,30 @@
-// Package bbr implements BBRv3 congestion control per draft-ietf-ccwg-bbr-03
-// (October 2024 revision of "BBR Congestion Control"), adapted to the ccsim
-// netstack CC interface (tcp.SimCC).
+// Package bbr implements BBRv3 congestion control following the Google BBRv3
+// reference at google/bbr v3 commit 90210de4 (whose state machine is described
+// by draft-ietf-ccwg-bbr-03), adapted to the ccsim netstack CC interface
+// (tcp.SimCC).
 //
-// Implemented per draft: the Startup/Drain/ProbeBW(DOWN,CRUISE,REFILL,UP)/
-// ProbeRTT state machine with the draft's gains; the windowed max-bandwidth
-// filter (two probe cycles); min_rtt filter (10 s window) with ProbeRTT
-// refresh every 5 s; inflight_hi/inflight_lo and bw_lo short-term bounds
-// with beta = 0.7; 0.85 headroom when cruising below inflight_hi; 2% loss
-// threshold aborting PROBE_UP; startup full-pipe detection via bandwidth
+// Implemented per reference: the Startup/Drain/ProbeBW(DOWN,CRUISE,REFILL,UP)/
+// ProbeRTT state machine with fixed-point gains; the windowed max-bandwidth
+// filter (two probe cycles); separate 10 s min_rtt and 5 s ProbeRTT scheduling
+// filters; measured ACK aggregation; inflight_hi/inflight_lo and bw_lo
+// short-term bounds; startup full-pipe detection via bandwidth
 // plateau (<25% growth across 3 round trips) or excessive loss/eligible ECN;
 // ECN alpha (gain 1/16) with the 1/3 ECN cut factor on explicit low-latency
 // routes with min RTT <= 5 ms; pacing with the draft's 1% pacing margin.
 //
 // Deliberate deviations (documented in docs/decisions.md):
-//   - Loss marking is RFC 6675 scoreboard inference (plus mark-all on RTO)
-//     rather than RACK, and the per-lost-packet BBRHandleLostPacket
-//     machinery (lost_prefix interpolation) is approximated by evaluating
-//     the loss gate against the current rate sample's tx_in_flight.
+//   - Loss marking comes from RFC 8985 RACK (RFC 6675 fallback plus mark-all
+//     on RTO), while the per-lost-packet BBRHandleLostPacket machinery
+//     (lost_prefix interpolation) is approximated by evaluating the loss gate
+//     against the current rate sample's tx_in_flight.
 //   - CE feedback is per-ACK ECE echo (ACE-like) rather than RFC 3168
 //     latched ECE; CE volume is computed from bytes acked by ECE-carrying
 //     ACKs (both per-round alpha and per-rate-sample threshold signals).
-//   - Ack aggregation (extra_acked) modeling is simplified to a fixed
-//     2-packet cwnd allowance; the simulated receiver does not batch acks
-//     beyond standard delayed acks.
 package bbr
 
 import (
-	"fmt"
 	"math"
 	"math/rand/v2"
-	"os"
 	"time"
 
 	"gvisor.dev/gvisor/pkg/tcpip/transport/tcp"
@@ -103,27 +98,34 @@ func StateName(s int) string {
 	return "?"
 }
 
-// Draft constants (section "Constants" of draft-ietf-ccwg-bbr-03).
+// Reference constants. Google stores gains in fixed point with BBR_UNIT=256;
+// these exact binary fractions preserve the rounded reference values while the
+// simulator continues to model rates and volumes in bits and bytes.
 const (
-	startupPacingGain = 2.77
-	startupCwndGain   = 2.0
-	drainPacingGain   = 1.0 / 2.77
-	probeUpGain       = 1.25
-	probeDownGain     = 0.9
-	cruiseGain        = 1.0
-	probeBWCwndGain   = 2.0
+	bbrScale             = 256
+	bbrUnit              = float64(bbrScale)
+	betaNumerator        = 180
+	lossThreshNumerator  = 5
+	headroomCutNumerator = 38
+	startupPacingGain    = 710.0 / bbrUnit // BBR_UNIT*277/100 + 1
+	startupCwndGain      = 2.0
+	drainPacingGain      = 88.0 / bbrUnit // BBR_UNIT*1000/2885
+	probeUpGain          = 1.25
+	probeDownGain        = 232.0 / bbrUnit // BBR_UNIT*91/100
+	cruiseGain           = 1.0
+	probeBWCwndGain      = 2.0
 	// probeUpCwndGain: the draft raises cwnd_gain to 2.25 in ProbeBW:UP so
 	// the cwnd does not cap the inflight the pacing probe is trying to grow.
 	probeUpCwndGain  = 2.25
 	probeRTTCwndGain = 0.5
 
-	beta         = 0.7  // loss response multiplier
-	headroom     = 0.85 // fraction of inflight_hi usable while cruising
-	lossThresh   = 0.02 // loss rate aborting PROBE_UP
+	beta         = float64(betaNumerator) / bbrUnit // 1 - floor(BBR_UNIT*30/100)/BBR_UNIT
+	headroom     = float64(bbrScale-headroomCutNumerator) / bbrUnit
+	lossThresh   = float64(lossThreshNumerator) / bbrUnit
 	pacingMargin = 0.01 // pace at 99% of modeled bw
 
 	ecnAlphaGain = 1.0 / 16
-	ecnFactor    = 1.0 / 3
+	ecnFactor    = 85.0 / bbrUnit // floor(BBR_UNIT/3)/BBR_UNIT
 	ecnThresh    = 0.5
 	ecnMaxRTT    = 5 * time.Millisecond
 	// startupFullECNCount is the number of consecutive high-CE rounds
@@ -143,6 +145,12 @@ const (
 
 	maxBwFilterLen  = 2 // max-bw filter window, in probe cycles
 	probeRandRounds = 2 // initial rounds_since_probe jitter: [0, 2)
+
+	extraAckedWinRTTs          = 5
+	extraAckedResetThreshPkts  = 1 << 20
+	extraAckedMaxInterval      = 100 * time.Millisecond
+	simulatorMaxSendQuantum    = 64 << 10
+	simulatorMinSendQuantumPkt = 2
 )
 
 // ACK phases (draft BBR.ack_phase): which ProbeBW phase the data being
@@ -170,6 +178,7 @@ type Sender interface {
 	SetSsthresh(int)
 	Seed() uint64
 	ECNLowLatency() bool
+	MarkAppLimited()
 }
 
 // BBR is one connection's BBRv3 state.
@@ -195,6 +204,15 @@ type BBR struct {
 	// full the pacing rate only ratchets upward (see setPacing).
 	pacingBps int64
 
+	// ACK aggregation. extraAcked is the reference's two-slot max filter;
+	// each slot covers five packet-timed rounds in steady state (one round in
+	// Startup), retaining the maximum over roughly 5-10 rounds.
+	ackEpochStart       time.Duration
+	ackEpochAcked       int64
+	extraAcked          [2]int64
+	extraAckedWinRounds int
+	extraAckedWinIdx    int
+
 	// cwnd is the persistent congestion window (bytes), per the draft's
 	// BBRSetCwnd: it grows by at most the newly-acked data per ACK and is
 	// snapped down to the model target only once the pipe is full; the
@@ -205,17 +223,17 @@ type BBR struct {
 	priorCwnd   int64
 	initialCwnd int64
 
-	// Model: RTT. minRTT is a windowed minimum: rttBuckets holds per-2.5s
-	// sub-window minima so stale low samples expire after ~10s (a pinned
-	// historical minimum under a competitor's standing queue starves the
-	// cwnd model).
+	// Model: RTT. probeRTTMin is the minimum over the current 5-second
+	// scheduling window; minRTT is the 10-second path-model value. Separate
+	// samples and stamps let a natural idle restart refresh ProbeRTT scheduling
+	// without prematurely replacing the longer-lived model.
 	minRTT            time.Duration
-	minRTTStamp       time.Duration // when minRTT last decreased or was refreshed
-	rttBuckets        [4]time.Duration
-	rttBucketT        time.Duration // start time of current bucket
+	minRTTStamp       time.Duration
+	probeRTTMin       time.Duration
+	probeRTTMinStamp  time.Duration
+	probeRTTExpired   bool
 	probeRTTDone      time.Duration // when ProbeRTT hold completes (0 = not holding)
 	probeRTTRoundDone bool          // a full round elapsed at the reduced window
-	probeRTTValid     bool
 
 	// Model: inflight bounds (bytes; MaxInt64 = unset).
 	inflightHi     int64
@@ -296,9 +314,12 @@ type BBR struct {
 var _ tcp.SimCC = (*BBR)(nil)
 var _ tcp.SimCCWithProbe = (*BBR)(nil)
 var _ tcp.SimCCWithUndo = (*BBR)(nil)
+var _ tcp.SimCCWithIdleRestart = (*BBR)(nil)
+var _ tcp.SimCCWithLossProbeRecovery = (*BBR)(nil)
 
 // New creates a BBRv3 instance for one connection.
 func New(s Sender) *BBR {
+	now := s.Now()
 	b := &BBR{
 		s: s,
 		// Named PCG sub-stream: the scenario seed selects the stream family
@@ -310,13 +331,19 @@ func New(s Sender) *BBR {
 		inflightHi: math.MaxInt64,
 		inflightLo: math.MaxInt64,
 		probeUpCnt: math.MaxInt64,
-		minRTT:     0,
 		ecnAlpha:   1, // draft: alpha starts at 1
 		// Match bbr_init(): wait until data sent after the first delivered
 		// byte is ACKed before closing the first loss-signal round.
 		lossRoundDelivered: 1,
+		ackEpochStart:      now,
 	}
-	b.stateTime = s.Now()
+	b.stateTime = now
+	if srtt := s.SRTT(); srtt > 0 {
+		b.minRTT = srtt
+		b.minRTTStamp = now
+		b.probeRTTMin = srtt
+		b.probeRTTMinStamp = now
+	}
 	b.initialCwnd = int64(s.CwndPkts()) * int64(s.MSS())
 	b.cwnd = b.initialCwnd
 	b.initPacingRate()
@@ -405,6 +432,53 @@ func (b *BBR) UndoRecovery() {
 	b.applyCwnd()
 }
 
+// HandleRestartFromIdle implements Google's CA_EVENT_TX_START handling. The
+// transport invokes it immediately before sending a new flight from an empty,
+// application-limited pipe.
+func (b *BBR) HandleRestartFromIdle() {
+	now := b.s.Now()
+	b.idleRestart = true
+	b.resetAckAggregationEpoch(now)
+	if b.inProbeBW() {
+		// Do not resume an old UP/DOWN gain after silence; return at the modeled
+		// bandwidth without changing the saved cwnd.
+		b.setPacingWithGain(cruiseGain)
+		return
+	}
+	if b.state == StateProbeRTT && b.probeRTTDone != 0 && now >= b.probeRTTDone {
+		// An idle interval already drained the pipe and satisfied the hold. The
+		// reference permits this restart path to exit without another ACK round.
+		b.probeRTTMinStamp = now
+		b.probeRTTExpired = false
+		b.exitProbeRTT(now)
+		b.applyCwnd()
+	}
+}
+
+// HandleLossProbeRecovery implements Google's CA_EVENT_TLP_RECOVERY path.
+// A successful TLP proves one copy of the tail packet was lost. Preserve that
+// signal even when the ACK cannot produce a normal rate sample, and, for data
+// sent during a bandwidth probe, apply the reference's synthetic one-packet
+// loss-rate test against the latest delivered flight.
+func (b *BBR) HandleLossProbeRecovery(ev tcp.SimLossProbeRecovery) {
+	b.noteLoss(ev.LostBytesCum, b.lastSample.Delivered)
+	if !b.bwProbeSamples {
+		return
+	}
+	lost := ev.LostBytes
+	if lost <= 0 {
+		lost = int64(b.s.MSS())
+	}
+	rs := tcp.SimRateSample{
+		LostBytes:    lost,
+		TxInflight:   b.inflightLatest + lost,
+		IsAppLimited: ev.IsAppLimited,
+	}
+	if b.lossRateTooHigh(rs) {
+		b.handleInflightTooHigh(rs, b.s.Now())
+	}
+}
+
 func (b *BBR) saveRecoveryModel() {
 	if b.recoverySnapshot {
 		return
@@ -432,22 +506,13 @@ func (b *BBR) restoreCwnd() {
 	}
 }
 
-// dbgSamples bounds the number of per-sample debug lines printed when
-// CCSIM_BBR_DEBUG is set.
-var dbgSamples int
-
 // OnAck processes one delivery rate sample (the heart of BBRv3).
 func (b *BBR) OnAck(rs tcp.SimRateSample) {
-	if debugBBR && dbgSamples < 80 {
-		dbgSamples++
-		fmt.Fprintf(os.Stderr, "[smp] t=%7.4f acked=%5d dlv=%8d rate=%6.2fMbps rtt=%5.1fms intv=%6.2fms infl=%6d applim=%v\n",
-			rs.Now.Seconds(), rs.AckedBytes, rs.Delivered, float64(rs.DeliveryRateBps)/1e6,
-			rs.RTT.Seconds()*1000, rs.Interval.Seconds()*1000, rs.InflightBytes, rs.IsAppLimited)
-	}
 	b.lastSample = rs
 	b.updateRound(rs)
 	b.updateLossECN(rs)
 	b.updateBwModel(rs)
+	b.updateAckAggregation(rs)
 	b.updateMinRTT(rs)
 	b.updateStateMachine(rs)
 	b.boundLower()
@@ -484,6 +549,15 @@ func (b *BBR) SimProbe() tcp.SimCCProbe {
 
 func (b *BBR) updateRound(rs tcp.SimRateSample) {
 	b.roundStart = false
+	// Linux advances the packet-timed round only for a valid delivery-rate
+	// sample (rate_sample.interval_us > 0). In particular, ambiguous
+	// retransmission samples shorter than min_rtt are invalidated by the
+	// transport. Letting their PriorDelivered marker advance this clock can
+	// turn several ACKs from one recovery flight into several fictitious RTTs,
+	// prematurely ending Startup and ProbeBW:UP.
+	if rs.Interval <= 0 {
+		return
+	}
 	// Packet-timed rounds, anchored like the reference implementation: a
 	// round ends when a segment SENT at-or-after the round marker is acked
 	// (PriorDelivered is the delivered count at the sample's transmit
@@ -507,17 +581,7 @@ func (b *BBR) updateLossECN(rs tcp.SimRateSample) {
 	// retransmit time: LostBytesCum is the netstack patch's C.lost. The first
 	// mark starts a fresh loss round at the current delivered count, so the
 	// lower-bound cut waits for a complete flight of post-mark observations.
-	if rs.LostBytesCum > b.prevLostBytes {
-		if !b.lossInRound {
-			b.lossRoundDelivered = rs.Delivered
-		}
-		b.lossInRound = true
-		if b.lossEventsRound < 0xf {
-			b.lossEventsRound++
-		}
-		b.lostBytesRound += rs.LostBytesCum - b.prevLostBytes
-		b.prevLostBytes = rs.LostBytesCum
-	}
+	b.noteLoss(rs.LostBytesCum, rs.Delivered)
 
 	// BBRUpdateLatestDeliverySignals is deliberately independent of max_bw
 	// filtering and app-limited status. These are the current safe delivery
@@ -558,6 +622,21 @@ func (b *BBR) updateLossECN(rs tcp.SimRateSample) {
 	}
 }
 
+func (b *BBR) noteLoss(lostBytesCum, delivered int64) {
+	if lostBytesCum <= b.prevLostBytes {
+		return
+	}
+	if !b.lossInRound {
+		b.lossRoundDelivered = delivered
+	}
+	b.lossInRound = true
+	if b.lossEventsRound < 0xf {
+		b.lossEventsRound++
+	}
+	b.lostBytesRound += lostBytesCum - b.prevLostBytes
+	b.prevLostBytes = lostBytesCum
+}
+
 func sampleDeliveredVolume(rs tcp.SimRateSample) int64 {
 	if rs.DeliveredBytes > 0 {
 		return rs.DeliveredBytes
@@ -572,10 +651,10 @@ func sampleDeliveredVolume(rs tcp.SimRateSample) int64 {
 
 // advanceLatestDeliverySignals starts the next independent loss-signal
 // round with the boundary sample, matching bbr_advance_latest_delivery_signals.
-// TLP retransmit samples are not special-cased because this simulator does
-// not implement RACK/TLP.
+// An ACK covering a TLP retransmission preserves the prior filter so a tail
+// loss does not erase the successfully delivered volume that preceded it.
 func (b *BBR) advanceLatestDeliverySignals(rs tcp.SimRateSample) {
-	if !b.lossRoundStart {
+	if !b.lossRoundStart || rs.IsAckingTLPRetransmit {
 		return
 	}
 	b.bwLatest = rs.DeliveryRateBps
@@ -592,6 +671,74 @@ func (b *BBR) updateBwModel(rs tcp.SimRateSample) {
 			b.maxBwFilter[1] = rs.DeliveryRateBps
 		}
 	}
+}
+
+// resetAckAggregationEpoch starts a new interval for measuring how much data
+// ACKs deliver beyond the amount expected at the current modeled bandwidth.
+func (b *BBR) resetAckAggregationEpoch(now time.Duration) {
+	b.ackEpochStart = now
+	b.ackEpochAcked = 0
+}
+
+// updateAckAggregation implements bbr_update_ack_aggregation in byte units.
+// The two max-filter slots each span five packet-timed rounds after Startup;
+// before full pipe each spans one round so stale Startup bursts age quickly.
+func (b *BBR) updateAckAggregation(rs tcp.SimRateSample) {
+	if rs.AckedBytes <= 0 || rs.PriorDelivered < 0 || rs.Interval <= 0 {
+		return
+	}
+
+	if b.roundStart {
+		b.extraAckedWinRounds++
+		window := extraAckedWinRTTs
+		if !b.filledPipe {
+			window = 1
+		}
+		if b.extraAckedWinRounds >= window {
+			b.extraAckedWinRounds = 0
+			b.extraAckedWinIdx ^= 1
+			b.extraAcked[b.extraAckedWinIdx] = 0
+		}
+	}
+
+	now := rs.Now
+	if now == 0 {
+		now = b.s.Now()
+	}
+	if now < b.ackEpochStart {
+		b.resetAckAggregationEpoch(now)
+	}
+	elapsed := now - b.ackEpochStart
+	expected := b.bw() / 8 * int64(elapsed) / int64(time.Second)
+	resetThreshold := int64(extraAckedResetThreshPkts) * int64(b.s.MSS())
+	if b.ackEpochAcked <= expected || b.ackEpochAcked+rs.AckedBytes >= resetThreshold {
+		b.resetAckAggregationEpoch(now)
+		expected = 0
+	}
+	b.ackEpochAcked += rs.AckedBytes
+	extra := b.ackEpochAcked - expected
+	if extra > b.cwnd {
+		extra = b.cwnd
+	}
+	if extra > b.extraAcked[b.extraAckedWinIdx] {
+		b.extraAcked[b.extraAckedWinIdx] = extra
+	}
+}
+
+func (b *BBR) maxExtraAcked() int64 {
+	if b.extraAcked[1] > b.extraAcked[0] {
+		return b.extraAcked[1]
+	}
+	return b.extraAcked[0]
+}
+
+func (b *BBR) ackAggregationCwnd() int64 {
+	extra := b.maxExtraAcked()
+	maxExtra := b.bw() / 8 * int64(extraAckedMaxInterval) / int64(time.Second)
+	if extra > maxExtra {
+		extra = maxExtra
+	}
+	return extra
 }
 
 // advanceMaxBwFilter turns over the two-bucket max-bw filter exactly at the
@@ -613,6 +760,12 @@ func min64(a, c int64) int64 {
 	return c
 }
 
+// fixedMulFloor applies one BBR_UNIT-scaled integer factor with the same
+// truncation as tcp_bbr.c's `(u64)value * factor >> BBR_SCALE` operations.
+func fixedMulFloor(value int64, numerator int64) int64 {
+	return value * numerator / bbrScale
+}
+
 func (b *BBR) maxBw() int64 {
 	m := b.maxBwFilter[0]
 	if b.maxBwFilter[1] > m {
@@ -631,54 +784,100 @@ func (b *BBR) bw() int64 {
 }
 
 func (b *BBR) updateMinRTT(rs tcp.SimRateSample) {
+	now := rs.Now
+	if now == 0 {
+		now = b.s.Now()
+	}
+	b.probeRTTExpired = b.probeRTTMin > 0 && now-b.probeRTTMinStamp > probeRTTInterval
 	if rs.RTT <= 0 {
 		return
 	}
-	now := b.s.Now()
-	// Rotate the 2.5s sub-window buckets.
-	const bucketLen = minRTTFilterLen / 4
-	if b.rttBucketT == 0 {
-		b.rttBucketT = now
+
+	// The short filter schedules ProbeRTT. Once it expires, the first
+	// non-delayed RTT sample starts a fresh five-second window even if that
+	// sample is above the old minimum.
+	if b.probeRTTMin == 0 || rs.RTT < b.probeRTTMin ||
+		(b.probeRTTExpired && !rs.IsAckDelayed) {
+		b.probeRTTMin = rs.RTT
+		b.probeRTTMinStamp = now
 	}
-	for now-b.rttBucketT >= bucketLen {
-		b.rttBucketT += bucketLen
-		copy(b.rttBuckets[:], b.rttBuckets[1:])
-		b.rttBuckets[3] = 0
-	}
-	if b.rttBuckets[3] == 0 || rs.RTT < b.rttBuckets[3] {
-		b.rttBuckets[3] = rs.RTT
-	}
-	min := time.Duration(0)
-	for _, v := range b.rttBuckets {
-		if v != 0 && (min == 0 || v < min) {
-			min = v
-		}
-	}
-	if min != b.minRTT {
-		if min < b.minRTT || b.minRTT == 0 {
-			// A genuinely lower sample refreshes the ProbeRTT schedule;
-			// equal samples deliberately do not (otherwise a constant-RTT
-			// path would never confirm its floor via ProbeRTT).
-			b.minRTTStamp = now
-		}
-		b.minRTT = min
+
+	// The longer path-model sample changes only when the short-window minimum
+	// is at least as good, or when the ten-second model itself expires.
+	minExpired := b.minRTT > 0 && now-b.minRTTStamp > minRTTFilterLen
+	if b.minRTT == 0 || b.probeRTTMin <= b.minRTT || minExpired {
+		b.minRTT = b.probeRTTMin
+		b.minRTTStamp = b.probeRTTMinStamp
 	}
 }
 
-// bdpBytesAt computes gain * BDP from an explicit bandwidth signal. State
-// transitions that drain a probe use max_bw; output control uses bw (bounded
-// by bw_lo), matching the split in tcp_bbr.c.
+// bdpBytesAt computes ceil(gain * BDP) from an explicit bandwidth signal,
+// rounded up to a full packet like bbr_bdp. State transitions that drain a
+// probe use max_bw; output control uses bw (bounded by bw_lo).
 func (b *BBR) bdpBytesAt(gain float64, bw int64) int64 {
 	if b.minRTT == 0 || bw == 0 {
-		return int64(gain * float64(10*b.s.MSS()))
+		return b.initialCwnd
 	}
 	bdp := float64(bw) / 8 * b.minRTT.Seconds()
-	return int64(gain * bdp)
+	bytes := float64(gain * bdp)
+	mss := float64(b.s.MSS())
+	return int64(math.Ceil(bytes/mss)) * int64(b.s.MSS())
 }
 
 // bdpBytes computes gain * BDP from the bounded control model.
 func (b *BBR) bdpBytes(gain float64) int64 {
 	return b.bdpBytesAt(gain, b.bw())
+}
+
+// tsoSegsGoal adapts Google's host-offload allowance to the simulator's
+// pacing layer. The pacing-rate term budgets roughly one millisecond of data;
+// the RTT term gives very-low-latency paths extra burst tolerance, capped at
+// the simulator's 64 KiB maximum send quantum.
+func (b *BBR) tsoSegsGoal() int64 {
+	bytes := b.pacingBps / 8 / 1024
+	if b.minRTT > 0 {
+		r := uint64(b.minRTT.Microseconds()) >> 9
+		if r < 63 {
+			bytes += int64(simulatorMaxSendQuantum) >> r
+		}
+	}
+	if bytes > simulatorMaxSendQuantum {
+		bytes = simulatorMaxSendQuantum
+	}
+	segs := bytes / int64(b.s.MSS())
+	if segs < simulatorMinSendQuantumPkt {
+		segs = simulatorMinSendQuantumPkt
+	}
+	return segs
+}
+
+// quantizationBudget reserves three send quanta for the sender, pacing layer,
+// and receiver, enforces MinPipeCwnd, and adds two packets only in ProbeBW:UP
+// so low-BDP gain cycling can actually rise above one BDP.
+func (b *BBR) quantizationBudget(inflight int64) int64 {
+	mss := int64(b.s.MSS())
+	if offload := 3 * b.tsoSegsGoal() * mss; inflight < offload {
+		inflight = offload
+	}
+	if minPipe := int64(4) * mss; inflight < minPipe {
+		inflight = minPipe
+	}
+	if b.state == StateProbeBWUp {
+		inflight += 2 * mss
+	}
+	return inflight
+}
+
+func (b *BBR) inflightBytesAt(gain float64, bw int64) int64 {
+	return b.quantizationBudget(b.bdpBytesAt(gain, bw))
+}
+
+func (b *BBR) targetInflightBytes() int64 {
+	target := b.inflightBytesAt(1.0, b.bw())
+	if b.cwnd < target {
+		target = b.cwnd
+	}
+	return target
 }
 
 // --- state machine --------------------------------------------------------
@@ -706,19 +905,22 @@ func (b *BBR) updateStateMachine(rs tcp.SimRateSample) {
 	}
 
 	if b.state == StateDrain {
-		if rs.InflightBytes <= b.bdpBytesAt(1.0, b.maxBw()) {
+		if rs.InflightBytes <= b.inflightBytesAt(1.0, b.maxBw()) {
 			b.startProbeBWDown(now)
 		}
 	}
 
-	// ProbeRTT scheduling: applies in all states except ProbeRTT itself
-	// (and not before we have a min_rtt sample).
+	// ProbeRTT scheduling uses the independent five-second probe_rtt_min
+	// window. An idle restart can refresh that window from a naturally drained
+	// path, so it suppresses entry until the first ACK of the restarted flight.
 	if b.state != StateProbeRTT && b.minRTT != 0 &&
-		now-b.minRTTStamp > probeRTTInterval && !b.idleRestart {
+		b.probeRTTExpired && !b.idleRestart {
 		b.saveCwnd()
 		b.enter(StateProbeRTT, now)
 		b.probeRTTDone = 0
 		b.probeRTTRoundDone = false
+		b.ackPhase = acksProbeStopping
+		b.nextRoundDelivered = rs.Delivered
 	}
 
 	// Long-term model adaptation runs on every ACK once the pipe has been
@@ -735,7 +937,7 @@ func (b *BBR) updateStateMachine(rs tcp.SimRateSample) {
 	case StateProbeBWDown:
 		// Leave DOWN once inflight is at/below the target with headroom.
 		if rs.InflightBytes <= b.inflightWithHeadroom() &&
-			rs.InflightBytes <= b.bdpBytesAt(1.0, b.maxBw()) {
+			rs.InflightBytes <= b.inflightBytesAt(1.0, b.maxBw()) {
 			b.enterCruise(now)
 		} else if b.timeToProbeBW(now) {
 			// A competing flow's standing queue can make the drain target
@@ -757,6 +959,10 @@ func (b *BBR) updateStateMachine(rs tcp.SimRateSample) {
 			b.startProbeBWDown(now)
 		}
 	case StateProbeRTT:
+		// Samples from the deliberately reduced ProbeRTT window are not robust
+		// bandwidth observations. Mark the connection so packets sent from this
+		// ACK onward produce app-limited delivery-rate samples.
+		b.s.MarkAppLimited()
 		cap := b.probeRTTCwndBytes()
 		if b.probeRTTDone == 0 && rs.InflightBytes <= cap {
 			// Inflight reached the ProbeRTT cap: hold for the duration and
@@ -772,8 +978,9 @@ func (b *BBR) updateStateMachine(rs tcp.SimRateSample) {
 		}
 		if b.probeRTTDone != 0 && b.probeRTTRoundDone && now >= b.probeRTTDone {
 			// The hold sampled RTT with our own queue drained; the windowed
-			// filter has absorbed those samples. Reschedule the next probe.
-			b.minRTTStamp = now
+			// filters have absorbed those samples. Reschedule the next probe.
+			b.probeRTTMinStamp = now
+			b.probeRTTExpired = false
 			b.exitProbeRTT(now)
 		}
 	}
@@ -795,17 +1002,14 @@ func (b *BBR) updateStateMachine(rs tcp.SimRateSample) {
 		b.ceBytesRound = 0
 		b.ackedBytesRound = 0
 	}
+	// Match tcp_bbr.c: idle restart remains latched while processing the first
+	// ACK, then clears once that ACK delivered data.
+	if sampleDeliveredVolume(rs) > 0 {
+		b.idleRestart = false
+	}
 }
 
-var debugBBR = os.Getenv("CCSIM_BBR_DEBUG") != ""
-
 func (b *BBR) enter(state int, now time.Duration) {
-	if debugBBR {
-		fmt.Fprintf(os.Stderr, "[bbr %d] t=%8.3fs %s -> %s bw=%.2fMbps maxbw=%.2f bwlo=%.2f minrtt=%.1fms cwnd=%d infl=%d fullbw=%.2f cnt=%d\n",
-			b.s.LocalPort(), now.Seconds(), StateName(b.state), StateName(state),
-			float64(b.bw())/1e6, float64(b.maxBw())/1e6, float64(min64(b.bwLo, 1<<60))/1e6,
-			b.minRTT.Seconds()*1000, b.s.CwndPkts(), b.s.InflightBytes(), float64(b.fullBw)/1e6, b.fullBwCount)
-	}
 	b.state = state
 	b.stateTime = now
 	b.roundsInPhase = 0
@@ -920,7 +1124,7 @@ func (b *BBR) checkFullPipe(rs tcp.SimRateSample) {
 // and the latest volume the path demonstrably delivered in one sample.
 func (b *BBR) handleQueueTooHighInStartup() {
 	b.filledPipe = true
-	hi := b.bdpBytesAt(1.0, b.maxBw()) + 2*int64(b.s.MSS())
+	hi := b.inflightBytesAt(1.0, b.maxBw())
 	if b.inflightLatest > hi {
 		hi = b.inflightLatest
 	}
@@ -965,7 +1169,7 @@ func (b *BBR) timeToProbeBW(now time.Duration) bool {
 	}
 	// Reno coexistence: probe after about as many rounds as Reno needs to
 	// grow one BDP (bounded at 63).
-	inflightPkts := b.bdpBytes(1.0) / int64(b.s.MSS())
+	inflightPkts := b.inflightBytesAt(1.0, b.bw()) / int64(b.s.MSS())
 	if cwndPkts := b.cwnd / int64(b.s.MSS()); cwndPkts < inflightPkts {
 		inflightPkts = cwndPkts
 	}
@@ -981,7 +1185,7 @@ func (b *BBR) timeToProbeBW(now time.Duration) bool {
 // transmit-time inflight and the data marked lost since that transmit.
 func (b *BBR) lossRateTooHigh(rs tcp.SimRateSample) bool {
 	return rs.TxInflight > 0 &&
-		rs.LostBytes > int64(lossThresh*float64(rs.TxInflight))
+		rs.LostBytes > fixedMulFloor(rs.TxInflight, lossThreshNumerator)
 }
 
 // ecnTooHigh is the ECN arm of IsInflightTooHigh. Google evaluates the
@@ -1029,8 +1233,11 @@ func (b *BBR) handleInflightTooHigh(rs tcp.SimRateSample, now time.Duration) {
 		if infl == 0 {
 			infl = rs.InflightBytes
 		}
-		target := float64(b.bdpBytes(1.0))
-		hi := int64(math.Max(float64(infl), beta*target))
+		target := fixedMulFloor(b.targetInflightBytes(), betaNumerator)
+		hi := infl
+		if target > hi {
+			hi = target
+		}
 		b.inflightHi = hi
 	}
 	if b.state == StateProbeBWUp {
@@ -1186,7 +1393,7 @@ func (b *BBR) adaptLowerBounds() {
 			b.bwLo = b.maxBw()
 		}
 		latest := b.bwLatest
-		cut := int64(beta * float64(b.bwLo))
+		cut := fixedMulFloor(b.bwLo, betaNumerator)
 		if latest > cut {
 			b.bwLo = latest
 		} else {
@@ -1196,7 +1403,7 @@ func (b *BBR) adaptLowerBounds() {
 			b.inflightLo = int64(b.s.CwndPkts()) * int64(b.s.MSS())
 		}
 		latestIn := b.inflightLatest
-		cutIn := int64(beta * float64(b.inflightLo))
+		cutIn := fixedMulFloor(b.inflightLo, betaNumerator)
 		if latestIn > cutIn {
 			b.inflightLo = latestIn
 		} else {
@@ -1248,11 +1455,15 @@ func (b *BBR) cwndGain() float64 {
 }
 
 func (b *BBR) setPacing() {
+	b.setPacingWithGain(b.pacingGain())
+}
+
+func (b *BBR) setPacingWithGain(gain float64) {
 	bw := b.bw()
 	if bw <= 0 {
-		return // no model yet: unpaced (startup burst governed by cwnd)
+		return
 	}
-	rate := int64(b.pacingGain() * float64(bw) * (1 - pacingMargin))
+	rate := int64(gain * float64(bw) * (1 - pacingMargin))
 	if rate < 8000 {
 		rate = 8000
 	}
@@ -1271,7 +1482,9 @@ func (b *BBR) inflightWithHeadroom() int64 {
 	if b.inflightHi == math.MaxInt64 {
 		return math.MaxInt64
 	}
-	return int64(headroom * float64(b.inflightHi))
+	// Google subtracts the truncated 38/256 headroom cut. This is subtly
+	// different from multiplying by 218/256 and truncating the remainder.
+	return b.inflightHi - fixedMulFloor(b.inflightHi, headroomCutNumerator)
 }
 
 func (b *BBR) probeRTTCwndBytes() int64 {
@@ -1282,10 +1495,11 @@ func (b *BBR) probeRTTCwndBytes() int64 {
 	return c
 }
 
-// maxInflightBytes is the draft's BBR.max_inflight: cwnd_gain * BDP plus
-// the fixed 2-MSS ack-aggregation allowance (see package comment).
+// maxInflightBytes is BBR.max_inflight: cwnd_gain*BDP plus the measured
+// extra_acked allowance, then the host/pacing quantization budget.
 func (b *BBR) maxInflightBytes() int64 {
-	return b.bdpBytes(b.cwndGain()) + 2*int64(b.s.MSS())
+	inflight := b.bdpBytes(b.cwndGain()) + b.ackAggregationCwnd()
+	return b.quantizationBudget(inflight)
 }
 
 // setCwnd implements the draft's BBRSetCwnd: the persistent cwnd grows by
