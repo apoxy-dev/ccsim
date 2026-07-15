@@ -90,6 +90,7 @@ func New(cfg *scenario.ScenarioConfig, w *stream.Writer) (*Sim, error) {
 	// seed via SimSender.Seed() (per-process sim configuration, like
 	// SimSynchronousDispatch; one sim runs at a time).
 	tcp.SimSeed = uint64(cfg.Seed)
+	tcp.SimECNLowLatency = cfg.Link.Queue.ECN && cfg.Link.Queue.ECNLowLatency
 
 	bufSize := bufSizeFor(cfg)
 	var err error

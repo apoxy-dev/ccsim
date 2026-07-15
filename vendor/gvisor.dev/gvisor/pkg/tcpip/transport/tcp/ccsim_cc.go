@@ -46,6 +46,12 @@ type SimRateSample struct {
 	AckedBytes int64
 	// Delivered is the cumulative delivered byte count.
 	Delivered int64
+	// DeliveredBytes is the volume delivered by this rate sample
+	// (C.delivered - P.delivered).
+	DeliveredBytes int64
+	// DeliveredCEBytes is the CE-marked subset of DeliveredBytes
+	// (C.delivered_ce - P.delivered_ce).
+	DeliveredCEBytes int64
 	// PriorDelivered is the cumulative delivered count at the transmit
 	// time of the segment this rate sample was taken from, or -1 when the
 	// ACK produced no sample (pure dup-ACK, ECE-only). CCs use it for
@@ -92,10 +98,11 @@ func (h SimSender) MSS() int { return h.s.MaxPayloadSize }
 // CwndPkts returns the congestion window in packets.
 func (h SimSender) CwndPkts() int { return h.s.SndCwnd }
 
-// SetCwndPkts sets the congestion window (packets, floor 2).
+// SetCwndPkts sets the congestion window (packets, floor 1). Registered CCs
+// apply their own steady-state floor; BBR needs a one-packet RTO restart.
 func (h SimSender) SetCwndPkts(c int) {
-	if c < 2 {
-		c = 2
+	if c < 1 {
+		c = 1
 	}
 	h.s.SndCwnd = c
 }
@@ -155,6 +162,14 @@ var SimSeed uint64
 // Seed returns the scenario seed for deriving named per-flow sub-streams.
 func (h SimSender) Seed() uint64 { return SimSeed }
 
+// SimECNLowLatency is the simulated route's TCP_ECN_LOW capability. The
+// harness sets it from queue configuration before creating endpoints.
+var SimECNLowLatency bool
+
+// ECNLowLatency reports whether both endpoints provide precise ECE feedback
+// and the route is explicitly configured for shallow-threshold ECN.
+func (h SimSender) ECNLowLatency() bool { return SimECNLowLatency }
+
 // SimCC is the extended congestion control interface for registered CCs.
 // It embeds the four upstream congestionControl methods plus the ccsim
 // extensions.
@@ -183,6 +198,12 @@ type SimCCProbe struct {
 // SimCCWithProbe is implemented by CCs that export internal state.
 type SimCCWithProbe interface {
 	SimProbe() SimCCProbe
+}
+
+// SimCCWithUndo is implemented by simulation CCs that can restore model state
+// after the transport's Eifel logic proves a recovery episode spurious.
+type SimCCWithUndo interface {
+	UndoRecovery()
 }
 
 var simCCRegistry = map[string]func(SimSender) SimCC{}
@@ -223,6 +244,7 @@ type ccsimSenderState struct {
 
 	// Delivery rate estimation state.
 	delivered     int64
+	deliveredCE   int64
 	deliveredTime tcpip.MonotonicTime
 	firstSent     tcpip.MonotonicTime
 	appLimitedSeq seqnum.Value // app-limited until this sequence is acked
@@ -251,12 +273,18 @@ type ccsimSenderState struct {
 		appLimited    bool
 		txInflight    int64
 		lostAtTx      int64
+		deliveredCE   int64
 	}
+
+	// recoveryResendPending remembers an initial fast retransmit deferred by
+	// pacing so the pacing timer can resume the RFC 6675 recovery walk.
+	recoveryResendPending bool
 }
 
 // ccsimSegState is embedded in segment (one added field upstream).
 type ccsimSegState struct {
 	delivered     int64
+	deliveredCE   int64
 	deliveredTime tcpip.MonotonicTime
 	firstSent     tcpip.MonotonicTime
 	appLimited    bool
@@ -346,7 +374,7 @@ func (s *sender) ccsimInitTimers(ep *Endpoint) {
 		if !s.ccsim.pacingTimer.checkExpiration() {
 			return nil
 		}
-		s.sendData()
+		s.ccsimPacingTimerExpired()
 		return nil
 	}))
 	s.ccsim.delAckTimer.init(ep.stack.Clock(), timerHandler(ep, func() tcpip.Error {
@@ -373,6 +401,7 @@ func (s *sender) ccsimStampSegment(seg *segment) {
 		}
 	}
 	seg.ccsim.delivered = st.delivered
+	seg.ccsim.deliveredCE = st.deliveredCE
 	seg.ccsim.deliveredTime = st.deliveredTime
 	seg.ccsim.firstSent = st.firstSent
 	seg.ccsim.appLimited = st.appLimited
@@ -452,6 +481,7 @@ func (s *sender) ccsimPreAck(rcvdSeg *segment) {
 			st.scratchSeg.appLimited = seg.ccsim.appLimited
 			st.scratchSeg.txInflight = seg.ccsim.txInflight
 			st.scratchSeg.lostAtTx = seg.ccsim.lostAtTx
+			st.scratchSeg.deliveredCE = seg.ccsim.deliveredCE
 		}
 	}
 }
@@ -470,6 +500,9 @@ func (s *sender) ccsimPostAck(rcvdSeg *segment) {
 
 	if st.scratchAcked > 0 {
 		st.delivered += st.scratchAcked
+		if ece {
+			st.deliveredCE += st.scratchAcked
+		}
 		st.deliveredTime = nowMT
 		// Clear app-limited once the limited chain is acked.
 		if st.appLimited && st.appLimitedSeq.LessThanEq(rcvdSeg.ackNumber) {
@@ -498,6 +531,8 @@ func (s *sender) ccsimPostAck(rcvdSeg *segment) {
 	}
 	if st.scratchHasSample {
 		sc := &st.scratchSeg
+		sample.DeliveredBytes = st.delivered - sc.delivered
+		sample.DeliveredCEBytes = st.deliveredCE - sc.deliveredCE
 		sample.TxInflight = sc.txInflight
 		sample.LostBytes = st.lostCum - sc.lostAtTx
 		sample.PriorDelivered = sc.delivered
@@ -552,6 +587,43 @@ func (s *sender) handleRcvdSegment(rcvdSeg *segment) {
 	s.ccsimPreAck(rcvdSeg)
 	s.handleRcvdSegmentInner(rcvdSeg)
 	s.ccsimPostAck(rcvdSeg)
+}
+
+// ccsimUndoRecovery forwards gVisor's spurious-recovery verdict to simulation
+// controllers that keep loss-adapted model state in addition to cwnd.
+func (s *sender) ccsimUndoRecovery() {
+	if w := s.ccsim.wrap; w != nil && w.sim != nil {
+		if u, ok := w.sim.(SimCCWithUndo); ok {
+			u.UndoRecovery()
+		}
+	}
+}
+
+// ccsimPacingTimerExpired resumes whichever send walk pacing suspended.
+// Ordinary and RTO transmission uses sendData; classic SACK recovery selects
+// lost ranges through RFC 6675 NextSeg and must resume that walk instead.
+func (s *sender) ccsimPacingTimerExpired() {
+	if s.ccsim.recoveryResendPending {
+		if !s.FastRecovery.Active {
+			s.ccsim.recoveryResendPending = false
+			s.sendData()
+			return
+		}
+		s.resendSegment()
+		if s.ccsim.recoveryResendPending {
+			return
+		}
+	}
+	if s.FastRecovery.Active && s.ep.SACKPermitted &&
+		s.ep.tcpRecovery&tcpip.TCPRACKLossDetection == 0 {
+		if sr, ok := s.lr.(*sackRecovery); ok {
+			end := s.SndUna.Add(s.SndWnd)
+			dataSent := sr.handleSACKRecovery(s.MaxPayloadSize, end)
+			s.postXmit(dataSent, true /* shouldScheduleProbe */)
+			return
+		}
+	}
+	s.sendData()
 }
 
 // ccsimPacingAllows reports whether pacing permits a transmission now; if

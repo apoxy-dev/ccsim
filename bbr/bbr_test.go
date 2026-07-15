@@ -17,6 +17,8 @@ type fakeSender struct {
 	pacing   int64
 	inflight int64
 	srtt     time.Duration
+	ecnLow   bool
+	recovery bool
 }
 
 func (f *fakeSender) MSS() int                 { return f.mss }
@@ -26,10 +28,11 @@ func (f *fakeSender) SetPacingRateBps(r int64) { f.pacing = r }
 func (f *fakeSender) InflightBytes() int64     { return f.inflight }
 func (f *fakeSender) SRTT() time.Duration      { return f.srtt }
 func (f *fakeSender) Now() time.Duration       { return f.now }
-func (f *fakeSender) InRecovery() bool         { return false }
+func (f *fakeSender) InRecovery() bool         { return f.recovery }
 func (f *fakeSender) LocalPort() uint16        { return 40001 }
 func (f *fakeSender) SetSsthresh(v int)        { f.ssthresh = v }
 func (f *fakeSender) Seed() uint64             { return 42 }
+func (f *fakeSender) ECNLowLatency() bool      { return f.ecnLow }
 
 const mss = 1448
 
@@ -52,6 +55,7 @@ func trace(b *BBR, f *fakeSender, rateBps int64, rtt time.Duration, dur time.Dur
 			Now:             f.now,
 			AckedBytes:      bytesPerStep,
 			Delivered:       delivered,
+			DeliveredBytes:  delivered - prior,
 			PriorDelivered:  prior,
 			DeliveryRateBps: rateBps,
 			RTT:             rtt,
@@ -97,17 +101,62 @@ func TestMaxBwFilterWindow(t *testing.T) {
 	if got := b.maxBw(); got < 95e6 {
 		t.Fatalf("maxBw %.1f Mbps, want ~100", float64(got)/1e6)
 	}
-	// Rate drops; after two (rate-limited, >=2s apart) filter advances the
-	// old sample must be forgotten.
-	b.forceAdvanceMaxBwFilter(f.now)
+	// Close the high-rate probe cycle, then collect a lower-rate cycle. The
+	// previous cycle remains visible until the low-rate cycle closes.
+	b.advanceMaxBwFilter()
 	trace(b, f, 20e6, rtt, 100*time.Millisecond)
 	if got := b.maxBw(); got < 95e6 {
 		t.Fatalf("one advance should retain the old bucket (got %.1f)", float64(got)/1e6)
 	}
-	b.forceAdvanceMaxBwFilter(f.now)
+	b.advanceMaxBwFilter()
 	trace(b, f, 20e6, rtt, 100*time.Millisecond)
 	if got := b.maxBw(); got > 25e6 {
 		t.Fatalf("stale bandwidth survived two advances: %.1f Mbps", float64(got)/1e6)
+	}
+}
+
+func TestRTOInstallsLiveOnePacketCwndAndRestores(t *testing.T) {
+	b, f := newTestBBR()
+	b.state = StateProbeBWCruise
+	b.cwnd = 20 * int64(mss)
+	f.cwnd = 20
+	b.bwLo = 50e6
+	f.recovery = true // gVisor enters RTORecovery before invoking the hook.
+
+	b.HandleRTOExpired()
+	if f.cwnd != 1 || b.cwnd != int64(mss) {
+		t.Fatalf("RTO cwnd live/private = %d/%d bytes, want 1 packet/%d bytes", f.cwnd, b.cwnd, mss)
+	}
+	if b.bwLo != 50e6 {
+		t.Fatalf("RTO cleared bw_lo: got %d, want 50Mbps retained", b.bwLo)
+	}
+	if want := 20 * int64(mss); b.inflightLo != want {
+		t.Fatalf("RTO inflight_lo = %d, want prior cwnd %d", b.inflightLo, want)
+	}
+
+	f.recovery = false
+	b.PostRecovery()
+	if f.cwnd != 20 {
+		t.Fatalf("RTO exit restored cwnd %d packets, want 20", f.cwnd)
+	}
+}
+
+func TestSpuriousRecoveryUndoRestoresModel(t *testing.T) {
+	b, f := newTestBBR()
+	b.state = StateProbeBWCruise
+	b.cwnd, f.cwnd = 20*int64(mss), 20
+	b.bwLo, b.inflightLo, b.inflightHi = 80e6, 300_000, 400_000
+	b.HandleLossDetected()
+
+	b.bwLo, b.inflightLo, b.inflightHi = 40e6, 150_000, 200_000
+	b.cwnd, f.cwnd = 5*int64(mss), 5
+	b.UndoRecovery()
+	if b.bwLo != 80e6 || b.inflightLo != 300_000 || b.inflightHi != 400_000 {
+		t.Fatalf("undo bounds = %d/%d/%d, want 80000000/300000/400000",
+			b.bwLo, b.inflightLo, b.inflightHi)
+	}
+	if f.cwnd != 20 {
+		t.Fatalf("undo cwnd %d packets, want 20", f.cwnd)
 	}
 }
 
@@ -251,6 +300,30 @@ func TestInflightTooHighAbortsProbe(t *testing.T) {
 	}
 	if b.inflightHi == math.MaxInt64 {
 		t.Fatal("inflight_hi not capped after loss abort")
+	}
+}
+
+func TestRiskyProbeStopsAtPriorInflightHiAndReprobes(t *testing.T) {
+	b, f := newTestBBR()
+	b.filledPipe = true
+	b.state = StateProbeBWUp
+	b.inflightHi = 100_000
+	b.prevProbeTooHigh = true
+	rs := tcp.SimRateSample{InflightBytes: 100_000}
+	if !b.isTimeToGoDown(rs) {
+		t.Fatal("probe did not stop at inflight_hi learned from prior excessive feedback")
+	}
+	if !b.stoppedRiskyProbe || b.prevProbeTooHigh {
+		t.Fatalf("risky-probe flags stopped/previous = %v/%v, want true/false",
+			b.stoppedRiskyProbe, b.prevProbeTooHigh)
+	}
+
+	b.startProbeBWDown(f.now)
+	b.roundStart = true
+	b.ackPhase = acksProbeStopping
+	b.adaptLongTermModel(tcp.SimRateSample{DeliveryRateBps: 50e6}, f.now)
+	if b.state != StateProbeBWRefill {
+		t.Fatalf("safe stopped probe entered %s, want immediate REFILL", StateName(b.state))
 	}
 }
 

@@ -80,8 +80,8 @@ func Presets() map[string]*ScenarioConfig {
 		},
 		"ecn-codel": {
 			Seed: 8, Dur: 30,
-			Link: LinkConfig{RateMbps: 50, OwdMs: 10,
-				Queue: QueueConfig{Kind: "fqcodel", ECN: true}},
+			Link: LinkConfig{RateMbps: 50, OwdMs: 2,
+				Queue: QueueConfig{Kind: "fqcodel", ECN: true, ECNLowLatency: true, TargetMs: 1}},
 			Flows: []FlowConfig{bulk("bbr", 0), bulk("cubic", 0)},
 		},
 		// The next three mirror validation-suite experiments (BBR operating

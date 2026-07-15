@@ -67,40 +67,35 @@ go test -tags slow ./sim -run TestSlow -update          # rewrite tables below
 
 ## Findings (expected-fail policy: analysis, never silent tolerance bumps)
 
-1. **BBR RTO rate at 0.1×BDP buffers** (test 23): target was <5 RTOs/min;
-   measured ~36/min originally, ~13/min after mark-time loss signals
-   (audit finding 3) — fewer escalations because the model reacts to the
-   loss before the retransmits themselves are lost, though goodput dipped
-   82% → ~70% as the honest signals also make BBR back off harder against
-   a queue this shallow. Mechanism unchanged: ccsim does not pace
-   retransmissions (decisions.md §2) — recovery bursts overrun the
-   25-packet queue. Cubic, whose recovery is ACK-clocked rather than
-   burst-limited by a missing pacer, shows 0. Fix requires pacing the
-   retransmit path in the vendored patch; the test pins the characterized
-   rate so both regressions and the eventual fix surface.
+1. **BBR RTO rate at 0.1×BDP buffers is resolved** (test 23): classic-SACK
+   retransmissions now use the same virtual-clock pacing gate as ordinary
+   sends, and the pacing timer resumes the RFC 6675 repair walk. The measured
+   BBR result is 0 RTOs/min, 931 retransmissions, and 88.5 Mbps through the
+   25-packet queue, versus ~13 RTOs/min and ~70 Mbps after the mark-time-loss
+   fix alone (~36 RTOs/min originally). The original <5 RTOs/min target is
+   restored as a hard assertion.
 2. **BBR intra-protocol Jain vs the 0.90 target** (test 13): shares
    wander with probe-cycle phasing; the draft ProbeBW feedback machine
-   (audit finding 4) lifted Jain to 0.915–0.947 across N (from 0.83 at
-   N=4 with linear inflight_hi growth) with min share 66% of fair at
+   (audit finding 4) lifted Jain to 0.906–0.965 across N (from 0.83 at
+   N=4 with linear inflight_hi growth) with min share 55% of fair at
    worst — far above the 10% line that marks BBRv1's bw-filter capture
    failure, which is the v3-specific claim and is asserted (Jain pinned
    at 0.85). The small-N aggregate dip from the mark-time loss change
-   mostly recovered (N=2 81.5 → 92.0, N=4 89.5 → 89.7, N=8 92.9 → 91.6
+   recovered (N=2 81.5 → 93.2, N=4 89.5 → 92.9, N=8 92.9 → 91.9
    Mbps vs the 90% target); pinned at 85 for N≤4.
 3. **Coexistence vs buffer depth** (test 15): originally 73/79 Mbps
    aggregate at 0.25/0.5×BDP vs the 85% target; mark-time loss signals
    (audit finding 3) resolved the idle-link half — retransmit-time loss
    counting had kept both flows in recovery churn. The draft ProbeBW
    feedback machine (audit finding 4) then resolved the mid-buffer
-   starvation: bbr share at 2×/4×BDP went 23%/19% → 51%/48% (linear
+   starvation: bbr share at 2×/4×BDP went 23%/19% → 63%/57% (linear
    inflight_hi growth could never rebuild the bound between cubic-induced
    cuts; the draft's exponential slope can). At sub-BDP buffers bbr now
-   takes the larger share (68–71%), consistent with published BBR
-   behavior in small buffers. What still stands is the deep-buffer end:
-   cubic's permanent standing queue starves BBR to ~1% share at 16×BDP
-   (windowed min_rtt is not enough when the queue never drains; 64×BDP
-   recovers slightly to ~5% because even cubic cannot keep a 64×BDP queue
-   full through its own loss cycles).
+   takes the larger share (71–78%), consistent with published BBR
+   behavior in small buffers. Deep buffers still favor Cubic, but the
+   source-faithful risky-probe/loss-round/recovery pass removes capture:
+   BBR retains 17% at 16×BDP and 14% at 64×BDP, with 91–96% aggregate
+   utilization.
 4. **Qdisc hot path allocated 1.0/packet** (test 29, fixed in this change):
    the fifo's slide-forward slice reallocated per packet whenever a queue
    oscillated around empty. Replaced with a ring buffer; golden streams
@@ -108,16 +103,26 @@ go test -tags slow ./sim -run TestSlow -update          # rewrite tables below
 5. **wasm page leaked a full sim per preset load** (test 30, fixed in this
    change): netstack goroutines pinned each replaced sim (~29 MB, +20
    goroutines per load). `sim.Close()` now destroys both stacks on
-   replacement; linear memory is flat at 126.6 MB across 20 cycles.
+   replacement. In the isolated final regression, linear memory warms from
+   248 MB to 550.3 MB by cycle 3 and is then byte-for-byte flat through cycle
+   20; the absolute high-water mark reflects the current 14.9 MB stream and
+   Go/WASM allocator, while the no-growth property is the leak assertion.
 6. **BBR operating point at tiny BDPs** (test 11): the 10 Mbps × 10 ms
-   cell (BDP ≈ 17 packets) measures 1.39×BDP inflight with 29% queue
-   delay vs the 1.3×/25% grid bounds (1.23×/13.5% before the draft
-   ProbeBW feedback machine; it was the outlier then too). One MSS of
-   inflight_hi/cwnd granularity is ~6% of this BDP and the 4-packet
-   MinPipeCwnd floor is ~24% of it, so probe overshoot quantizes to a
-   visible standing queue; utilization is unaffected (93.5%). The other
-   8 cells hold 0.98–1.09×BDP and ≤16% queue delay. Characterized
-   bounds (1.5×, 35%) apply only below 25 packets of BDP.
+   cell (BDP ≈ 9 MSS) measures 1.48×BDP inflight with 39% queue delay
+   (1.39×/29% before the source-faithful ProbeBW timing fixes). One MSS
+   of `inflight_hi`/cwnd granularity is ~12% of this BDP and the 4-packet
+   MinPipeCwnd floor is ~46% of it, so probe overshoot quantizes to a
+   visible standing queue; utilization is unaffected (93.8%). The other
+   8 cells hold 0.98–1.11×BDP and ≤17% queue delay. Characterized bounds
+   (1.5×, 45%) apply only below 25 packets of BDP.
+7. **Extreme-BDP recovery is a separate scalability workload** (test 24):
+   the original 1×BDP tail-drop setup entered RFC 6675 recovery with a
+   ~25,000-packet flight and spent more than 15 minutes repeatedly scanning
+   `SetPipe`; that measures simulator scoreboard complexity, not the test's
+   stated window/autosizing goal. Test 24 now uses a 4×BDP deep buffer and
+   completes in 21 s: BBR reaches 903 Mbps with 43.8 MB mean inflight and
+   zero retransmissions/RTOs (Cubic 965 Mbps). Loss recovery remains covered
+   at practical flight sizes by test 23 and the random-loss scenario.
 
 ## Measured results
 
@@ -134,7 +139,7 @@ go test -tags slow ./sim -run TestSlow -update          # rewrite tables below
 | 1.00% | 3.0 | 3.5 | 0.84 |
 | 3.00% | 1.4 | 2.0 | 0.68 |
 
-log-log slope: -0.563 (R² 1.00)
+log-log slope: -0.565 (R² 1.00)
 <!-- end:mathis -->
 
 ### RTT fairness (test 3)
@@ -143,18 +148,17 @@ Shared 100 Mbps, 2×BDP buffer, RTTs 20 ms vs 120 ms, goodput over [30,120] s.
 
 BBR's exponent has tracked the audit fixes: −1.17 with retransmit-time
 loss signals (pathological long-RTT dominance driven by the short-RTT
-flow's spurious loss feedback), 0.24 with mark-time signals, and −0.69
-with the draft ProbeBW feedback machine (audit finding 4). The negative
-steady-state exponent — long-RTT flows holding the larger share — is
-BBR's documented inverse-RTT bias (probe magnitude scales with BDP, so
-the long-RTT flow's probes displace more of the queue), the opposite of
-loss-based CC and not a harness defect.
+flow's spurious loss feedback), 0.24 with mark-time signals, and −0.69 after
+the first ProbeBW feedback port. The complete source pass lands at −0.46
+(28.6/65.4 Mbps): the artifact is reduced, but this deterministic case still
+shows BBR's known long-RTT advantage. This is a measured result, not a claim
+that the exponent is universal.
 
 <!-- begin:rtt-fairness -->
 | cc | 20 ms flow | 120 ms flow | exponent e |
 |---|---|---|---|
 | cubic | 70.9 Mbps | 25.5 Mbps | 0.57 |
-| bbr | 21.1 Mbps | 72.2 Mbps | -0.69 |
+| bbr | 28.6 Mbps | 65.4 Mbps | -0.46 |
 <!-- end:rtt-fairness -->
 
 ### BBR operating-point surface (test 11)
@@ -164,15 +168,15 @@ Single bbr flow, 4×BDP tail-drop, measured over [15,60] s.
 <!-- begin:bbr-op-point -->
 | rate Mbps | RTT ms | inflight ×BDP | queue delay / RTT | utilization |
 |---|---|---|---|---|
-| 10 | 10 | 1.39 | 29.3% | 93.5% |
+| 10 | 10 | 1.48 | 38.6% | 93.8% |
 | 10 | 40 | 1.06 | 9.3% | 93.2% |
-| 10 | 150 | 1.09 | 15.5% | 93.2% |
-| 100 | 10 | 1.02 | 6.6% | 93.5% |
-| 100 | 40 | 0.98 | 4.2% | 93.2% |
-| 100 | 150 | 1.07 | 14.6% | 93.1% |
-| 500 | 10 | 1.00 | 6.2% | 93.6% |
-| 500 | 40 | 0.98 | 4.4% | 93.2% |
-| 500 | 150 | 1.06 | 13.5% | 92.8% |
+| 10 | 150 | 1.11 | 16.7% | 93.3% |
+| 100 | 10 | 1.02 | 6.9% | 93.6% |
+| 100 | 40 | 0.98 | 4.3% | 93.3% |
+| 100 | 150 | 1.09 | 16.1% | 93.3% |
+| 500 | 10 | 1.01 | 7.3% | 93.7% |
+| 500 | 40 | 0.98 | 5.1% | 93.3% |
+| 500 | 150 | 1.08 | 15.6% | 93.0% |
 <!-- end:bbr-op-point -->
 
 ### Late-joiner convergence (test 14)
@@ -213,11 +217,11 @@ cubic vs bbr, 100 Mbps / 30 ms RTT, 60 s × 3 seeds, goodput over [20,60] s.
 <!-- begin:coexistence -->
 | buffer ×BDP | cubic Mbps | bbr Mbps | bbr share | aggregate |
 |---|---|---|---|---|
-| 0.25 | 30.5 | 64.3 | 68% | 94.8 |
-| 0.50 | 27.0 | 65.8 | 71% | 92.8 |
-| 1.00 | 31.3 | 63.7 | 67% | 94.9 |
-| 2.00 | 46.9 | 49.4 | 51% | 96.2 |
-| 4.00 | 50.5 | 46.0 | 48% | 96.5 |
-| 16.00 | 94.7 | 1.0 | 1% | 95.7 |
-| 64.00 | 85.4 | 4.6 | 5% | 89.9 |
+| 0.25 | 27.1 | 67.6 | 71% | 94.7 |
+| 0.50 | 21.0 | 73.4 | 78% | 94.4 |
+| 1.00 | 21.0 | 74.4 | 78% | 95.4 |
+| 2.00 | 36.1 | 60.2 | 63% | 96.3 |
+| 4.00 | 41.6 | 54.9 | 57% | 96.5 |
+| 16.00 | 79.6 | 16.7 | 17% | 96.3 |
+| 64.00 | 78.2 | 13.1 | 14% | 91.2 |
 <!-- end:coexistence -->

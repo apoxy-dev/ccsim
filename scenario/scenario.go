@@ -31,15 +31,19 @@ type LinkConfig struct {
 
 // QueueConfig selects and parameterizes the queue discipline.
 type QueueConfig struct {
-	Kind       string  `json:"kind"` // "taildrop" | "red" | "codel" | "fqcodel"
-	LimitPkts  int     `json:"limit_pkts,omitempty"`
-	LimitBytes int     `json:"limit_bytes,omitempty"`
-	ECN        bool    `json:"ecn,omitempty"`
-	TargetMs   float64 `json:"target_ms,omitempty"`   // codel/fqcodel
-	IntervalMs float64 `json:"interval_ms,omitempty"` // codel/fqcodel
-	MinTh      float64 `json:"min_th,omitempty"`      // red, packets
-	MaxTh      float64 `json:"max_th,omitempty"`      // red, packets
-	MaxP       float64 `json:"max_p,omitempty"`       // red
+	Kind       string `json:"kind"` // "taildrop" | "red" | "codel" | "fqcodel"
+	LimitPkts  int    `json:"limit_pkts,omitempty"`
+	LimitBytes int    `json:"limit_bytes,omitempty"`
+	ECN        bool   `json:"ecn,omitempty"`
+	// ECNLowLatency models the route-level TCP_ECN_LOW signal required by
+	// Google BBRv3. It asserts a shallow marking threshold and precise ECE
+	// feedback; ordinary RFC 3168 ECN alone is not enough for BBR's ECN law.
+	ECNLowLatency bool    `json:"ecn_low_latency,omitempty"`
+	TargetMs      float64 `json:"target_ms,omitempty"`   // codel/fqcodel
+	IntervalMs    float64 `json:"interval_ms,omitempty"` // codel/fqcodel
+	MinTh         float64 `json:"min_th,omitempty"`      // red, packets
+	MaxTh         float64 `json:"max_th,omitempty"`      // red, packets
+	MaxP          float64 `json:"max_p,omitempty"`       // red
 }
 
 // FlowConfig describes one TCP flow.
@@ -145,6 +149,9 @@ func (c *ScenarioConfig) Validate() error {
 		return fmt.Errorf("scenario: link.queue.kind is required (taildrop|red|codel|fqcodel)")
 	default:
 		return fmt.Errorf("scenario: unknown queue kind %q (want taildrop|red|codel|fqcodel)", c.Link.Queue.Kind)
+	}
+	if c.Link.Queue.ECNLowLatency && !c.Link.Queue.ECN {
+		return fmt.Errorf("scenario: link.queue.ecn_low_latency requires ecn=true")
 	}
 	if len(c.Flows) == 0 {
 		return fmt.Errorf("scenario: at least one flow is required")

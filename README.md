@@ -145,7 +145,10 @@ All changes are in `pkg/tcpip/transport/tcp`:
   `sendSegmentFromPacketBuffer` (data segments carry ACKs too);
   `handleRcvdSegment`
   renamed `handleRcvdSegmentInner`; FMA-blocking conversions in the
-  RFC 7323 RTT smoothing; `SetPipe` body delegates to `ccsimSetPipe`.
+  RFC 7323 RTT smoothing; `SetPipe` body delegates to `ccsimSetPipe`; RTO
+  recovery exit and spurious-recovery callbacks reach the simulation CC.
+- `sack_recovery.go` — pacing gate/charge around direct RFC 6675 repair
+  transmissions; the pacing timer resumes this walk when blocked.
 - `cubic.go` — fractional cwnd accumulator (upstream truncation stalls the
   window at large cwnd); FMA-blocking conversions.
 - `segment.go` — one field: `ccsim ccsimSegState` (delivery-rate stamps).
@@ -162,25 +165,26 @@ Why each change exists is recorded in `docs/decisions.md`.
 
 ## BBRv3
 
-`bbr/` implements **draft-ietf-ccwg-bbr-03** (the July 2025 revision):
+`bbr/` implements **draft-ietf-ccwg-bbr-03** (October 2024):
 Startup (pacing gain 2.77 / cwnd gain 2.0) → Drain (1/2.77) →
 ProbeBW DOWN(0.9)/CRUISE(1.0)/REFILL(1.0)/UP(1.25) → ProbeRTT (cwnd gain
 0.5, 200 ms hold, ~5 s cadence, 10 s min_rtt window); windowed max-bw filter
 (two probe cycles); `inflight_hi`/`inflight_lo` and `bw_lo` bounds with
 beta 0.7 and 0.85 headroom; 2% loss-rate probe abort; startup full-pipe
-detection (<25% growth across 3 rounds, or excessive loss/ECN); ECN alpha
-(gain 1/16, cut factor 1/3, threshold 0.5); pacing at 1% margin.
+detection (<25% growth across 3 rounds, or excessive loss/eligible ECN); ECN
+alpha (gain 1/16, cut factor 1/3, threshold 0.5) only on an explicit
+shallow-threshold route with min RTT ≤5 ms; pacing at 1% margin.
 
 **Pacing** is enforced in the sender integration layer (`ccsim_cc.go`), not
 in the CC: `sendData` releases quantum-sized bursts
 (`min(pacing_rate·1ms, 64KB)`, ≥2 MSS) gated by a virtual-clock timer.
-Pacing granularity is therefore one send quantum; retransmissions in
-recovery are not paced.
+Pacing granularity is therefore one send quantum. Classic-SACK recovery uses
+the same gate and its pacing timer resumes the RFC 6675 repair walk.
 
 Deliberate deviations (full rationale in docs/decisions.md §7 and the
-package comment): retransmit-counter loss attribution, per-ACK (ACE-style)
-ECN echo, simplified extra-acked allowance, rate-limited max-bw filter
-turnover with a cruise aging backstop, DOWN-timeout probe entry.
+package comment): RFC 6675 rather than RACK loss marking, per-ACK (ACE-style)
+ECN echo, simplified extra-acked allowance, and no TLP recovery hook because
+the harness disables RACK/TLP.
 
 Internal state (phase, pacing rate, filtered bw, min_rtt, inflight_hi/lo,
 cycle index) is exported to the probe layer on every sample tick.
@@ -189,16 +193,16 @@ cycle index) is exported to the probe layer on every sample tick.
 
 All ten pass natively (`go test ./sim -run TestScenario`), including
 `fairness` — no expected-fail needed: over t∈[20,60] s the cubic/BBR split
-is ≈59%/41% of a ≥90%-utilized 100 Mbps link. Representative results:
+is ≈33%/67% of a 96%-utilized 100 Mbps link. Representative results:
 
 | scenario | result |
 |---|---|
 | cubic-single | 96.5 Mbps, 3 cwnd cuts, 0 RTO |
-| bbr-single | 91+ Mbps, mean srtt 40.7 ms (base 40), ProbeRTT every ≤5 s |
+| bbr-single | 93 Mbps, mean srtt 41.7 ms (base 40), ProbeRTT every ≤5 s |
 | bufferbloat | cubic steady-state srtt 825 ms vs bbr 31 ms (base 30); 2 overflow cuts in 60 s (HyStart makes the first fill a ~27 s t³ climb) |
-| random-loss 1% | bbr 86-90 Mbps vs cubic 2.8 Mbps |
-| rate-step | drained to ≈1×new BDP within 3 s of the down-step |
-| ecn-codel | 60+ CE marks, zero retransmits, srtt ≤ 2×base |
+| random-loss 1% | bbr 62 Mbps vs cubic 2.7 Mbps (reference `bw_lo` response active) |
+| rate-step | 21 Mbps delivery and 0.81×new BDP after the next probe-cycle turnover (~4.5 s) |
+| ecn-codel | 400+ CE marks, zero retransmits, srtt ≤ 2×base |
 | wasm-parity | byte-identical stream, matching summary |
 
 ## Sample stream format

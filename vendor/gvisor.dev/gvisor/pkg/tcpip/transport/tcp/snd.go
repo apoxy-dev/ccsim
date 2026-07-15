@@ -503,6 +503,11 @@ func (s *sender) updateRTO(rtt time.Duration) {
 // resendSegment resends the first unacknowledged segment.
 // +checklocks:s.ep.mu
 func (s *sender) resendSegment() {
+	if !s.ccsimPacingAllows() { // ccsim patch: pace the initial repair, too.
+		s.ccsim.recoveryResendPending = true
+		return
+	}
+	s.ccsim.recoveryResendPending = false
 	// Don't use any segments we already sent to measure RTT as they may
 	// have been affected by packets being lost.
 	s.RTTMeasureSeqNum = s.SndNxt
@@ -520,6 +525,7 @@ func (s *sender) resendSegment() {
 		s.FastRecovery.HighRxt = seg.sequenceNumber.Add(seqnum.Size(seg.payloadSize())) - 1
 		s.FastRecovery.RescueRxt = seg.sequenceNumber.Add(seqnum.Size(seg.payloadSize())) - 1
 		s.sendSegment(seg)
+		s.ccsimPacingCharge(seg.payloadSize()) // ccsim patch
 		s.ep.stack.Stats().TCP.FastRetransmit.Increment()
 		s.ep.stats.SendErrors.FastRetransmit.Increment()
 
@@ -1173,6 +1179,7 @@ func (s *sender) enterRecovery() {
 // +checklocks:s.ep.mu
 func (s *sender) leaveRecovery() {
 	s.FastRecovery.Active = false
+	s.ccsim.recoveryResendPending = false // ccsim patch
 	s.FastRecovery.MaxCwnd = 0
 	s.DupAckCount = 0
 
@@ -1469,6 +1476,7 @@ func (s *sender) detectSpuriousRecovery(hasDSACK bool, tsEchoReply uint32) {
 	// between fast, SACK or RTO recovery.
 	s.spuriousRecovery = true
 	s.ep.stack.Stats().TCP.SpuriousRecovery.Increment()
+	s.ccsimUndoRecovery() // ccsim patch: restore CC model as well as cwnd.
 
 	// RFC 3522 will detect all kinds of spurious recoveries (fast, SACK and
 	// timeout). Increment the metric for RTO only as we want to track the
@@ -1679,7 +1687,11 @@ func (s *sender) handleRcvdSegmentInner(rcvdSeg *segment) { // ccsim patch: rena
 		if !s.FastRecovery.Active {
 			s.cc.Update(originalOutstanding-s.Outstanding, bestRTT)
 			if s.FastRecovery.Last.LessThan(s.SndUna) {
+				exitingRTO := s.state == tcpip.RTORecovery
 				s.state = tcpip.Open
+				if exitingRTO {
+					s.cc.PostRecovery() // ccsim patch: RTO recovery exit.
+				}
 				// Update RACK when we are exiting fast or RTO
 				// recovery as described in the RFC
 				// draft-ietf-tcpm-rack-08 Section-7.2 Step 4.

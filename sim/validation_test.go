@@ -190,17 +190,12 @@ func TestSubBDPBuffer(t *testing.T) {
 			t.Errorf("%s goodput %.1f Mbps < 30%% of link through a 0.1xBDP buffer", cc, gp)
 		}
 		if cc == "bbr" {
-			// FINDING (documented in docs/validation.md): the <5 RTOs/min
-			// target is not met (~13/min measured; ~36/min before
-			// mark-time loss signals). Mechanism: ccsim does not pace
-			// retransmissions (decisions.md section 2), so recovery
-			// bursts overrun the 25-packet queue and lose the retransmits
-			// themselves, escalating to RTO. The bound below
-			// characterizes the current behavior so a regression (or a
-			// fix) is visible; tightening it to <5 requires paced
-			// retransmissions.
-			if perMin >= 30 {
-				t.Errorf("bbr steady-state RTO rate %.1f/min, above the characterized ~13/min", perMin)
+			// Classic-SACK repairs use the same pacing gate as ordinary BBR
+			// traffic. This closes the earlier recovery-burst failure mode
+			// (~13 RTOs/min after mark-time loss accounting; ~36/min before)
+			// and restores the original reliability target.
+			if perMin >= 5 {
+				t.Errorf("bbr steady-state RTO rate %.1f/min, want <5/min", perMin)
 			}
 		}
 	}

@@ -3,11 +3,13 @@
   "dur_s": 30,
   "link": {
     "rate_mbps": 50,
-    "owd_ms": 10,
+    "owd_ms": 2,
     "loss": 0,
     "queue": {
       "kind": "fqcodel",
-      "ecn": true
+      "ecn": true,
+      "ecn_low_latency": true,
+      "target_ms": 1
     }
   },
   "flows": [

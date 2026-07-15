@@ -30,6 +30,7 @@ func steadySample(b *BBR, f *fakeSender, rateBps int64, rtt, step time.Duration)
 		Now:             f.now,
 		AckedBytes:      rateBps / 8 * int64(step) / int64(time.Second),
 		Delivered:       delivered,
+		DeliveredBytes:  delivered - prior,
 		PriorDelivered:  prior,
 		DeliveryRateBps: rateBps,
 		RTT:             rtt,
@@ -40,11 +41,9 @@ func steadySample(b *BBR, f *fakeSender, rateBps int64, rtt, step time.Duration)
 
 // --- Test 4: filter windows ------------------------------------------------
 
-// The max-bw filter holds two buckets; a bandwidth step down must survive
-// exactly until two bucket turnovers have passed. In CRUISE/DOWN the aging
-// backstop turns a bucket over at most once per second (decisions.md
-// section 7), so a 5x rate drop must be forgotten within about 2 s and must
-// NOT be forgotten before the first turnover.
+// The max-bw filter holds the current and previous ProbeBW cycles. Wall clock
+// alone must never evict a sample; the old high rate disappears only when the
+// low-rate probe cycle reaches ACKS_PROBE_STOPPING and turns the filter over.
 func TestMaxBwFilterDecayTiming(t *testing.T) {
 	b, f := newTestBBR()
 	rtt := 20 * time.Millisecond
@@ -52,29 +51,29 @@ func TestMaxBwFilterDecayTiming(t *testing.T) {
 	if b.state == StateStartup || b.state == StateDrain {
 		t.Fatalf("not in ProbeBW after 4s (state=%s)", StateName(b.state))
 	}
-	// Pin the state to CRUISE and push the probe timer far out so only the
-	// aging backstop advances the filter during the step-down.
+	// Close the high-rate cycle, pin CRUISE, and push the probe timer far out.
+	// A simulator-specific time backstop would now incorrectly age the filter.
+	b.advanceMaxBwFilter()
 	b.enter(StateProbeBWCruise, f.now)
+	b.ackPhase = acksInit
 	b.cycleStamp = f.now
 	b.probeWait = time.Hour
+	b.roundsSinceProbe = -1 << 30 // suppress the independent Reno-rounds trigger
+	b.minRTTStamp = f.now         // suppress an unrelated ProbeRTT interruption
 
 	stepStart := f.now
-	var tHigh, tLow time.Duration // last time still high, first time low
-	for elapsed := time.Duration(0); elapsed < 4*time.Second; elapsed += 10 * time.Millisecond {
+	for elapsed := time.Duration(0); elapsed < 1500*time.Millisecond; elapsed += 10 * time.Millisecond {
 		b.OnAck(steadySample(b, f, 20e6, rtt, 10*time.Millisecond))
-		if b.maxBw() > 95e6 {
-			tHigh = f.now - stepStart
-		} else if tLow == 0 && b.maxBw() <= 25e6 {
-			tLow = f.now - stepStart
-		}
 	}
-	t.Logf("held >=95Mbps until +%v, decayed to <=25Mbps at +%v (window: 2 buckets, backstop 1s/turnover)", tHigh, tLow)
-	if tHigh < 900*time.Millisecond {
-		t.Errorf("old bandwidth forgotten at +%v, before the first bucket turnover (~1s)", tHigh)
+	if got := b.maxBw(); got < 95e6 {
+		t.Fatalf("wall clock evicted prior probe-cycle sample after %v: %.1f Mbps", f.now-stepStart, float64(got)/1e6)
 	}
-	if tLow == 0 || tLow > 2500*time.Millisecond {
-		t.Errorf("old bandwidth survived past two turnovers: low at +%v, want <= ~2.5s", tLow)
+	b.advanceMaxBwFilter()
+	if got := b.maxBw(); got > 25e6 {
+		t.Errorf("old bandwidth survived low-rate probe-cycle turnover: %.1f Mbps", float64(got)/1e6)
 	}
+	t.Logf("held 100Mbps for %v without a cycle boundary; decayed to %.1fMbps at explicit turnover",
+		f.now-stepStart, float64(b.maxBw())/1e6)
 }
 
 // The min_rtt filter is a windowed minimum over 4 x 2.5 s buckets: a stale
@@ -112,8 +111,8 @@ func TestProbeBWCycleSequence(t *testing.T) {
 	var seq []int
 	var times []time.Duration
 	last := -1
-	cruiseEnter, refillEnter, upEnter := time.Duration(0), time.Duration(0), time.Duration(0)
-	var cruiseDur []time.Duration
+	refillEnter, upEnter := time.Duration(0), time.Duration(0)
+	var probeWaitDur []time.Duration
 	var refillRounds []int64
 	for elapsed := time.Duration(0); elapsed < 20*time.Second; elapsed += 5 * time.Millisecond {
 		b.OnAck(steadySample(b, f, 100e6, rtt, 5*time.Millisecond))
@@ -121,12 +120,10 @@ func TestProbeBWCycleSequence(t *testing.T) {
 			seq = append(seq, b.state)
 			times = append(times, f.now)
 			switch b.state {
-			case StateProbeBWCruise:
-				cruiseEnter = f.now
 			case StateProbeBWRefill:
 				refillEnter = f.now
-				if cruiseEnter != 0 {
-					cruiseDur = append(cruiseDur, f.now-cruiseEnter)
+				if b.cycleStamp != 0 {
+					probeWaitDur = append(probeWaitDur, f.now-b.cycleStamp)
 				}
 			case StateProbeBWUp:
 				upEnter = f.now
@@ -164,13 +161,13 @@ func TestProbeBWCycleSequence(t *testing.T) {
 		}
 	}
 
-	// CRUISE duration = probe interval: jittered 2-3 s wall time (or the
-	// Reno-rounds bound, whichever first; at 167 pkts BDP the 63-round cap
-	// is 63*20ms = 1.26s... rounds bound can fire first, so accept [1,3.2]s).
-	for _, d := range cruiseDur {
-		t.Logf("cruise duration %v (probe interval; jitter range 2-3s, reno-rounds floor 63 rtt=1.26s)", d)
-		if d < time.Second || d > 3200*time.Millisecond {
-			t.Errorf("probe interval %v outside [1s, 3.2s]", d)
+	// The probe clock starts on entry to DOWN, not CRUISE. The interval is a
+	// jittered 2-3 s wall-time bound or the Reno-rounds bound, whichever fires
+	// first. At this BDP the latter is about 1.24-1.26 s.
+	for _, d := range probeWaitDur {
+		t.Logf("DOWN-entry to REFILL %v (probe interval; wall range 2-3s, Reno-rounds bound about 1.25s)", d)
+		if d < 1150*time.Millisecond || d > 3200*time.Millisecond {
+			t.Errorf("probe interval %v outside [1.15s, 3.2s]", d)
 		}
 	}
 	// REFILL lasts one packet-timed round.
@@ -180,7 +177,7 @@ func TestProbeBWCycleSequence(t *testing.T) {
 			t.Errorf("REFILL lasted ~%d rounds, want 1", r)
 		}
 	}
-	if len(cruiseDur) == 0 || len(refillRounds) == 0 {
+	if len(probeWaitDur) == 0 || len(refillRounds) == 0 {
 		t.Fatal("did not observe complete probe cycles in 20s")
 	}
 }
@@ -242,14 +239,11 @@ func TestLossResponseTable(t *testing.T) {
 		{
 			// First loss: bw_lo initialized from max_bw then cut to
 			// max(latest, beta*bw_lo) = max(40, 0.7*100) = 70. inflight_lo
-			// initializes from BDP of the just-cut bw (70e6/8*20ms =
-			// 175000; deviation from the reference's cwnd init, see
-			// decisions.md section 7) and is then beta-cut since
-			// latestI is below the floor. Runtime float: expected value
-			// computed with the same expression the code uses.
+			// initializes from the live 10-packet cwnd, exactly like
+			// bbr_init_lower_bounds, then is beta-cut.
 			name: "first-loss-beta-cut", state: StateProbeBWCruise,
-			bwLo: maxI, inflLo: maxI, latest: 40e6, latestI: 100_000, loss: true,
-			wantBw: 70e6, wantIn: betaCut(175_000),
+			bwLo: maxI, inflLo: maxI, latest: 40e6, latestI: 1_000, loss: true,
+			wantBw: 70e6, wantIn: betaCut(10 * int64(mss)),
 		},
 		{
 			// Latest above the beta floor: bw_lo tracks latest, no deeper cut.
@@ -327,14 +321,53 @@ func TestProbeAbortSetsInflightHi(t *testing.T) {
 	t.Logf("inflight_hi latched at %d (inflight=%d, beta*BDP=%.0f)", b.inflightHi, f.inflight, beta*target)
 }
 
+// An app-limited high-loss sample is not robust enough to lower inflight_hi,
+// but Google still consumes the once-per-probe feedback token, marks the
+// probe risky, and leaves UP. Ignoring it entirely can keep accelerating
+// after the probe has already produced excessive loss.
+func TestAppLimitedHighLossStopsProbeWithoutCut(t *testing.T) {
+	b, f := newTestBBR()
+	b.filledPipe = true
+	b.state = StateProbeBWUp
+	b.minRTT = 20 * time.Millisecond
+	b.maxBwFilter[0] = 100e6
+	b.inflightHi = 300_000
+	b.bwProbeSamples = true
+	b.probeStartDelivered = 0
+	b.lastSample.Delivered = 100_000
+	s := tcp.SimRateSample{
+		Now:             f.now,
+		AckedBytes:      mss,
+		Delivered:       101_448,
+		DeliveredBytes:  mss,
+		PriorDelivered:  50_000,
+		DeliveryRateBps: 50e6,
+		TxInflight:      200_000,
+		LostBytes:       10_000,
+		IsAppLimited:    true,
+	}
+	b.adaptLongTermModel(s, f.now)
+	if b.state != StateProbeBWDown || !b.prevProbeTooHigh || b.bwProbeSamples {
+		t.Fatalf("app-limited high loss did not stop/consume probe: state=%s risky=%v samples=%v",
+			StateName(b.state), b.prevProbeTooHigh, b.bwProbeSamples)
+	}
+	if b.inflightHi != 300_000 {
+		t.Fatalf("app-limited high loss cut inflight_hi to %d, want unchanged 300000", b.inflightHi)
+	}
+}
+
 // --- Test 7: ECN response ----------------------------------------------------
 
 // Alpha follows the EWMA alpha' = (1-g)*alpha + g*ce_frac with g = 1/16,
 // updated once per round.
 func TestECNAlphaEWMA(t *testing.T) {
 	b, f := newTestBBR()
-	rtt := 20 * time.Millisecond
+	rtt := 4 * time.Millisecond
+	f.ecnLow = true
 	trace(b, f, 50e6, rtt, time.Second)
+	if !b.ecnEligible {
+		t.Fatal("shallow precise-ECN route with 4ms min_rtt did not become eligible")
+	}
 
 	// Exact single-round check: stage a round with a known CE byte
 	// fraction and close it with one round-boundary sample, then verify
@@ -373,34 +406,136 @@ func TestECNAlphaEWMA(t *testing.T) {
 	t.Logf("alpha converging: %.4f after 4 half-CE rounds", b.ecnAlpha)
 }
 
-// The ECN cut scales bw_lo by (1 - alpha*ecnFactor) with a floor of 1/3,
-// and composes with a loss cut in the same round (loss beta first, then the
-// ECN scale, per adaptLowerBounds order).
-func TestECNAndLossCompose(t *testing.T) {
+// bbr_reset_congestion_signals resets loss-round state, but ECN alpha uses
+// the independent ordinary packet-round clock and cumulative delivered/CE
+// deltas. A ProbeBW transition must not truncate that alpha interval.
+func TestCongestionResetPreservesECNAlphaRound(t *testing.T) {
 	b, _ := newTestBBR()
+	b.lossInRound, b.ecnInRound = true, true
+	b.lossEventsRound, b.lostBytesRound = 3, 12_000
+	b.bwLatest, b.inflightLatest = 50e6, 100_000
+	b.ackedBytesRound, b.ceBytesRound = 10_000, 4_000
+	b.resetCongestionSignals()
+	if b.lossInRound || b.ecnInRound || b.lossEventsRound != 0 ||
+		b.lostBytesRound != 0 || b.bwLatest != 0 || b.inflightLatest != 0 {
+		t.Fatal("loss-round congestion signals survived reset")
+	}
+	if b.ackedBytesRound != 10_000 || b.ceBytesRound != 4_000 {
+		t.Fatalf("ECN alpha round was truncated: acked=%d ce=%d",
+			b.ackedBytesRound, b.ceBytesRound)
+	}
+}
+
+func TestECNEligibilityAndSampleThreshold(t *testing.T) {
+	cases := []struct {
+		name string
+		low  bool
+		rtt  time.Duration
+		want bool
+	}{
+		{"ordinary-ecn", false, 4 * time.Millisecond, false},
+		{"rtt-too-large", true, 20 * time.Millisecond, false},
+		{"shallow-low-rtt", true, 4 * time.Millisecond, true},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			b, f := newTestBBR()
+			f.ecnLow, b.minRTT, b.roundStart = c.low, c.rtt, true
+			b.updateLossECN(tcp.SimRateSample{AckedBytes: 100, ECE: true})
+			if b.ecnEligible != c.want {
+				t.Fatalf("ecnEligible=%v, want %v", b.ecnEligible, c.want)
+			}
+		})
+	}
+	b, _ := newTestBBR()
+	b.ecnEligible = true
+	if !b.ecnTooHigh(tcp.SimRateSample{DeliveredBytes: 1000, DeliveredCEBytes: 501}) {
+		t.Fatal("sample above 50% CE did not trip ECN gate")
+	}
+	if b.ecnTooHigh(tcp.SimRateSample{DeliveredBytes: 1000, DeliveredCEBytes: 500}) {
+		t.Fatal("sample exactly at 50% CE tripped strict threshold")
+	}
+}
+
+// ECN reduces only inflight_lo. If loss and ECN occur together, both
+// candidates are computed from the pre-cut bound and the lower is selected;
+// the cuts do not compound and ECN never reduces bw_lo.
+func TestECNAndLossIndependentLowerBounds(t *testing.T) {
+	b, _ := newTestBBR()
+	b.state = StateProbeBWCruise
+	b.ecnEligible = true
+	b.ecnAlpha = 1
+	b.lossInRound = true
+	b.bwLatest = 10e6
+	b.inflightLatest = 10_000
+	b.ecnInRound = true
+	b.ceBytesRound, b.ackedBytesRound = 500, 1000
+	b.bwLo, b.inflightLo = 100e6, 300_000
+	b.adaptLowerBounds()
+	wantBw := betaCut(100e6)
+	wantIn := int64(float64(300_000) * (1 - ecnFactor))
+	if b.bwLo != wantBw {
+		t.Errorf("bw_lo = %d, want loss-only cut %d", b.bwLo, wantBw)
+	}
+	if b.inflightLo != wantIn {
+		t.Errorf("inflight_lo = %d, want min(loss=%d, ecn=%d) = %d",
+			b.inflightLo, betaCut(300_000), wantIn, wantIn)
+	}
+	t.Logf("loss+ECN: bw_lo=%d (loss only), inflight_lo=%d (min independent candidates)", b.bwLo, b.inflightLo)
+}
+
+// Lower-bound adaptation has its own packet-timed loss round. A loss seen
+// midway through BBR's ordinary round must not cut the model at that ordinary
+// boundary; it waits until a segment sent after the loss-time delivered mark
+// is ACKed, thereby collecting one complete flight of delivery signals.
+func TestLowerBoundsWaitForIndependentLossRound(t *testing.T) {
+	b, f := newTestBBR()
+	b.filledPipe = true
+	b.state = StateProbeBWCruise
 	b.maxBwFilter[0] = 100e6
 	b.minRTT = 20 * time.Millisecond
-	b.state = StateProbeBWCruise
-	b.ecnAlpha = 0.5
-	b.lossInRound = true
-	b.bwLatest = 10e6 // far below the beta floor
-	b.inflightLatest = 10_000
-	b.ceBytesRound, b.ackedBytesRound = 500, 1000 // CE present this round
-	b.bwLo, b.inflightLo = math.MaxInt64, math.MaxInt64
-	b.adaptLowerBounds()
-	scale := 1 - 0.5*ecnFactor // = 1 - alpha*factor = 0.8333
-	wantBw := int64(float64(int64(beta*100e6)) * scale)
-	if b.bwLo != wantBw {
-		t.Errorf("composed bw_lo = %d, want %d (beta cut then ECN scale %.4f)", b.bwLo, wantBw, scale)
-	}
-	t.Logf("loss+ECN composed: bw_lo = 100e6 * 0.7 * %.4f = %d", scale, b.bwLo)
+	b.minRTTStamp = f.now
+	b.probeWait = time.Hour
+	b.roundsSinceProbe = -1 << 30
+	b.nextRoundDelivered = math.MaxInt64 // ordinary round clock is irrelevant
+	b.lossRoundDelivered = 10_000
+	b.bwLo, b.inflightLo = 100e6, 100_000
 
-	// Floor: alpha=1 would give scale 2/3... the floor binds at 1/3 when
-	// alpha*factor > 2/3, i.e. alpha > 2 — unreachable since alpha <= 1;
-	// verify the clamp arithmetic directly instead.
-	if s := 1 - float64(3.0*ecnFactor); s > 1.0/3 {
-		t.Errorf("floor arithmetic: scale %v should clamp at 1/3", s)
+	ack := func(delivered, prior, rate, lostCum int64) {
+		f.now += 10 * time.Millisecond
+		b.OnAck(tcp.SimRateSample{
+			Now:             f.now,
+			AckedBytes:      10_000,
+			Delivered:       delivered,
+			DeliveredBytes:  delivered - prior,
+			PriorDelivered:  prior,
+			DeliveryRateBps: rate,
+			RTT:             20 * time.Millisecond,
+			Interval:        10 * time.Millisecond,
+			InflightBytes:   100_000,
+			TxInflight:      100_000,
+			LostBytesCum:    lostCum,
+		})
 	}
+
+	// The first mark moves the loss-round marker to C.delivered=20,000.
+	ack(20_000, 9_000, 80e6, mss)
+	ack(30_000, 19_999, 70e6, mss)
+	if b.bwLo != 100e6 || b.inflightLo != 100_000 {
+		t.Fatalf("bounds cut before a full post-loss flight: bw_lo=%d inflight_lo=%d", b.bwLo, b.inflightLo)
+	}
+
+	// This sample was sent at the loss marker, closing the independent loss
+	// round. The 80 Mbps rate floor dominates beta*100 Mbps.
+	ack(40_000, 20_000, 60e6, mss)
+	if b.bwLo != 80e6 {
+		t.Fatalf("bw_lo=%d after loss round, want latest delivery floor 80000000", b.bwLo)
+	}
+	if b.inflightLo != betaCut(100_000) {
+		t.Fatalf("inflight_lo=%d after loss round, want beta cut %d", b.inflightLo, betaCut(100_000))
+	}
+	t.Logf("loss at delivered=20000: held bounds for a full flight, then cut to %.1fMbps/%dB",
+		float64(b.bwLo)/1e6, b.inflightLo)
 }
 
 // --- Test 8: startup exit ------------------------------------------------------
@@ -459,6 +594,7 @@ func TestStartupExitOnLoss(t *testing.T) {
 	// lost-since-transmit volume exceeds 2% of its transmit-time inflight.
 	b.lossInRound = true
 	b.lossEventsRound = fullLossCount
+	f.recovery = true
 	s := steadySample(b, f, 20e6, rtt, rtt)
 	s.TxInflight = f.inflight
 	s.LostBytes = int64(0.05 * float64(f.inflight))
@@ -466,7 +602,15 @@ func TestStartupExitOnLoss(t *testing.T) {
 	if b.state == StateStartup {
 		t.Fatalf("startup survived %d loss events at 5%% lost bytes", fullLossCount)
 	}
-	t.Logf("loss-based startup exit -> %s", StateName(b.state))
+	if b.inflightHi == math.MaxInt64 {
+		t.Fatal("loss-based startup exit did not initialize inflight_hi")
+	}
+	wantFloor := b.bdpBytesAt(1.0, b.maxBw()) + 2*int64(mss)
+	if b.inflightHi < wantFloor || b.inflightHi < b.inflightLatest {
+		t.Fatalf("startup inflight_hi=%d below model/latest floors %d/%d",
+			b.inflightHi, wantFloor, b.inflightLatest)
+	}
+	t.Logf("loss-based startup exit -> %s with inflight_hi=%d", StateName(b.state), b.inflightHi)
 }
 
 // A single loss during Startup must neither engage the short-term model

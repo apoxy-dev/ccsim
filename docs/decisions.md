@@ -38,11 +38,12 @@ registered) in `ccsimWrapper` and adds:
   at transmit, one `SimRateSample` per ACK computed in a pre/post wrapper
   around `handleRcvdSegment` (upstream body renamed `handleRcvdSegmentInner`,
   a one-line diff).
-- Pacing enforced in `sendData`'s transmit loop: a virtual-clock timer gate
+- Pacing enforced in `sendData`'s transmit loop and the classic-SACK repair
+  walk: a virtual-clock timer gate
   (`ccsimPacingAllows` / `ccsimPacingCharge`). Granularity is one send
-  quantum: `min(pacing_rate * 1ms, 64KB)`, at least 2×MSS. Retransmissions
-  in recovery bypass pacing (they are triggered outside `sendData`); this is
-  a simplification, documented, and only affects loss episodes.
+  quantum: `min(pacing_rate * 1ms, 64KB)`, at least 2×MSS. A blocked repair is
+  resumed by the pacing timer in the RFC 6675 walk (details and measured
+  shallow-buffer effect in §16).
 
 ## 3. ECN path
 
@@ -94,20 +95,32 @@ barrier. Byte parity native↔wasm is enforced by test.
   a cubic competitor's standing queue drove `cwnd = 2·bw·min_rtt` far below
   `bw·RTT_actual` — a positive-feedback starvation spiral (BBR share → 2%).
   The windowed filter (4×2.5s buckets) fixes coexistence (39-48% share).
-- **Max-bw filter aging**: bucket turnover is rate-limited to ≥2 s (the
-  draft window is *two probe cycles* of 2-3 s; contested mini-cycles would
-  otherwise erase bandwidth memory), plus a 1 s aging backstop in
-  CRUISE/DOWN so a rate drop that never causes loss (cwnd-capped inflight
-  fitting the queue, as in the rate-step scenario) is forgotten within ~2 s.
+- **Max-bw filter aging**: the two buckets turn over only at the reference's
+  ProbeBW `ACKS_PROBE_STOPPING` feedback boundary. There is no wall-clock
+  backstop or rate limiter; an empty current bucket preserves the old sample.
+  In the rate-step seed this intentionally moves down-rate adaptation from the
+  invented ~2 s deadline to the next completed probe cycle (~4 s).
 - **DOWN exit**: also exits to REFILL when the probe timer expires; the
   inflight≤BDP drain target is unreachable when a competitor maintains a
   standing queue (matches the reference implementation's
   `bbr_check_time_to_probe_bw` behavior in DOWN).
-- **Excess-queue drain from CRUISE**: inflight > 1.5×BDP re-enters DOWN to
-  deplete queue built at a stale higher rate.
-- Loss is observed via the endpoint's cumulative retransmit counter
-  (retransmitted segments × MSS approximates lost bytes); netstack does not
-  expose per-packet loss marks without much deeper surgery.
+- **No CRUISE-to-DOWN queue heuristic**: CRUISE stays neutral until its normal
+  probe timer. The old inflight >1.5×BDP transition was simulator-specific and
+  made the rate-step look faster than `tcp_bbr.c`.
+- Loss is counted when the RFC 6675 scoreboard first marks an original
+  transmission lost (and for every outstanding un-SACKed segment on RTO), with
+  per-transmit `P.lost` and `P.tx_in_flight` stamps. This approximates Google's
+  per-SKB lost-prefix hook at rate-sample granularity (§14).
+- **Latest delivery signals use an independent loss-round clock.** The first
+  loss mark records `C.delivered`; `bw_latest`/`inflight_latest` then collect a
+  complete flight before lower-bound adaptation. Using the ordinary BBR round
+  could cut `bw_lo` less than one RTT after a mid-flight loss from only partial
+  evidence. The boundary sample seeds the next loss round, as in
+  `bbr_advance_latest_delivery_signals`.
+- **ECN eligibility is explicit**: `queue.ecn_low_latency` models negotiated
+  precise ECE plus the route's `TCP_ECN_LOW` bit. BBR latches eligibility only
+  when min RTT is at most 5 ms. Ordinary RFC 3168 ECN is still carried and is
+  handled by stock CCs, but does not activate Google BBRv3's ECN control law.
 - **Alignment pass (post-review, vs google/bbr tcp_bbr.c)**: rounds are
   packet-timed and anchored at the sample segment's transmit time
   (`SimRateSample.PriorDelivered`), matching `prior_delivered` semantics —
@@ -116,6 +129,10 @@ barrier. Byte parity native↔wasm is enforced by test.
   inflight_hi-bytes threshold (a unit bug previously grew it ~MSS× too
   fast), and `bw_probe_up_acks` is reset on REFILL entry. Startup's ECN
   exit requires two consecutive high-CE rounds (`bbr_full_ecn_cnt`).
+- A congestion-driven Startup exit initializes `inflight_hi` to the larger of
+  the model BDP (plus the simulator's quantization allowance) and
+  `inflight_latest`, matching `bbr_handle_queue_too_high_in_startup`; this
+  loss/ECN exit is not suppressed merely because the sample is app-limited.
   ProbeRTT exit requires a packet-timed round at the reduced window in
   addition to the 200 ms hold. `bw_lo`'s floor is `max(1, bw_lo)` — an
   earlier 0.2·max_bw floor silently neutered the beta cuts on >5× rate
@@ -387,29 +404,57 @@ structure:
   verdict) from `full_bw_reached` (lifetime latch, our `filledPipe`);
   startup exit uses the same estimator unchanged.
 
-Not adopted: `prev_probe_too_high` and `stopped_risky_probe` are
-tcp_bbr.c internals absent from draft-03, and per-lost-packet
-`BBRHandleLostPacket` lost-prefix interpolation stays approximated at
-rate-sample granularity (§14).
+The source-specific `prev_probe_too_high` / `stopped_risky_probe` path is also
+modeled: after excessive probe feedback, the next UP stops at the learned
+`inflight_hi`; if the resulting flight is safe, ACKS_PROBE_STOPPING immediately
+starts another REFILL before accelerating beyond it. The Reno-coexistence
+probe clock uses a separate `rounds_since_probe` counter initialized to a
+random 0–1 rounds at DOWN entry, so DOWN/CRUISE state transitions do not reset
+the reference timer. Per-lost-packet `BBRHandleLostPacket` lost-prefix
+interpolation remains approximated at rate-sample granularity (§14).
 
-Validation deltas (tables regenerated in docs/validation.md): the
-mid-buffer coexistence starvation is gone — bbr share vs cubic at
-2×/4×BDP went 23%/19% → 51%/48% (the linear growth could never rebuild
-`inflight_hi` against cubic between cuts), and at sub-BDP buffers bbr now
-takes the larger share (68-71%), consistent with published BBR behavior
-in small buffers. The 16×BDP starvation (1% share) stands — that is the
-windowed min_rtt under cubic's permanent standing queue, not the probe
-machine. Intra-bbr aggregates recovered (N=2 81.5 → 92.0 Mbps, the §14
-dip; pin raised 80 → 85), late-joiner convergence tightened to 5-9 s
-over seeds 34-37, and the RTT-fairness exponent moved 0.24 → -0.69:
-long-RTT flows now hold the larger share, which is BBR's documented
-inverse-RTT bias (probe magnitude scales with BDP), not a defect — the
-draft-faithful machine restored a known trait. Random-loss gives back a
-little (89.5 → 87.5 Mbps): safe samples raising `inflight_hi` to
-`tx_in_flight` keep the operating point nearer the loss gate under
-random loss. The one cell that ran hotter is the operating-point grid's
-smallest BDP (10 Mbps × 10 ms, ~17 packets): 1.23 → 1.39×BDP inflight —
-MSS-granular `inflight_hi` growth and the 4-packet MinPipeCwnd floor are
-large fractions of a BDP that small; characterized in validation.md
-finding 6. Goldens regenerated: every bbr-carrying preset shifts (probe
-cadence changed), cubic-only presets are byte-identical.
+Validation deltas after the complete high-severity pass (tables regenerated
+in docs/validation.md): bbr share vs cubic is 63%/57% at 2×/4×BDP and remains
+17%/14% even at 16×/64×BDP, replacing the earlier 1% deep-buffer collapse.
+Intra-bbr Jain is 0.965/0.965/0.906 for 2/4/8 flows at 92–93 Mbps aggregate.
+The source-faithful Startup `inflight_hi` initialization makes the final
+20 ms/120 ms RTT split 28.6/65.4 Mbps (exponent -0.46): materially better
+than the audit's -1.17 artifact, but still showing long-RTT dominance in this
+seed. Reference-style loss rounds make the 1% random-loss case more
+conservative (61.9 Mbps, still 23× Cubic) because `bw_lo` now cuts once per
+complete loss flight instead of using an unrelated round boundary.
+The smallest operating-point cell (10 Mbps × 10 ms, BDP ~9 MSS) is the one
+outlier at 1.48×BDP/39% queue delay; the four-packet minimum window is nearly
+half its BDP. Goldens were regenerated for every stream changed by the ECN,
+ProbeBW, loss-round, and recovery corrections.
+
+## 16. BBR recovery callbacks follow the transport's real recovery lifecycle
+
+The BBR audit's recovery finding could not be fixed entirely inside
+`bbr/bbr.go`: gVisor's classic SACK recovery sends retransmissions directly
+from `sackRecovery`, bypassing the pacing gate in `sender.sendData`, and the
+RTO path returns to `Open` without calling the congestion controller's
+`PostRecovery` hook. Consequently BBR's private `cwnd` could be reduced on an
+RTO while the transport kept transmitting with the old live `SndCwnd`, the
+saved window was never restored after an RTO, and a SACK repair burst could
+overrun a shallow queue even though ordinary data was paced.
+
+The ccsim netstack patch therefore treats recovery as part of its existing
+simulation CC surface:
+
+- RTO recovery exit invokes `PostRecovery`, just like fast-recovery exit.
+- A new optional `SimCCWithUndo` callback reports gVisor's existing Eifel
+  spurious-recovery verdict. BBR uses it to restore the pre-recovery cwnd and
+  loss-adapted model bounds; stock controllers are unchanged.
+- Classic-SACK retransmissions use the same virtual-clock pacing gate and send
+  quantum as ordinary data. If pacing blocks the initial fast retransmit or a
+  later RFC 6675 repair, the pacing timer resumes the recovery walk instead of
+  incorrectly switching to the ordinary new-data walk.
+
+BBR's RTO entry sets the live transport cwnd to one packet (the transport
+clears its pipe immediately after the callback), preserves `bw_lo`, and seeds
+an unset `inflight_lo` from the last good cwnd when not probing. This matches
+the draft's `C.inflight + 1` restart and Google `tcp_bbr.c`'s retained-model
+behavior. RACK and TLP remain disabled by `sim/newStack` for deterministic
+runtime cost, so the Google `CA_EVENT_TLP_RECOVERY` hook is deliberately not
+modeled.

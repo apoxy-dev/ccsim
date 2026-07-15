@@ -28,6 +28,7 @@ func TestValidationErrors(t *testing.T) {
 		{"bad loss", func(c *ScenarioConfig) { c.Link.Loss = 1.5 }},
 		{"bad queue kind", func(c *ScenarioConfig) { c.Link.Queue.Kind = "fifo9000" }},
 		{"no queue limit", func(c *ScenarioConfig) { c.Link.Queue.LimitPkts = 0 }},
+		{"low latency ECN without ECN", func(c *ScenarioConfig) { c.Link.Queue.ECNLowLatency = true }},
 		{"no flows", func(c *ScenarioConfig) { c.Flows = nil }},
 		{"bad cc", func(c *ScenarioConfig) { c.Flows[0].CC = "vegas" }},
 		{"bad app", func(c *ScenarioConfig) { c.Flows[0].App.Kind = "torrent" }},
