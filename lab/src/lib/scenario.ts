@@ -83,10 +83,10 @@ export function scenarioFor(cc: CC, cfg: LabCfg): object {
     // The figures resample onto a 20 ms grid (series.toPts dt), so finer
     // sampling is pure stream weight — this cuts streams 20× vs the 1 ms
     // default, which is what makes shipping precomputed defaults viable.
-    // wire_stats adds compact cumulative enqueue/dequeue counters plus an
-    // arrival-burstiness record per window. Fig. 3 derives its aggregate
-    // particles from those actual link-hook counters without shipping the
-    // much larger per-packet event stream.
+    // wire_stats adds compact cumulative enqueue/dequeue counters, an
+    // arrival-burstiness record, and the sender's latest raw RTT sample per
+    // window. Fig. 3 derives its particles and actual-RTT trace from that
+    // telemetry without shipping the much larger per-packet event stream.
     sample: { interval_ms: 20, wire_stats: true },
   }
 }

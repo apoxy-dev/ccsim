@@ -15,6 +15,7 @@ var goldenRecords = []Record{
 	{T: 0.002, Flow: 1, Kind: KindSRTTSec, Value: 0.0402},
 	{T: 1.5, Flow: 0xFFFF, Kind: KindQDepthPkts, Value: 123},
 	{T: 2.25, Flow: 2, Kind: KindFCTSec, Value: 0.181},
+	{T: 2.5, Flow: 0, Kind: KindRTTSampleSec, Value: 0.052},
 	{T: 30, Flow: 0, Kind: KindCEMark, Value: 1},
 }
 

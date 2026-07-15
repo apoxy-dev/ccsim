@@ -15,6 +15,7 @@ func (s *Sim) fillSenderTap(f *flow, m *probe.FlowMetrics) {
 		return
 	}
 	m.InflightBytes = float64(info.InflightBytes)
+	m.RTTSample = info.RTTSample
 	m.PacingBps = float64(info.PacingBps)
 	m.DeliveryBps = float64(info.DeliveryBps)
 	m.Retransmits = info.RetransSegs

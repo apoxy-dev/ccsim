@@ -67,13 +67,15 @@ function StatusLine({
   running,
   pct,
   durS,
+  runCount = 2,
   onReset,
 }: {
   left?: string
   error?: string
   running: boolean
-  pct: number // combined progress of the pair, 0..1
+  pct: number // combined progress for the represented run(s), 0..1
   durS: number
+  runCount?: number
   onReset: () => void
 }) {
   return (
@@ -85,7 +87,7 @@ function StatusLine({
         ) : running ? (
           `simulating… ${Math.round(pct * 100)} %`
         ) : (
-          `${durS} s × 2 runs ready`
+          runCount === 1 ? `${durS} s run ready` : `${durS} s × ${runCount} runs ready`
         )}
       </span>
       <button className="btn-toggle" onClick={onReset}>
@@ -100,6 +102,14 @@ export function App() {
   const d = useMemo(() => derive(cfg), [cfg])
   const set = (k: keyof LabCfg) => (v: number) => setCfg((c) => ({ ...c, [k]: v }))
 
+  // Fig. 3 is a separate experiment. Its link knobs and selected-flow run
+  // never reuse or mutate Fig. 1's comparison state.
+  const [pipeCfg, setPipeCfg] = useState<LabCfg>(HEAVY_CFG)
+  const pipeD = useMemo(() => derive(pipeCfg), [pipeCfg])
+  const pipeSet = (k: keyof LabCfg) => (v: number) =>
+    setPipeCfg((c) => ({ ...c, [k]: v }))
+  const [pipeFlow, setPipeFlow] = useState<CC>('naive')
+
   const [bwLossPct, setBwLossPct] = useState(0)
   const [bwJitterMs, setBwJitterMs] = useState(0)
 
@@ -113,11 +123,11 @@ export function App() {
     return c && b ? { cubic: c, bbr: b } : null
   }, [cfg])
   const runs = useSimPair(cubicScn, bbrScn, pre1)
-  // The naive pipe is a fixed control experiment: 150 Mbps offered into
-  // the canonical 100 Mbps bottleneck, independent of the comparison sliders.
-  const naiveScn = useMemo(() => scenarioFor('naive', HEAVY_CFG), [])
-  const naivePre = useMemo(() => fig1Precomp('naive', HEAVY_CFG), [])
-  const naive = useSimRun(naiveScn, naivePre)
+  // Run only Fig. 3's selected controller. This keeps its state isolated
+  // without making a slider change launch three full Go/Wasm simulations.
+  const pipeScn = useMemo(() => scenarioFor(pipeFlow, pipeCfg), [pipeFlow, pipeCfg])
+  const pipePre = useMemo(() => fig1Precomp(pipeFlow, pipeCfg), [pipeFlow, pipeCfg])
+  const pipe = useSimRun(pipeScn, pipePre)
   const bwCubicScn = useMemo(() => bwStepScenario('cubic', bwLossPct, bwJitterMs), [bwLossPct, bwJitterMs])
   const bwBbrScn = useMemo(() => bwStepScenario('bbr', bwLossPct, bwJitterMs), [bwLossPct, bwJitterMs])
   const pre2 = useMemo(() => {
@@ -138,10 +148,9 @@ export function App() {
     () => toPts(runs.bbr, d, cfg.rateMbps, true),
     [runs.bbr, runs.version],
   )
-  const naiveD = useMemo(() => derive(HEAVY_CFG), [])
-  const naivePts = useMemo(
-    () => toPts(naive.data, naiveD, HEAVY_CFG.rateMbps, false),
-    [naive.data, naive.version],
+  const pipePts = useMemo(
+    () => toPts(pipe.data, pipeD, pipeCfg.rateMbps, pipeFlow === 'bbr'),
+    [pipe.data, pipe.version, pipeD, pipeCfg.rateMbps, pipeFlow],
   )
   const losses = useMemo(() => lossMarks(runs.cubic, cubicPts, d), [cubicPts])
   const bwD = derive(BWSTEP_CFG)
@@ -159,28 +168,20 @@ export function App() {
   const bwLoadedT = Math.min(bw.cubic.maxT, bw.bbr.maxT)
   const trBw = useTransport(BWSTEP_DUR_S, bwLoadedT)
 
-  // The pipe replays the selected flow of the FIG 1 run on its own
-  // transport: it cruises slower than real time and auto-slows around the
-  // flow's events, which would make the other figures crawl if shared.
-  // naive default: the pipe leads the page as the "why congestion control
-  // exists" exhibit, so it opens on the congestion-oblivious control case.
-  const [pipeFlow, setPipeFlow] = useState<CC>('naive')
-  const pipePts = pipeFlow === 'cubic' ? cubicPts : pipeFlow === 'bbr' ? bbrPts : naivePts
-  const pipeDrops =
-    pipeFlow === 'cubic'
-      ? runs.cubic.dropEvents
-      : pipeFlow === 'bbr'
-        ? runs.bbr.dropEvents
-        : naive.data.dropEvents
-  const pipeEvents = useMemo(() => pipeEventTimes(pipePts, pipeDrops), [pipePts, pipeDrops])
+  // The pipe cruises slower than real time and auto-slows around its own
+  // selected flow's events, independently of every other figure.
+  const pipeQueueDrops = pipe.data.dropEvents
+  const pipeWireDrops = pipe.data.wireDropEvents
+  const pipeEvents = useMemo(
+    () => pipeEventTimes(pipePts, pipeQueueDrops, pipeWireDrops),
+    [pipePts, pipeQueueDrops, pipeWireDrops],
+  )
   const pipeRate = useCallback((t: number) => rateAt(pipeEvents, t), [pipeEvents])
   // coarse: the pipe animates from tr.tRef on a canvas, so its React tick
   // only needs to drive the slider row (~8 Hz) and the card stops
   // re-rendering at frame rate.
-  const pipeLoadedT = pipeFlow === 'naive' ? naive.data.maxT : loadedT
+  const pipeLoadedT = pipe.data.maxT
   const trPipe = useTransport(RUN_DUR_S, pipeLoadedT, true, pipeRate, true)
-  const pipeCfg = pipeFlow === 'naive' ? HEAVY_CFG : cfg
-  const pipeD = pipeFlow === 'naive' ? naiveD : d
 
   return (
     <div className="page">
@@ -204,7 +205,8 @@ export function App() {
 
       <Pipe3b
         pts={pipePts}
-        dropTimes={pipeDrops}
+        queueDropTimes={pipeQueueDrops}
+        wireDropTimes={pipeWireDrops}
         events={pipeEvents}
         cfg={pipeCfg}
         d={pipeD}
@@ -215,6 +217,27 @@ export function App() {
         }}
         tr={trPipe}
         T={RUN_DUR_S}
+        controls={
+          <>
+            <div className="ctl-row">
+              <Slider label="loss" value={pipeCfg.lossPct} min={0} max={3} step={0.05} fmt={(v) => `${v.toFixed(2)} %`} onChange={pipeSet('lossPct')} />
+              <Slider label="jitter" value={pipeCfg.jitterMs} min={0} max={100} step={1} fmt={(v) => `${v} ms`} onChange={pipeSet('jitterMs')} />
+            </div>
+            <StatusLine
+              left={`link ${pipeCfg.rateMbps} Mbps · base rtt ${pipeD.baseMs} ms · buffer ${Math.round(pipeCfg.qlimPkts)} pkt`}
+              error={pipe.error}
+              running={pipe.running}
+              pct={pipe.data.maxT / RUN_DUR_S}
+              durS={RUN_DUR_S}
+              runCount={1}
+              onReset={() => {
+                setPipeCfg(HEAVY_CFG)
+                trPipe.scrub(0)
+              }}
+            />
+            <SlowWarning />
+          </>
+        }
       />
 
       <Figure2a

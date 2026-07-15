@@ -525,3 +525,20 @@ controller continues through Drain into the normal ProbeBW schedule. This
 removes the adjacent artificial one-packet-cwnd reprobe hump that the old
 classic-SACK/RTO path introduced while leaving the source-faithful Startup
 loss trigger intact.
+
+## 18. The lab RTT trace uses raw sender samples, not a queue-depth reconstruction
+
+Fig. 3 originally reconstructed an "actual RTT" as fixed propagation plus the
+current forward queue depth. That is only valid on a fixed-delay path: the
+link's correlated jitter walk adds independently realized delay in both
+directions, and neither contribution can be recovered from queue depth.
+
+The netstack already computes a per-ACK RTT sample for the delivery-rate
+sample (`ack time - transmit time`) before smoothing it into SRTT. The ccsim
+wrapper now retains the latest valid, non-retransmitted sample for probe
+instrumentation. Scenarios with `sample.wire_stats` emit it as a periodic
+stream record; ordinary scenarios and their golden streams are unchanged.
+This is observation-only state: it does not feed TCP, BBR, timers, or any RNG.
+The lab plots that raw sample as the solid trace and the sender's SRTT as the
+dashed trace, so realized jitter, queueing, serialization, and ACK timing are
+represented without inventing a browser-side path model.

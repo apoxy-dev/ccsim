@@ -31,6 +31,7 @@ declare module '*/stream/decoder.mjs' {
     LinkDequeueBytesCum: number
     LinkEnqueuePktsCum: number
     LinkArrivalBytesCum: number
+    RTTSampleSec: number
   }>
   export function decode(
     buf: ArrayBuffer | Uint8Array,

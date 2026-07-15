@@ -30,6 +30,7 @@ export const Kind = Object.freeze({
   LinkDequeueBytesCum: 22,
   LinkEnqueuePktsCum: 23,
   LinkArrivalBytesCum: 24,
+  RTTSampleSec: 25,
 });
 
 export const LINK_FWD = 0xffff;

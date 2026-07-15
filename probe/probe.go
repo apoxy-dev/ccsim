@@ -18,6 +18,7 @@ type FlowMetrics struct {
 	InflightBytes float64
 	PacingBps     float64 // 0 if the CC does not pace
 	SRTT          time.Duration
+	RTTSample     time.Duration // latest raw, unambiguous ACK RTT sample
 	MinRTT        time.Duration // 0 if unknown
 	DeliveryBps   float64       // 0 if unknown
 	BytesAcked    uint64
@@ -138,6 +139,9 @@ func (r *Recorder) OnFlowSample(t time.Duration, id int, m FlowMetrics) {
 	r.write(t, fid, stream.KindBytesAckedCum, float64(m.BytesAcked))
 	r.write(t, fid, stream.KindRetransCum, float64(m.Retransmits))
 	r.write(t, fid, stream.KindCCState, float64(m.CCState))
+	if r.WireStats {
+		r.write(t, fid, stream.KindRTTSampleSec, m.RTTSample.Seconds())
+	}
 
 	if m.SRTT > 0 {
 		f.srtts = append(f.srtts, float64(m.SRTT)/float64(time.Millisecond))

@@ -25,12 +25,18 @@ const BBR_PHASE = [
   'probertt',
 ] as const
 
+// Mirrors link.DropReason. Drop records already carry this code, so retain
+// enough of it to place queue overflow and random wire loss at their actual
+// locations in the pipe schematic.
+const DROP_WIRE = 2
+
 export type Phase = (typeof BBR_PHASE)[number]
 
 export class RunData {
   inflight = newTrack() // bytes
   cwnd = newTrack() // packets
   srtt = newTrack() // seconds
+  rttSample = newTrack() // latest raw sender RTT sample, seconds (wire_stats)
   delivery = newTrack() // bits/s
   appBytes = newTrack() // cumulative receiver-side app bytes (true goodput counter)
   ccState = newTrack()
@@ -41,7 +47,8 @@ export class RunData {
   fwdDequeueBytes = newTrack() // cumulative transmitted bytes, actual link hook
   revEnqueuePkts = newTrack() // cumulative actual reverse packets (mostly ACKs)
   lossEvents: number[] = [] // cwnd-cut times
-  dropEvents: number[] = [] // forward-link drop times
+  dropEvents: number[] = [] // forward queue/AQM/forced-drop times
+  wireDropEvents: number[] = [] // forward random-loss times after serialization
   maxT = 0
 
   push(recs: Rec[]) {
@@ -49,17 +56,22 @@ export class RunData {
     // Lazily install newly added tracks so a development HMR cannot leave
     // an older instance shape behind.
     this.appBytes ??= newTrack()
+    this.rttSample ??= newTrack()
     this.fwdArrivalBytes ??= newTrack()
     this.fwdEnqueueBytes ??= newTrack()
     this.fwdDequeueBytes ??= newTrack()
     this.revEnqueuePkts ??= newTrack()
+    this.wireDropEvents ??= []
     for (const r of recs) {
       if (r.t > this.maxT) this.maxT = r.t
       // Forward drops are attributed to the owning flow when known, with
       // LINK_FWD as fallback; reverse-direction (ACK-path) drops arrive as
       // LINK_REV and are excluded — they are not bottleneck-queue events.
       if (r.kind === Kind.Drop) {
-        if (r.flow !== LINK_REV) this.dropEvents.push(r.t)
+        if (r.flow !== LINK_REV) {
+          if (r.value === DROP_WIRE) this.wireDropEvents.push(r.t)
+          else this.dropEvents.push(r.t)
+        }
         continue
       }
       if (r.flow === LINK_FWD) {
@@ -101,6 +113,10 @@ export class RunData {
           this.srtt.t.push(r.t)
           this.srtt.v.push(r.value)
           break
+        case Kind.RTTSampleSec:
+          this.rttSample.t.push(r.t)
+          this.rttSample.v.push(r.value)
+          break
         case Kind.DeliveryBps:
           this.delivery.t.push(r.t)
           this.delivery.v.push(r.value)
@@ -126,6 +142,7 @@ export interface Pt {
   x: number // inflight, ×BDP
   y: number // delivery, ×BtlBw
   r: number // srtt, ×base RTT
+  rawR?: number // latest unsmoothed RTT sample, ×base RTT (wire_stats)
   q: number // bottleneck queue, packets
   w?: number // cwnd, packets
   cv?: number // bottleneck arrival-gap CV (wire_stats; absent in old streams)
@@ -164,6 +181,7 @@ export function toPts(run: RunData, d: Derived, rateMbps: number, bbrPhases: boo
   const inf = new Cursor(run.inflight)
   const cwn = new Cursor(run.cwnd)
   const rtt = new Cursor(run.srtt)
+  const rawRTT = new Cursor(run.rttSample ?? newTrack())
   const del = new Cursor(run.delivery)
   const app = new Cursor(run.appBytes ?? newTrack())
   const st = new Cursor(run.ccState)
@@ -187,6 +205,7 @@ export function toPts(run: RunData, d: Derived, rateMbps: number, bbrPhases: boo
     const cwB = cwn.at(t) * 1500
     if (!Number.isNaN(cwB)) infB = Math.min(infB, cwB)
     const rttS = rtt.at(t)
+    const rawRTTS = rawRTT.at(t)
     const delB = del.at(t)
     const code = st.at(t)
     const qP = q.at(t)
@@ -208,6 +227,7 @@ export function toPts(run: RunData, d: Derived, rateMbps: number, bbrPhases: boo
       x,
       y,
       r,
+      rawR: Number.isNaN(rawRTTS) || rawRTTS <= 0 ? undefined : (rawRTTS * 1000) / d.baseMs,
       q: Number.isNaN(qP) ? 0 : qP,
       w: Number.isNaN(cwB) ? undefined : cwB / 1500,
       cv: Number.isNaN(cvV) ? undefined : cvV,

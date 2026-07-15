@@ -1,7 +1,6 @@
 // Figure 3 (design option 3b): the animated pipe — sender, bottleneck queue
-// and receiver with packet dots, drop ballistics, and the RTT strip that
-// spells out the bufferbloat equation (rtt = base + queueing delay), with
-// the sender's own srtt estimate dashed alongside the measured truth.
+// and receiver with packet dots, drop ballistics, and an RTT strip showing
+// raw sender RTT samples with the sender's SRTT estimate dashed alongside.
 //
 // The wire is an aggregate particle view of actual simulator telemetry.
 // Forward particles are crossings of cumulative bytes presented to and
@@ -18,7 +17,7 @@
 // tr.tRef, so animation costs a canvas blit, not DOM reconciliation. The
 // component itself only re-renders on the transport's coarse (~8 Hz) tick.
 
-import { memo, useEffect, useMemo, useRef } from 'react'
+import { memo, useEffect, useMemo, useRef, type ReactNode } from 'react'
 import { FigureCard } from './figure-card'
 import { Transport, type TransportState } from './transport'
 import { COLORS } from '../lib/trail'
@@ -38,8 +37,8 @@ const SLOMO_WIN = 0.2 // seconds of sim time on each side of an event
 // burst is one event) plus BBR phase changes. Under heavy random loss the
 // event set gets dense enough that slow-mo would be permanent — worse than
 // none — so it disables itself.
-export function pipeEventTimes(pts: Pt[], dropTimes: number[]): number[] {
-  const evs = coalesce(dropTimes, 0.25)
+export function pipeEventTimes(pts: Pt[], queueDropTimes: number[], wireDropTimes: number[]): number[] {
+  const evs = coalesce([...queueDropTimes, ...wireDropTimes].sort((a, b) => a - b), 0.25)
   for (let i = 1; i < pts.length; i++) {
     if (pts[i].phase !== pts[i - 1].phase) evs.push(pts[i].t)
   }
@@ -142,7 +141,8 @@ function lb(a: number[], v: number): number {
 
 export const Pipe3b = memo(function Pipe3b({
   pts,
-  dropTimes,
+  queueDropTimes,
+  wireDropTimes,
   events,
   cfg,
   d,
@@ -150,9 +150,11 @@ export const Pipe3b = memo(function Pipe3b({
   onFlow,
   tr,
   T,
+  controls,
 }: {
   pts: Pt[]
-  dropTimes: number[]
+  queueDropTimes: number[]
+  wireDropTimes: number[]
   events: number[]
   cfg: LabCfg
   d: Derived
@@ -160,36 +162,43 @@ export const Pipe3b = memo(function Pipe3b({
   onFlow: (f: CC) => void
   tr: TransportState
   T: number
+  controls?: ReactNode
 }) {
   const col = flow === 'cubic' ? COLORS.cubic : flow === 'bbr' ? COLORS.bbr : COLORS.naive
   const base = d.baseMs
-  // srtt strip y-scale: base RTT sits on the dashed rule at y=272; the strip
-  // spans [0.75, 2.25]×base so queueing delay reads as height above it.
-  const yS = (r: number) => 280 - (48 * Math.max(0, Math.min((r - 0.75) * base, 1.5 * base))) / (1.5 * base)
+  // Keep the base RTT rule at y=272 while expanding the upper range for the
+  // largest configured queue plus two independently jittered directions.
+  // The default retains the original 1..2.25× scale.
+  const modeledMaxRTT = base + (cfg.qlimPkts * 12) / cfg.rateMbps + 2 * cfg.jitterMs
+  const rttTopRatio = Math.max(2.25, (modeledMaxRTT * 1.05) / base)
+  const yS = (r: number) => 272 - 40 * Math.max(0, Math.min((r - 1) / (rttTopRatio - 1), 1))
 
   const limitDots = Math.max(4, Math.min(14, cfg.qlimPkts))
   const pktPerQDot = cfg.qlimPkts / limitDots
   const pitch = (STACK_BASE - LIMIT_Y) / limitDots
   const qDotR = Math.min(2.6, pitch * 0.42)
 
-  // Actual RTT is derived from the measured queue depth (base + q packets ×
-  // serialization time) rather than the sender's srtt: a sender with a huge
-  // window under sustained loss barely updates its smoothed estimate (RFC
-  // 7323 App. G divides the EWMA gain by inflight/2), so srtt can sit near
-  // base while the buffer is pinned full. Both are drawn so the gap itself
-  // is visible.
-  const rttOf = (p: Pt) => 1 + (p.q * 12) / cfg.rateMbps / base
+  // rawR is the latest unambiguous sender RTT sample (ACK time minus the
+  // sampled segment's transmit time). It includes realized jitter in both
+  // directions, queueing, serialization, and ACK timing. Before the first
+  // sample there is deliberately no solid trace; reconstructing one from
+  // queue depth would omit jitter and repeat the original bug.
   const rtt = useMemo(() => {
     if (pts.length < 2) return null
-    const path = (val: (p: Pt) => number) =>
-      pts
-        .filter((_, i) => i % 3 === 0)
+    const sampled = pts.filter((_, i) => i % 3 === 0)
+    const path = (source: Pt[], val: (p: Pt) => number) =>
+      source
         .map((p, i) => (i ? 'L' : 'M') + tx(p.t).toFixed(1) + ' ' + yS(val(p)).toFixed(1))
         .join(' ')
-    const actual = path(rttOf)
-    return { actual, area: actual + ' L 628 280 L 52 280 Z', srtt: path((p) => p.r) }
+    const raw = sampled.filter((p): p is Pt & { rawR: number } => p.rawR != null)
+    const actual = path(raw, (p) => p.rawR!)
+    const firstX = raw.length > 0 ? tx(raw[0].t).toFixed(1) : null
+    // Close at the last rendered sample. Closing at the fixed right edge
+    // creates a diagonal wedge while a live stream is still arriving.
+    const area = firstX == null ? null : `${actual} V 280 H ${firstX} Z`
+    return { actual, area, srtt: path(sampled, (p) => p.r) }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [pts, base, cfg.rateMbps])
+  }, [pts, rttTopRatio])
 
   // Rate strip: offered load (bytes presented to the queue, drops included)
   // against true goodput (receiver-side app bytes), both differentiated over
@@ -223,19 +232,24 @@ export const Pipe3b = memo(function Pipe3b({
     const good = hasGood
       ? deriv((p) => p.goodB)
       : pts.map((p) => p.y * cfg.rateMbps) // old streams: sender estimate fallback
+    const sampled = pts.filter((_, i) => i % 3 === 0)
     const path = (vals: number[]) => {
       let s = ''
-      for (let i = 0; i < pts.length; i += 3)
-        s += (s ? 'L' : 'M') + tx(pts[i].t).toFixed(1) + ' ' + yR(vals[i]).toFixed(1)
+      for (let i = 0; i < sampled.length; i++) {
+        const p = sampled[i]
+        const sourceIndex = i * 3
+        s += (s ? 'L' : 'M') + tx(p.t).toFixed(1) + ' ' + yR(vals[sourceIndex]).toFixed(1)
+      }
       return s
     }
     const goodPath = path(good)
+    const firstX = tx(sampled[0].t).toFixed(1)
     return {
       offered,
       good,
       offeredPath: offKey ? path(offered) : null,
       goodPath,
-      area: goodPath + ' L 628 364 L 52 364 Z',
+      area: `${goodPath} V 364 H ${firstX} Z`,
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [pts, cfg.rateMbps])
@@ -243,10 +257,16 @@ export const Pipe3b = memo(function Pipe3b({
   // Drop glyph decimation happens once so each surviving ✕ keeps a stable
   // index (and thus fan lane) for its whole ballistic flight; per-frame
   // sampling would reshuffle the population and read as flicker.
-  // pts is in the deps because dropTimes (RunData.dropEvents) is mutated in
-  // place as sample batches arrive — its identity never changes, but a new
-  // pts array is derived per batch and marks the data as refreshed.
-  const visDrops = useMemo(() => coalesce(dropTimes, 0.9 / 25), [dropTimes, pts])
+  // pts is in the deps because RunData's event arrays are mutated in place
+  // as sample batches arrive. A newly derived pts array marks the refresh.
+  const visQueueDrops = useMemo(
+    () => coalesce(queueDropTimes, 0.9 / 25),
+    [queueDropTimes, pts],
+  )
+  const visWireDrops = useMemo(
+    () => coalesce(wireDropTimes, 0.9 / 25),
+    [wireDropTimes, pts],
+  )
 
   // Display aggregation only: the quantum controls how many actual bytes one
   // visible dot represents. Its timing comes from measured cumulative link
@@ -285,6 +305,14 @@ export const Pipe3b = memo(function Pipe3b({
       ctx.beginPath()
       ctx.arc(x, y, r, 0, Math.PI * 2)
       ctx.fill()
+    }
+    const cross = (x: number, y: number) => {
+      ctx.beginPath()
+      ctx.moveTo(x - 3, y - 3)
+      ctx.lineTo(x + 3, y + 3)
+      ctx.moveTo(x - 3, y + 3)
+      ctx.lineTo(x + 3, y - 3)
+      ctx.stroke()
     }
     let raf = 0
     const draw = () => {
@@ -386,47 +414,58 @@ export const Pipe3b = memo(function Pipe3b({
       }
       ctx.globalAlpha = 1
 
-      // Each ✕ is an actual dropped packet, decimated once (visDrops) so
-      // dense overload stays readable. Like the wire dots, every glyph has
-      // permanent identity: its arc and fan lane depend only on its own drop
-      // time and index, so it flies its full ballistic path — never
-      // reshuffled or re-sampled as neighbors enter and leave the window.
+      // Each ✕ is an actual dropped packet, decimated once so dense overload
+      // stays readable. Queue overflow flies from the full queue; Bernoulli
+      // wire loss starts downstream, where the link drops it after
+      // serialization. Keeping separate origins avoids falsely presenting
+      // random loss as another tail drop.
       ctx.strokeStyle = COLORS.loss
       ctx.lineWidth = 1.4
-      for (let k = lb(visDrops, t - 0.9); k < visDrops.length && visDrops[k] <= t; k++) {
-        const f = (t - visDrops[k]) / 0.9
+      for (let k = lb(visQueueDrops, t - 0.9); k < visQueueDrops.length && visQueueDrops[k] <= t; k++) {
+        const f = (t - visQueueDrops[k]) / 0.9
         const fx = 290 + f * (110 + (k % 5) * 12)
         const fy = LIMIT_Y - 2 - f * 80 + f * f * 150
         ctx.globalAlpha = 1 - f
-        ctx.beginPath()
-        ctx.moveTo(fx - 3, fy - 3)
-        ctx.lineTo(fx + 3, fy + 3)
-        ctx.moveTo(fx - 3, fy + 3)
-        ctx.lineTo(fx + 3, fy - 3)
-        ctx.stroke()
+        cross(fx, fy)
+      }
+      for (let k = lb(visWireDrops, t - 0.9); k < visWireDrops.length && visWireDrops[k] <= t; k++) {
+        const f = (t - visWireDrops[k]) / 0.9
+        const lane = (k % 5) - 2
+        const fx = 408 + f * (70 + lane * 9)
+        const fy = 140 + f * (30 + Math.abs(lane) * 5) + f * f * 60
+        ctx.globalAlpha = 1 - f
+        cross(fx, fy)
       }
       ctx.globalAlpha = 1
 
-      // srtt strip playhead, marker and readout.
+      // RTT strip playhead, raw-sample marker and readout.
       ctx.strokeStyle = COLORS.ink
       ctx.globalAlpha = 0.35
       ctx.lineWidth = 1
       ctx.beginPath()
-      ctx.moveTo(tx(t), 236)
+      ctx.moveTo(tx(t), 232)
       ctx.lineTo(tx(t), 280)
       ctx.stroke()
       ctx.globalAlpha = 1
-      ctx.fillStyle = col
-      ctx.strokeStyle = '#FFFFFF'
-      ctx.lineWidth = 1.2
-      ctx.beginPath()
-      ctx.arc(tx(t), yS(rttOf(p)), 3.2, 0, Math.PI * 2)
-      ctx.fill()
-      ctx.stroke()
-      const qMs = (p.q * 12) / cfg.rateMbps
-      ctx.font = mono(10.5, 600)
+      const rawRatio = p.rawR
       ctx.textAlign = 'right'
-      ctx.fillText(`rtt ${(base + qMs).toFixed(1)} ms = ${base} base + ${qMs.toFixed(1)} queue`, 628, 220)
+      if (rawRatio != null) {
+        const rawRTT = rawRatio * base
+        ctx.fillStyle = col
+        ctx.strokeStyle = '#FFFFFF'
+        ctx.lineWidth = 1.2
+        ctx.beginPath()
+        ctx.arc(tx(t), yS(rawRatio), 3.2, 0, Math.PI * 2)
+        ctx.fill()
+        ctx.stroke()
+        const variable = Math.max(0, rawRTT - base)
+        ctx.font = mono(10.5, 600)
+        ctx.fillText(`latest rtt ${rawRTT.toFixed(1)} ms · ${base} base + ${variable.toFixed(1)} variable`, 628, 220)
+      } else {
+        ctx.fillStyle = COLORS.stone
+        ctx.font = mono(9)
+        ctx.fillText('waiting for first raw rtt sample', 628, 220)
+      }
       ctx.font = mono(9)
       ctx.fillStyle = COLORS.stone
       ctx.fillText(`sender srtt ${(p.r * base).toFixed(1)} ms`, 628, 232)
@@ -462,7 +501,7 @@ export const Pipe3b = memo(function Pipe3b({
     raf = requestAnimationFrame(draw)
     return () => cancelAnimationFrame(raf)
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [pts, sched, visDrops, rate, cfg, d, col, base, limitDots, pktPerQDot, pitch, qDotR, wireR, tr.tRef])
+  }, [pts, sched, visQueueDrops, visWireDrops, rate, cfg, d, col, base, limitDots, pktPerQDot, pitch, qDotR, wireR, tr.tRef])
 
   const t = tr.t
   const nextEv = events.find((e) => e > t + SLOMO_WIN)
@@ -484,15 +523,18 @@ export const Pipe3b = memo(function Pipe3b({
           </button>
         </div>
       }
+      controls={controls}
       note={
         flow === 'naive' ? (
           <>
             Naive ignores congestion and keeps offering {NAIVE_RATE_MBPS} Mbps. On a{' '}
             {cfg.rateMbps} Mbps bottleneck, the denser input train fills the queue and the excess
             becomes <span style={{ color: COLORS.loss }}>actual tail drops</span>; the output train
-            remains limited by the simulated link. ACKs and retransmissions are still real TCP.
-            Note the RTT strip: the pinned-full buffer inflates the real round trip (solid line,
-            from the measured queue) while the sender&apos;s own srtt (dashed) barely moves — with
+            remains limited by the simulated link. Crosses launched from the full queue are tail
+            drops; with configured random loss, crosses instead leave the downstream wire. ACKs
+            and retransmissions are still real TCP.
+            Note the RTT strip: the solid line is the latest raw TCP RTT sample, including realized
+            jitter and queueing, while the sender&apos;s own srtt (dashed) barely moves — with
             thousands of packets in flight under sustained loss, TCP&apos;s smoothed estimator is
             nearly frozen. A sender this aggressive cannot even see the damage it does. The
             delivery strip shows classic congestion collapse: {NAIVE_RATE_MBPS} Mbps offered, the
@@ -505,8 +547,9 @@ export const Pipe3b = memo(function Pipe3b({
             Actual simulated traffic, aggregated so the particles remain readable. Their timing
             comes from forward and reverse link activity; the browser does not run another traffic
             model or impose output spacing. Cubic's growing window appears in the in-flight bar and
-            queue stack, ACKs follow the complete return path, and{' '}
-            <span style={{ color: COLORS.loss }}>✕ marks actual dropped packets</span>. Playback
+            queue stack, ACKs follow the complete return path, and queue-overflow{' '}
+            <span style={{ color: COLORS.loss }}>✕ marks leave the queue</span> while random-loss
+            marks leave the downstream wire. Playback
             cruises at {CRUISE_RATE}× and slows to {SLOMO_RATE}× around losses and phase changes.
           </>
         )
@@ -540,14 +583,14 @@ export const Pipe3b = memo(function Pipe3b({
           <text x={52} y={230} fontFamily="JetBrains Mono" fontSize={9} fill={COLORS.stone} letterSpacing="0.08em">
             ROUND-TRIP TIME
           </text>
-          <line x1={52} y1={272} x2={628} y2={272} stroke={COLORS.fog} strokeWidth={1} strokeDasharray="4 3" />
+          <line x1={52} y1={yS(1)} x2={628} y2={yS(1)} stroke={COLORS.fog} strokeWidth={1} strokeDasharray="4 3" />
           <text x={52} y={288} fontFamily="JetBrains Mono" fontSize={9} fill={COLORS.stone}>
             base rtt {base} ms
           </text>
           {rtt && (
             <>
-              <path d={rtt.area} fill={col} fillOpacity={0.1} stroke="none" />
-              <path d={rtt.actual} fill="none" stroke={col} strokeWidth={1.3} />
+              {rtt.area && <path d={rtt.area} fill={col} fillOpacity={0.1} stroke="none" />}
+              {rtt.actual && <path d={rtt.actual} fill="none" stroke={col} strokeWidth={1.3} />}
               <path d={rtt.srtt} fill="none" stroke={COLORS.stone} strokeWidth={0.9} strokeDasharray="3 3" />
             </>
           )}

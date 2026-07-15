@@ -132,8 +132,9 @@ All changes are in `pkg/tcpip/transport/tcp`:
   RFC 3168 fallback for stock CCs), delivery-rate estimation
   (`ccsimPreAck`/`ccsimPostAck` around the renamed upstream ACK handler),
   pacing gate + timer, delayed-ACK policy, per-ACK ECE echo helpers,
-  `SimSenderInfo` probe snapshot, a single-pass classic RFC 6675 pipe
-  calculation, and Linux-style incremental RACK pipe/transmit/loss queues.
+  `SimSenderInfo` probe snapshot (including the latest raw RTT sample), a
+  single-pass classic RFC 6675 pipe calculation, and Linux-style incremental
+  RACK pipe/transmit/loss queues.
 
 **Modified files (all edits marked `// ccsim patch`)**
 - `dispatcher.go` — 4 lines: `queueEndpoint` branches to inline processing.
@@ -220,4 +221,6 @@ Fixed 20-byte little-endian records:
 `stream/decoder.mjs` (validated against a shared golden file). Flow ids
 `0xFFFF`/`0xFFFE` are the forward/reverse link pseudo-flows. The optional
 per-packet event stream (kinds 17-19) is enabled with
-`"sample": {"packet_events": true}`.
+`"sample": {"packet_events": true}`. `wire_stats` adds compact cumulative
+link counters, arrival burstiness, and the sender's latest unsmoothed RTT
+sample for the browser lab.

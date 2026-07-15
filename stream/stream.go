@@ -56,6 +56,7 @@ const (
 	KindLinkDequeueBytesCum Kind = 22
 	KindLinkEnqueuePktsCum  Kind = 23
 	KindLinkArrivalBytesCum Kind = 24 // bytes presented to qdisc, including rejected arrivals
+	KindRTTSampleSec        Kind = 25 // latest raw sender RTT sample (wire_stats only)
 )
 
 // Pseudo flow ids for link-level records.

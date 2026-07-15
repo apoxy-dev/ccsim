@@ -14,6 +14,7 @@ const want = [
   { t: 0.002, flow: 1, kind: Kind.SRTTSec, value: 0.0402 },
   { t: 1.5, flow: 0xffff, kind: Kind.QDepthPkts, value: 123 },
   { t: 2.25, flow: 2, kind: Kind.FCTSec, value: 0.181 },
+  { t: 2.5, flow: 0, kind: Kind.RTTSampleSec, value: 0.052 },
   { t: 30, flow: 0, kind: Kind.CEMark, value: 1 },
 ];
 

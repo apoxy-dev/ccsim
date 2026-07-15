@@ -389,6 +389,7 @@ type ccsimWrapper struct {
 	inner     congestionControl
 	sim       SimCC // non-nil if inner is a registered SimCC
 	pacingBps int64
+	latestRTT time.Duration // latest unambiguous, unsmoothed ACK RTT sample
 
 	lossEvents   uint64
 	rtoCount     uint64
@@ -903,6 +904,9 @@ func (s *sender) ccsimPostAck(rcvdSeg *segment) {
 				int64(time.Second) / int64(interval)
 		}
 	}
+	if sample.RTT > 0 {
+		w.latestRTT = sample.RTT
+	}
 	if sample.DeliveryRateBps > 0 && (!sample.IsAppLimited || sample.DeliveryRateBps > w.deliveryBps) {
 		w.deliveryBps = sample.DeliveryRateBps
 	}
@@ -1098,6 +1102,7 @@ type SimInfo struct {
 	CwndPkts      int
 	InflightBytes int64
 	MSS           int
+	RTTSample     time.Duration
 	PacingBps     int64
 	DeliveryBps   int64
 	RetransSegs   uint64
@@ -1129,6 +1134,7 @@ func SimSenderInfo(tep tcpip.Endpoint) (SimInfo, bool) {
 		RTOs:          ep.stats.SendErrors.Timeouts.Value(),
 	}
 	if w := s.ccsim.wrap; w != nil {
+		info.RTTSample = w.latestRTT
 		info.PacingBps = w.pacingBps
 		info.DeliveryBps = w.deliveryBps
 		info.LossEvents = w.lossEvents
