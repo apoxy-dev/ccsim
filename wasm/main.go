@@ -13,6 +13,7 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"runtime"
 	"syscall/js"
 	"time"
 
@@ -28,6 +29,28 @@ type session struct {
 }
 
 var cur *session
+
+// releaseCurrent makes the previous simulation collectible before the next
+// one is allocated. Merely calling Sim.Close is not enough here: cur would
+// otherwise keep the closed session (including its writer callback cycle and
+// sample buffers) rooted throughout sim.New, temporarily retaining two full
+// simulation heaps. Go's wasm linear memory cannot shrink after that peak.
+func releaseCurrent() {
+	old := cur
+	cur = nil
+	if old == nil {
+		return
+	}
+	if old.sim != nil {
+		old.sim.Close()
+		old.sim = nil
+	}
+	// Break the Writer -> bound flushTake method -> session cycle and release
+	// the JS callback before forcing collection of the closed object graph.
+	old.w = nil
+	old.onSamples = js.Undefined()
+	runtime.GC()
+}
 
 // flushTake hands one full sample buffer to JS (ownership transfers).
 func (s *session) flushTake(buf []byte) {
@@ -60,12 +83,9 @@ func load(this js.Value, args []js.Value) any {
 	if err != nil {
 		return errResult(err)
 	}
-	// Tear down the previous session's netstacks: their goroutines would
-	// otherwise pin the whole old sim (~30 MB per run) for the life of the
-	// page — a leak the memtest harness catches within a few reloads.
-	if cur != nil && cur.sim != nil {
-		cur.sim.Close()
-	}
+	// Tear down and collect the previous session before allocating its
+	// replacement. This keeps repeated loads within one worker bounded.
+	releaseCurrent()
 	s := &session{}
 	if len(args) > 1 {
 		s.onSamples = args[1]

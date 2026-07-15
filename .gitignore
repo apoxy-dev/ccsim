@@ -1,4 +1,5 @@
 *.bin
+!stream/testdata/golden.bin
 /ccsim
 wasm/main.wasm
 

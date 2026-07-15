@@ -91,7 +91,8 @@ func jsonNum(v float64) json.RawMessage {
 // Test 20: the scenario fuzzer. Invariants: no panic; queue depth bounded
 // by the configured limit; per-flow cwnd >= 1 pkt, monotone cumulative
 // counters, inflight bounded by cwnd with slack; time monotone; every flow
-// with >= 5 s of runtime delivers bytes; no timer leak at teardown.
+// with enough post-handshake service time delivers bytes; no timer leak at
+// teardown.
 func TestScenarioFuzz(t *testing.T) {
 	master := rand.New(rand.NewPCG(0xF022, 7))
 	for iter := 0; iter < fuzzIterations; iter++ {
@@ -151,7 +152,8 @@ func checkStreamInvariants(t *testing.T, iter int, cfg *scenario.ScenarioConfig,
 		lastCwnd, peakCwnd     float64
 		maxAcked               float64
 		inflViolations         int
-		established            bool // first nonzero cwnd seen (samples during the handshake read 0)
+		established            bool    // first nonzero cwnd seen (samples during the handshake read 0)
+		establishedAt          float64 // simulation time of that first established sample
 	}
 	flows := make([]flowAgg, len(cfg.Flows))
 	// cwnd (pkts) and inflight (bytes) arrive as separate records of the
@@ -168,6 +170,9 @@ func checkStreamInvariants(t *testing.T, iter int, cfg *scenario.ScenarioConfig,
 		switch r.Kind {
 		case stream.KindCwndPkts:
 			if r.Value >= 1 {
+				if !f.established {
+					f.establishedAt = r.T
+				}
 				f.established = true
 			} else if f.established {
 				t.Fatalf("iter %d: flow %d cwnd %.1f < 1 pkt at t=%.3f (after establishment)\nscenario: %s",
@@ -206,13 +211,51 @@ func checkStreamInvariants(t *testing.T, iter int, cfg *scenario.ScenarioConfig,
 			f.lastRetrans = r.Value
 		}
 	}
-	// Liveness: every flow with >= 5 s of runtime delivered something.
+	// Liveness: every established flow that subsequently had enough time to
+	// drain a worst-case configured FIFO plus five seconds of recovery grace
+	// delivered something. StartAt alone is insufficient: the handshake can
+	// finish late, and after it does the first data packet can legitimately sit
+	// behind thousands of packets in a randomized deep FIFO.
 	for i, fc := range cfg.Flows {
-		if cfg.Dur-fc.StartAt >= 5 && flows[i].maxAcked == 0 {
-			t.Errorf("iter %d: flow %d (%s, start %.1fs, dur %.1fs) delivered 0 bytes — silent deadlock?\nscenario: %s",
+		f := &flows[i]
+		if f.established && cfg.Dur-f.establishedAt >= livenessGrace(cfg, i) && f.maxAcked == 0 {
+			t.Errorf("iter %d: established flow %d (%s, start %.1fs, dur %.1fs) delivered 0 bytes — silent deadlock?\nscenario: %s",
 				iter, i, fc.CC, fc.StartAt, cfg.Dur, js)
 		}
 	}
+}
+
+// livenessGrace returns a conservative interval in which an established flow
+// should make forward progress. Five seconds covers TCP recovery timers; a
+// full configured FIFO and the flow's RTT are added because neither is a
+// transport deadlock. Rate-change events use the slowest configured rate.
+func livenessGrace(cfg *scenario.ScenarioConfig, flow int) float64 {
+	minRateMbps := cfg.Link.RateMbps
+	for _, ev := range cfg.Events {
+		if ev.Path != "link.rate_mbps" {
+			continue
+		}
+		var rate float64
+		if json.Unmarshal(ev.Value, &rate) == nil && rate > 0 && rate < minRateMbps {
+			minRateMbps = rate
+		}
+	}
+
+	var queueBytes float64
+	switch cfg.Link.Queue.Kind {
+	case "taildrop", "red":
+		queueBytes = float64(cfg.Link.Queue.LimitBytes)
+		if byPackets := float64(cfg.Link.Queue.LimitPkts) * 1500; byPackets > queueBytes {
+			queueBytes = byPackets
+		}
+	}
+	queueDrain := queueBytes * 8 / (minRateMbps * 1e6)
+	revOwdMs := cfg.Link.RevOwdMs
+	if revOwdMs == 0 {
+		revOwdMs = cfg.Link.OwdMs
+	}
+	rtt := (cfg.Link.OwdMs + revOwdMs + 2*cfg.Flows[flow].ExtraOwdMs) / 1000
+	return 5 + queueDrain + rtt
 }
 
 // Test 21: live-mutation determinism. The same schedule of Set calls at
