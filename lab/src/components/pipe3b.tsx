@@ -513,7 +513,7 @@ export const Pipe3b = memo(function Pipe3b({
 
   return (
     <FigureCard
-      title="FIG. 3 — THE PIPE"
+      title="FIG. 1 - BOTTLENECK"
       aside={
         <div style={{ display: 'flex', gap: 8 }}>
           <button className={flow === 'naive' ? 'btn-toggle on' : 'btn-toggle'} onClick={() => onFlow('naive')}>
@@ -570,9 +570,25 @@ export const Pipe3b = memo(function Pipe3b({
             SENDER
           </text>
           <line x1={110} y1={140} x2={266} y2={140} stroke={COLORS.fog} strokeWidth={1} />
-          <rect x={266} y={126} width={26} height={28} fill="none" stroke={COLORS.ink} strokeWidth={1.3} />
+          <rect x={262} y={122} width={34} height={36} fill="none" stroke={COLORS.ink} strokeWidth={1.3} />
+          <g aria-label="bottleneck constriction">
+            <path
+              d="M 265 125 H 293 V 130 L 283 138 H 275 L 265 130 Z"
+              fill={COLORS.ink}
+              fillOpacity={0.12}
+              stroke={COLORS.ink}
+              strokeWidth={0.8}
+            />
+            <path
+              d="M 265 155 H 293 V 150 L 283 142 H 275 L 265 150 Z"
+              fill={COLORS.ink}
+              fillOpacity={0.12}
+              stroke={COLORS.ink}
+              strokeWidth={0.8}
+            />
+          </g>
           <text x={279} y={180} textAnchor="middle" fontFamily="JetBrains Mono" fontSize={9} fill={COLORS.slate}>
-            tail-drop q · {cfg.rateMbps} Mbps link
+            bottleneck · {cfg.rateMbps} Mbps · tail-drop queue
           </text>
           <line x1={292} y1={140} x2={528} y2={140} stroke={COLORS.fog} strokeWidth={1} />
           <rect x={528} y={110} width={86} height={60} fill="none" stroke={COLORS.ink} strokeWidth={1.3} />

@@ -266,7 +266,7 @@ export function App() {
               <Slider label="jitter" value={pipeCfg.jitterMs} min={0} max={100} step={1} fmt={(v) => `${v} ms`} onChange={pipeSet('jitterMs')} />
             </div>
             <StatusLine
-              left={`link ${pipeCfg.rateMbps} Mbps · base rtt ${pipeD.baseMs} ms · buffer ${Math.round(pipeCfg.qlimPkts)} pkt`}
+              left={`bottleneck ${pipeCfg.rateMbps} Mbps · base rtt ${pipeD.baseMs} ms · buffer ${Math.round(pipeCfg.qlimPkts)} pkt`}
               error={pipe.error}
               running={pipe.running}
               pct={pipe.data.maxT / RUN_DUR_S}

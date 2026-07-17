@@ -88,7 +88,7 @@ export function Figure2a({
 
   return (
     <FigureCard
-      title="FIG. 1 — RTT & DELIVERY VS. INFLIGHT · INDEPENDENT RUNS"
+      title="FIG. 2 - RTT & DELIVERY VS. INFLIGHT"
       aside={
         <div className="fig-legend">
           <span style={{ color: COLORS.cubic }}>— cubic</span>
