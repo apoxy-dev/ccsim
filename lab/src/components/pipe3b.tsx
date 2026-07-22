@@ -17,6 +17,7 @@
 // tr.tRef, so animation costs a canvas blit, not DOM reconciliation. The
 // component itself only re-renders on the transport's coarse (~8 Hz) tick.
 
+import { SkipForwardFilled } from '@carbon/icons-react'
 import { memo, useEffect, useMemo, useRef, type ReactNode } from 'react'
 import { FigureCard } from './figure-card'
 import { Transport, type TransportState } from './transport'
@@ -70,17 +71,28 @@ const visCapFor = (rateMbps: number) => Math.max(2.5, Math.min(16, 6 * Math.sqrt
 // The forward segments use one screen-space velocity so dot density can be
 // compared across the box without a geometry-induced distortion.
 const WIRE_PX_PER_S = 160
-const PRE_T = 148 / WIRE_PX_PER_S
-const POST_T = 228 / WIRE_PX_PER_S
+// Station box geometry. The bottleneck is centered between sender and
+// receiver, so both forward wire segments are the same length.
+const SENDER_R = 110 // sender box right edge
+const BNECK_L = 302 // bottleneck box left edge
+const BNECK_R = 336 // bottleneck box right edge
+const BNECK_CX = (BNECK_L + BNECK_R) / 2
+const RECV_L = 528 // receiver box left edge
+const PRE_T = (BNECK_L - SENDER_R) / WIRE_PX_PER_S
+const POST_T = (RECV_L - BNECK_R) / WIRE_PX_PER_S
 const ACK_T = 1.6
 
 // ACK return-path geometry. Keeping this in one place prevents the particle
 // animation from silently taking a horizontal shortcut across the SVG path.
+// The endpoints sit slightly inside the receiver/sender boxes (their bottom
+// edge is y=170) so dots emerge from and slide under the box walls instead
+// of popping into and out of existence; the box interiors are clipped out
+// of the canvas while dots draw.
 const ACK_PATH = [
-  { x: 571, y: 170 },
+  { x: 571, y: 164 },
   { x: 571, y: 200 },
   { x: 67, y: 200 },
-  { x: 67, y: 176 },
+  { x: 67, y: 164 },
 ] as const
 const ACK_LEGS = ACK_PATH.slice(1).map((p, i) => {
   const from = ACK_PATH[i]
@@ -344,12 +356,12 @@ export const Pipe3b = memo(function Pipe3b({
       const pathPkts = Math.max(0, infPkts - queuedPkts)
       const shown = Math.min(Math.round(q / pktPerQDot), limitDots)
       ctx.fillStyle = col
-      for (let k = 0; k < shown; k++) dot(279, STACK_BASE - pitch * (k + 0.5), qDotR)
+      for (let k = 0; k < shown; k++) dot(BNECK_CX, STACK_BASE - pitch * (k + 0.5), qDotR)
       if (q >= 1) {
         ctx.fillStyle = COLORS.slate
         ctx.font = mono(9)
         ctx.textAlign = 'center'
-        ctx.fillText(`q ${Math.round(q)} pkt`, 279, 192)
+        ctx.fillText(`q ${Math.round(q)} pkt`, BNECK_CX, 192)
       }
 
       ctx.fillStyle = COLORS.slate
@@ -397,16 +409,30 @@ export const Pipe3b = memo(function Pipe3b({
         }
       }
 
-      // Wire dots: pure functions of each dot's fixed schedule. A dot lives
-      // on the pre-wire for exactly [em, em+PRE_T), moves at constant
-      // speed, and leaves only by entering the bottleneck box.
+      // Wire dots: pure functions of each dot's fixed schedule, moving at
+      // constant speed. The three station boxes are clipped out of the canvas
+      // here so a dot is born fully hidden inside a box, emerges through its
+      // wall, and later slides under the next box's wall — partial occlusion
+      // at the edges instead of popping in and out of existence. Spawn and
+      // despawn positions extend one radius into the boxes to match.
+      ctx.save()
+      ctx.beginPath()
+      ctx.rect(0, 0, 640, 376)
+      ctx.rect(24, 110, 86, 60)
+      ctx.rect(BNECK_L, 122, BNECK_R - BNECK_L, 36)
+      ctx.rect(RECV_L, 110, 86, 60)
+      ctx.clip('evenodd')
       const { em, dep } = sched
       ctx.fillStyle = col
-      for (let k = lb(em, t - PRE_T); k < em.length && em[k] <= t; k++) {
-        dot(114 + ((t - em[k]) / PRE_T) * 148, 140, wireR)
+      const preX0 = SENDER_R - wireR
+      const preLife = (BNECK_L + wireR - preX0) / WIRE_PX_PER_S
+      for (let k = lb(em, t - preLife); k < em.length && em[k] <= t; k++) {
+        dot(preX0 + (t - em[k]) * WIRE_PX_PER_S, 140, wireR)
       }
-      for (let k = lb(dep, t - POST_T); k < dep.length && dep[k] <= t; k++) {
-        dot(296 + ((t - dep[k]) / POST_T) * 228, 140, wireR)
+      const postX0 = BNECK_R - wireR
+      const postLife = (RECV_L + wireR - postX0) / WIRE_PX_PER_S
+      for (let k = lb(dep, t - postLife); k < dep.length && dep[k] <= t; k++) {
+        dot(postX0 + (t - dep[k]) * WIRE_PX_PER_S, 140, wireR)
       }
       // ACKs: aggregate crossings of actual reverse packets emitted by the
       // receiver-side stack, including its delayed-ACK behavior.
@@ -417,6 +443,7 @@ export const Pipe3b = memo(function Pipe3b({
         dot(a.x, a.y, Math.max(1.5, wireR - 1))
       }
       ctx.globalAlpha = 1
+      ctx.restore()
 
       // Each ✕ is an actual dropped packet, decimated once so dense overload
       // stays readable. Queue overflow flies from the full queue; Bernoulli
@@ -427,7 +454,7 @@ export const Pipe3b = memo(function Pipe3b({
       ctx.lineWidth = 1.4
       for (let k = lb(visQueueDrops, t - 0.9); k < visQueueDrops.length && visQueueDrops[k] <= t; k++) {
         const f = (t - visQueueDrops[k]) / 0.9
-        const fx = 290 + f * (110 + (k % 5) * 12)
+        const fx = BNECK_R - 6 + f * (110 + (k % 5) * 12)
         const fy = LIMIT_Y - 2 - f * 80 + f * f * 150
         ctx.globalAlpha = 1 - f
         cross(fx, fy)
@@ -435,7 +462,7 @@ export const Pipe3b = memo(function Pipe3b({
       for (let k = lb(visWireDrops, t - 0.9); k < visWireDrops.length && visWireDrops[k] <= t; k++) {
         const f = (t - visWireDrops[k]) / 0.9
         const lane = (k % 5) - 2
-        const fx = 408 + f * (70 + lane * 9)
+        const fx = 428 + f * (70 + lane * 9)
         const fy = 140 + f * (30 + Math.abs(lane) * 5) + f * f * 60
         ctx.globalAlpha = 1 - f
         cross(fx, fy)
@@ -534,9 +561,8 @@ export const Pipe3b = memo(function Pipe3b({
             Naive ignores congestion and keeps offering {NAIVE_RATE_MBPS} Mbps. On a{' '}
             {cfg.rateMbps} Mbps bottleneck, the denser input train fills the queue and the excess
             becomes <span style={{ color: COLORS.loss }}>actual tail drops</span>; the output train
-            remains limited by the simulated link. Crosses launched from the full queue are tail
-            drops; with configured random loss, crosses instead leave the downstream wire. ACKs
-            and retransmissions are still real TCP.
+            remains limited by the simulated link. ACKs and retransmissions are still real
+            netstack TCP.
             Note the RTT strip: the solid line is the latest raw TCP RTT sample, including realized
             jitter and queueing, while the sender&apos;s own srtt (dashed) barely moves — with
             thousands of packets in flight under sustained loss, TCP&apos;s smoothed estimator is
@@ -548,49 +574,53 @@ export const Pipe3b = memo(function Pipe3b({
           </>
         ) : (
           <>
-            Actual simulated traffic, aggregated so the particles remain readable. Their timing
-            comes from forward and reverse link activity; the browser does not run another traffic
-            model or impose output spacing. Cubic's growing window appears in the in-flight bar and
-            queue stack, ACKs follow the complete return path, and queue-overflow{' '}
+            Netstack simulated traffic, aggregated so the particles remain readable. Their timing
+            comes from forward and reverse link activity. CUBIC's growing window appears in the
+            in-flight bar and queue stack, ACKs follow the complete return path, and queue-overflow{' '}
             <span style={{ color: COLORS.loss }}>✕ marks leave the queue</span> while random-loss
-            marks leave the downstream wire. Playback
-            cruises at {CRUISE_RATE}× and slows to {SLOMO_RATE}× around losses and phase changes.
+            marks leave the downstream wire. In the RTT strip the solid trace is the latest raw RTT
+            sample and the dotted one is the sender&apos;s own smoothed srtt estimate, both against
+            the dashed base-rtt rule. In the delivery strip the solid trace is goodput (bytes
+            reaching the receiver&apos;s app), the dotted one is offered load entering the
+            bottleneck — the gap between them is congestion — and the dashed rule is the configured
+            link rate. Playback cruises at {CRUISE_RATE}× and slows to {SLOMO_RATE}× around losses
+            and phase changes.
           </>
         )
       }
     >
       <div style={{ position: 'relative', maxWidth: 640 }}>
         <svg viewBox="0 0 640 376" width="100%" style={{ display: 'block' }}>
-          <line x1={266} y1={LIMIT_Y} x2={292} y2={LIMIT_Y} stroke={COLORS.loss} strokeWidth={1.2} />
-          <text x={260} y={LIMIT_Y + 3} textAnchor="end" fontFamily="JetBrains Mono" fontSize={9} fill={COLORS.loss}>
+          <line x1={306} y1={LIMIT_Y} x2={332} y2={LIMIT_Y} stroke={COLORS.loss} strokeWidth={1.2} />
+          <text x={300} y={LIMIT_Y + 3} textAnchor="end" fontFamily="JetBrains Mono" fontSize={9} fill={COLORS.loss}>
             buffer limit · {Math.round(cfg.qlimPkts)} pkt
           </text>
           <rect x={24} y={110} width={86} height={60} fill="none" stroke={COLORS.ink} strokeWidth={1.3} />
           <text x={67} y={144} textAnchor="middle" fontFamily="JetBrains Mono" fontSize={10} fill={COLORS.ink}>
             SENDER
           </text>
-          <line x1={110} y1={140} x2={266} y2={140} stroke={COLORS.fog} strokeWidth={1} />
-          <rect x={262} y={122} width={34} height={36} fill="none" stroke={COLORS.ink} strokeWidth={1.3} />
+          <line x1={110} y1={140} x2={302} y2={140} stroke={COLORS.fog} strokeWidth={1} />
+          <rect x={302} y={122} width={34} height={36} fill="none" stroke={COLORS.ink} strokeWidth={1.3} />
           <g aria-label="bottleneck constriction">
             <path
-              d="M 265 125 H 293 V 130 L 283 138 H 275 L 265 130 Z"
+              d="M 305 125 H 333 V 130 L 323 138 H 315 L 305 130 Z"
               fill={COLORS.ink}
               fillOpacity={0.12}
               stroke={COLORS.ink}
               strokeWidth={0.8}
             />
             <path
-              d="M 265 155 H 293 V 150 L 283 142 H 275 L 265 150 Z"
+              d="M 305 155 H 333 V 150 L 323 142 H 315 L 305 150 Z"
               fill={COLORS.ink}
               fillOpacity={0.12}
               stroke={COLORS.ink}
               strokeWidth={0.8}
             />
           </g>
-          <text x={279} y={180} textAnchor="middle" fontFamily="JetBrains Mono" fontSize={9} fill={COLORS.slate}>
+          <text x={319} y={180} textAnchor="middle" fontFamily="JetBrains Mono" fontSize={9} fill={COLORS.slate}>
             bottleneck · {cfg.rateMbps} Mbps · tail-drop queue
           </text>
-          <line x1={292} y1={140} x2={528} y2={140} stroke={COLORS.fog} strokeWidth={1} />
+          <line x1={336} y1={140} x2={528} y2={140} stroke={COLORS.fog} strokeWidth={1} />
           <rect x={528} y={110} width={86} height={60} fill="none" stroke={COLORS.ink} strokeWidth={1.3} />
           <text x={571} y={144} textAnchor="middle" fontFamily="JetBrains Mono" fontSize={10} fill={COLORS.ink}>
             RECEIVER
@@ -651,7 +681,7 @@ export const Pipe3b = memo(function Pipe3b({
               disabled={flow === 'naive' || nextEv == null}
               onClick={() => nextEv != null && tr.seek(nextEv - 0.3)}
             >
-              EVENT ▸
+              FWD <SkipForwardFilled size={12} />
             </button>
           </>
         }

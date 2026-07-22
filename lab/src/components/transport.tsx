@@ -1,5 +1,6 @@
 // Play/scrub transport row shared by the figures, plus the rAF clock hook.
 
+import { PauseFilled, PlayFilledAlt } from '@carbon/icons-react'
 import { useEffect, useMemo, useRef, useState, type MutableRefObject, type ReactNode } from 'react'
 
 export interface TransportState {
@@ -85,6 +86,7 @@ export function Transport({ tr, T, extra }: { tr: TransportState; T: number; ext
   return (
     <div className="transport">
       <button className="btn-solid" onClick={tr.toggle}>
+        {tr.playing ? <PauseFilled size={12} /> : <PlayFilledAlt size={12} />}
         {tr.playing ? 'PAUSE' : 'PLAY'}
       </button>
       <input

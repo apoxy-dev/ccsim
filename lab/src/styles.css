@@ -59,7 +59,6 @@ a:hover {
   margin-top: 10px;
   font: 400 12.5px/1.6 var(--font-body);
   color: var(--apx-graphite);
-  max-width: 64ch;
 }
 
 .fig-card {
@@ -75,7 +74,7 @@ a:hover {
   align-items: baseline;
   gap: 16px;
   flex-wrap: wrap;
-  margin-bottom: 8px;
+  margin-bottom: 18px;
 }
 
 .fig-title {
@@ -135,7 +134,7 @@ a:hover {
   border: 0;
   padding: 6px 12px;
   cursor: pointer;
-  min-width: 64px;
+  min-width: 80px;
 }
 
 .btn-toggle {
@@ -146,6 +145,21 @@ a:hover {
   border: 1px solid var(--apx-ink);
   padding: 5px 12px;
   cursor: pointer;
+}
+
+/* Buttons that pair a Carbon icon with their label (play/pause, FWD). */
+.btn-solid,
+.btn-toggle {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+}
+
+.btn-solid svg,
+.btn-toggle svg {
+  flex: none;
+  fill: currentColor;
 }
 
 .btn-toggle.on {
@@ -207,7 +221,7 @@ input[type='range']::-webkit-slider-thumb {
 }
 
 .fig-controls {
-  margin: 6px 0 16px;
+  margin: 0 0 16px;
   padding-bottom: 16px;
   border-bottom: 1px solid var(--apx-mist);
 }

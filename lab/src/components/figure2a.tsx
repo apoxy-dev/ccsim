@@ -99,20 +99,35 @@ export function Figure2a({
       }
       controls={controls}
       note={
-        <div className="fig-readout">
-          <span className="ro" style={{ minWidth: 200, color: COLORS.cubic }}>
-            cubic {pc ? `${pc.x.toFixed(2)} bdp / rtt ${pc.r.toFixed(2)}×` : '—'}
-          </span>
-          <span className="ro" style={{ minWidth: 200, color: COLORS.bbr }}>
-            bbrv3 {pb ? `${pb.x.toFixed(2)} bdp / rtt ${pb.r.toFixed(2)}×` : '—'}
-          </span>
-          <span className="ro" style={{ minWidth: 180 }}>
-            bbr phase:{' '}
-            <span style={{ color: (pb?.phase && PHASE_LIGHT[pb.phase]) || COLORS.bbr }}>
-              ■ {pb?.phase ?? '—'}
+        <>
+          <div>
+            Adapted from Figure 1 in the original{' '}
+            <a
+              href="https://spawn-queue.acm.org/doi/pdf/10.1145/3012426.3022184"
+              target="_blank"
+              rel="noreferrer"
+            >
+              BBR paper
+            </a>
+            . One BDP is the sweet spot: enough data in flight to fill the path without building a
+            queue. CUBIC searches by crossing into loss; BBRv3 estimates the path and stays near
+            the operating point.
+          </div>
+          <div className="fig-readout" style={{ marginTop: 8 }}>
+            <span className="ro" style={{ minWidth: 200, color: COLORS.cubic }}>
+              cubic {pc ? `${pc.x.toFixed(2)} bdp / rtt ${pc.r.toFixed(2)}×` : '—'}
             </span>
-          </span>
-        </div>
+            <span className="ro" style={{ minWidth: 200, color: COLORS.bbr }}>
+              bbrv3 {pb ? `${pb.x.toFixed(2)} bdp / rtt ${pb.r.toFixed(2)}×` : '—'}
+            </span>
+            <span className="ro" style={{ minWidth: 180 }}>
+              bbr phase:{' '}
+              <span style={{ color: (pb?.phase && PHASE_LIGHT[pb.phase]) || COLORS.bbr }}>
+                ■ {pb?.phase ?? '—'}
+              </span>
+            </span>
+          </div>
+        </>
       }
     >
       <svg viewBox="0 0 640 610" style={{ display: 'block', width: '100%', height: 'auto' }}>

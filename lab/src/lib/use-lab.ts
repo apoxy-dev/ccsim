@@ -7,7 +7,13 @@ import { useEffect, useRef, useState } from 'react'
 import { decode } from '../../../stream/decoder.mjs'
 import { RunData } from './series'
 import { isDisposed, SimClient } from './sim-client'
-import { SMALL_MACHINE } from './scenario'
+import { SMALL_MACHINE, WASM_OK } from './scenario'
+
+// Friendly stand-in for the worker's ReferenceError when WebAssembly is
+// disabled (e.g. iOS Lockdown Mode): defaults still render from precomputed
+// streams; only live re-simulation is unavailable.
+const NO_WASM_ERROR =
+  'WebAssembly is disabled in this browser (Lockdown Mode?) — live simulation unavailable, defaults only'
 
 // Global worker-slot limiter. Each sim is a full Go runtime in a worker;
 // four of them contending for a phone's two performance cores makes every
@@ -72,6 +78,10 @@ export function useSimRun(scn: object, pre: string | null): SimRun {
       if (live()) setState((s) => ({ ...s, version: s.version + 1 }))
     }
     const runLive = async () => {
+      if (!WASM_OK) {
+        if (live()) setState((s) => ({ ...s, running: false, error: NO_WASM_ERROR }))
+        return
+      }
       await acquireSlot()
       if (!live()) {
         releaseSlot()
@@ -164,6 +174,10 @@ export function useSimPair(cubicScn: object, bbrScn: object, pre: PrePair | null
       }
     }
     const startLive = () => {
+      if (!WASM_OK) {
+        setState((s) => ({ ...s, running: false, error: NO_WASM_ERROR }))
+        return
+      }
       // Small machines run the pair back to back — one slot per figure —
       // so both figures make visible progress instead of the first one
       // hogging both slots while the second sits at zero for minutes.

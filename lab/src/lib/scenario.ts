@@ -18,6 +18,12 @@ export interface LabCfg {
 // there is roughly an order of magnitude below native, so they also get a
 // 4× lighter default link (buffer rescaled to keep the same ~1×BDP shape).
 // The sliders still reach the full range.
+// Safari's Lockdown Mode (and some enterprise policies) removes the
+// WebAssembly global entirely. Precomputed default streams don't need it —
+// only live (off-default) simulation does, so gate the worker path on this
+// instead of surfacing a raw ReferenceError from inside the worker.
+export const WASM_OK = typeof WebAssembly !== 'undefined'
+
 export const SMALL_MACHINE =
   (typeof navigator !== 'undefined' ? navigator.hardwareConcurrency || 4 : 4) < 8
 
@@ -92,12 +98,14 @@ export function scenarioFor(cc: CC, cfg: LabCfg): object {
 }
 
 // The bandwidth-change experiment from the BBR paper (ACM Queue, figure 3):
-// a 10-Mbps, 40-ms flow whose bottleneck doubles to 20 Mbps at t=20 s and
-// drops back to 10 Mbps at t=40 s. Rate, delay, and buffer stay fixed —
-// the figure's chrome (link-rate step path, lane ranges, step labels) is
-// drawn to them — but wire loss and jitter are adjustable and either CC can
-// run it.
+// a 10-Mbps, 40-ms flow whose bottleneck doubles for 20 seconds. The paper's
+// 20/40-second changes are shifted to 21/41 here so the deterministic BBR run
+// is in CRUISE, rather than entering ProbeBW:UP on the exact up-step. Rate,
+// delay, and buffer stay fixed — the figure's chrome is drawn to them — but
+// wire loss and jitter are adjustable and either CC can run it.
 export const BWSTEP_DUR_S = 60
+export const BWSTEP_UP_S = 21
+export const BWSTEP_DOWN_S = 41
 // jitter 0 default: the precomputed streams reproduce the paper's clean-path
 // experiment; the sliders opt into a dirtier path.
 export const BWSTEP_CFG: LabCfg = { rateMbps: 10, owdMs: 20, jitterMs: 0, lossPct: 0, qlimPkts: 133 }
@@ -107,8 +115,8 @@ export function bwStepScenario(cc: CC, lossPct: number, jitterMs = 0): object {
     ...scenarioFor(cc, { ...BWSTEP_CFG, lossPct, jitterMs }),
     dur_s: BWSTEP_DUR_S,
     events: [
-      { at_s: 20, path: 'link.rate_mbps', value: 20 },
-      { at_s: 40, path: 'link.rate_mbps', value: 10 },
+      { at_s: BWSTEP_UP_S, path: 'link.rate_mbps', value: 20 },
+      { at_s: BWSTEP_DOWN_S, path: 'link.rate_mbps', value: 10 },
     ],
   }
 }

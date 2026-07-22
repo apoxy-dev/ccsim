@@ -1,17 +1,24 @@
-// Figure 2: the bandwidth-change experiment from the BBR paper (ACM Queue
-// 2016, figure 3) — a 10-Mbps, 40-ms bottleneck that doubles at t=20 s and
-// halves back at t=40 s. Three lanes vs. time: delivery rate against the
+// Figure 3: the bandwidth-change experiment from the BBR paper (ACM Queue
+// 2016, figure 3) — a 10-Mbps, 40-ms bottleneck that doubles for 20 seconds.
+// Three lanes vs. time: delivery rate against the
 // link-rate step, inflight, and srtt. Unlike the paper's BBR-only figure,
-// Cubic runs the same experiment as an overlay: it discovers the up-step
-// only by growing cwnd, and reacts to the down-step only after the queue
-// overflows — the loss-based vs model-based contrast in one plot.
+// Cubic runs the same experiment as an overlay. Its standing queue can use
+// an up-step before the controller reacts; it notices the down-step only
+// after the queue overflows — the loss-based vs model-based contrast in one
+// plot.
 
 import { useMemo, type ReactNode } from 'react'
 import { FigureCard } from './figure-card'
 import { Transport, type TransportState } from './transport'
 import { COLORS } from '../lib/trail'
 import { ptAt, type Pt } from '../lib/series'
-import { BWSTEP_CFG, BWSTEP_DUR_S, derive } from '../lib/scenario'
+import {
+  BWSTEP_CFG,
+  BWSTEP_DOWN_S,
+  BWSTEP_DUR_S,
+  BWSTEP_UP_S,
+  derive,
+} from '../lib/scenario'
 
 const tx = (t: number) => 52 + t * 9.6
 const d = derive(BWSTEP_CFG)
@@ -25,8 +32,8 @@ const yInf = (kb: number) => 226 - (76 * Math.max(0, Math.min(kb, 280))) / 280
 const yRtt = (ms: number) => 330 - (76 * Math.max(0, Math.min(ms - 30, 200))) / 200
 
 const STEPS = [
-  { t: 20, label: 'BtlBw ×2' },
-  { t: 40, label: 'BtlBw ÷2' },
+  { t: BWSTEP_UP_S, label: 'BtlBw ×2' },
+  { t: BWSTEP_DOWN_S, label: 'BtlBw ÷2' },
 ]
 
 const flowPath = (pts: Pt[]) => {
@@ -37,16 +44,17 @@ const flowPath = (pts: Pt[]) => {
       s += (s ? 'L' : 'M') + tx(pts[i].t).toFixed(1) + ' ' + fn(pts[i], i).toFixed(1)
     return s
   }
-  // True goodput: receiver-side app bytes differentiated over a ±160 ms
-  // window. The sender's delivery-rate estimate (p.y) is drawn alongside;
-  // the two split exactly when retransmissions eat the wire (crank loss or
-  // jitter), which is the point of overlaying them.
+  // True goodput: receiver-side app bytes differentiated over the trailing
+  // 320 ms. This is deliberately causal: a centered window made the plotted
+  // rate rise before a bandwidth step by incorporating future deliveries.
+  // The sender's delivery-rate estimate (p.y) is drawn alongside; the two
+  // split when retransmissions eat the wire (crank loss or jitter).
   const hasGood = pts.some((p) => p.goodB != null)
-  const W = 8
+  const W = 16
   const good = pts.map((p, i) => {
     if (!hasGood) return p.y * BWSTEP_CFG.rateMbps
     const a = pts[Math.max(0, i - W)]
-    const b = pts[Math.min(pts.length - 1, i + W)]
+    const b = p
     const dt = b.t - a.t
     return dt > 0 ? (((b.goodB ?? 0) - (a.goodB ?? 0)) * 8) / 1e6 / dt : 0
   })
@@ -98,7 +106,7 @@ export function FigureBwStep({
 
   const pc = ptAt(cubic, t)
   const pb = ptAt(bbr, t)
-  const linkRate = `M ${tx(0)} ${yDel(10)} L ${tx(20)} ${yDel(10)} L ${tx(20)} ${yDel(20)} L ${tx(40)} ${yDel(20)} L ${tx(40)} ${yDel(10)} L ${tx(60)} ${yDel(10)}`
+  const linkRate = `M ${tx(0)} ${yDel(10)} L ${tx(BWSTEP_UP_S)} ${yDel(10)} L ${tx(BWSTEP_UP_S)} ${yDel(20)} L ${tx(BWSTEP_DOWN_S)} ${yDel(20)} L ${tx(BWSTEP_DOWN_S)} ${yDel(10)} L ${tx(BWSTEP_DUR_S)} ${yDel(10)}`
 
   const lane = (y0: number, y1: number, label: string, ticks: [number, string][]) => (
     <g key={label}>
@@ -126,7 +134,7 @@ export function FigureBwStep({
 
   return (
     <FigureCard
-      title="FIG. 2 — BANDWIDTH CHANGE · 10 MBPS × 40 MS"
+      title="FIG. 3 — BANDWIDTH CHANGE · 10 MBPS × 40 MS"
       aside={
         <div className="fig-legend">
           <span style={{ color: COLORS.cubic }}>— cubic</span>
@@ -144,13 +152,11 @@ export function FigureBwStep({
           >
             The paper's
           </a>{' '}
-          figure 3, plus cubic: bbr converges on the up-step within a probe cycle (max-filter
-          admits the new rate immediately) and drains the down-step spike once the old BtlBw
-          estimate ages out; cubic grows into new bandwidth one RTT at a time and notices the
-          down-step only when the buffer overflows. The top lane draws true goodput (receiver
-          app bytes) solid with the sender&apos;s own delivery-rate estimate dashed — on a clean
-          path they coincide, and they split when loss or jitter makes the wire carry
-          retransmissions that deliver nothing new.
+          figure 3, plus CUBIC. The rate changes are shifted from 20/40 s to 21/41 s so the
+          up-step lands while BBR is cruising, not already in ProbeBW:UP. CUBIC uses the new
+          capacity immediately only because its standing queue drains faster; the controller has
+          not sensed it. BBR holds its old rate until the next scheduled probe, then ACK delivery
+          samples raise its bandwidth model.
         </>
       }
     >

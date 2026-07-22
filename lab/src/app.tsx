@@ -230,7 +230,7 @@ export function App() {
       <header className="hdr">
         <div className="hdr-title">CCSIM — CC LAB</div>
         <div className="hdr-sub">
-          The{' '}
+          A bottleneck model and the {' '}
           <a
             href="https://spawn-queue.acm.org/doi/pdf/10.1145/3012426.3022184"
             target="_blank"
@@ -239,9 +239,8 @@ export function App() {
             BBR paper
           </a>
           's figures, drawn live: full gVisor sender/receiver netstacks (built to WebAssembly)
-          drive a simulated bottleneck link in your browser. Compare stock Cubic, a from-scratch
-          BBRv3, and Fig. 3's fixed-rate naive control; every run is deterministic and replays
-          byte-for-byte.
+          drive a simulated bottleneck link in your browser. Compare stock Cubic with a from-scratch
+          BBRv3.
         </div>
       </header>
 
@@ -263,7 +262,7 @@ export function App() {
           <>
             <div className="ctl-row">
               <LossSlider value={pipeCfg.lossPct} onChange={pipeSet('lossPct')} />
-              <Slider label="jitter" value={pipeCfg.jitterMs} min={0} max={100} step={1} fmt={(v) => `${v} ms`} onChange={pipeSet('jitterMs')} />
+              <Slider label="jitter" value={pipeCfg.jitterMs} min={0} max={50} step={1} fmt={(v) => `${v} ms`} onChange={pipeSet('jitterMs')} />
             </div>
             <StatusLine
               left={`bottleneck ${pipeCfg.rateMbps} Mbps · base rtt ${pipeD.baseMs} ms · buffer ${Math.round(pipeCfg.qlimPkts)} pkt`}
@@ -296,7 +295,7 @@ export function App() {
                 wasm run is impractically slow even on a fast laptop. */}
             <div className="ctl-row">
               <Slider label="owd" value={cfg.owdMs} min={5} max={50} step={1} fmt={(v) => `${v} ms`} onChange={set('owdMs')} />
-              <Slider label="jitter" value={cfg.jitterMs} min={0} max={100} step={1} fmt={(v) => `${v} ms`} onChange={set('jitterMs')} />
+              <Slider label="jitter" value={cfg.jitterMs} min={0} max={50} step={1} fmt={(v) => `${v} ms`} onChange={set('jitterMs')} />
               <LossSlider value={cfg.lossPct} onChange={set('lossPct')} />
               <Slider label="buffer" value={cfg.qlimPkts} min={20} max={2000} step={10} fmt={(v) => `${v} pkt`} onChange={set('qlimPkts')} />
             </div>
@@ -323,7 +322,7 @@ export function App() {
           <>
             <div className="ctl-row">
               <LossSlider value={bwLossPct} onChange={setBwLossPct} />
-              <Slider label="jitter" value={bwJitterMs} min={0} max={100} step={1} fmt={(v) => `${v} ms`} onChange={setBwJitterMs} />
+              <Slider label="jitter" value={bwJitterMs} min={0} max={50} step={1} fmt={(v) => `${v} ms`} onChange={setBwJitterMs} />
             </div>
             <StatusLine
               error={bw.error}
@@ -342,8 +341,8 @@ export function App() {
       />
 
       <footer className="ftr">
-        deterministic: same scenario + seed ⇒ byte-identical streams, native and wasm ·{' '}
-        <a href="https://github.com/apoxy-dev/ccsim">apoxy-dev/ccsim</a>
+        Special credits: BBR authors, Apoxy team.
+        Source: <a href="https://github.com/apoxy-dev/ccsim">apoxy-dev/ccsim</a>
       </footer>
     </div>
   )
